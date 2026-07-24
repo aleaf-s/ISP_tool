@@ -1,0 +1,19 @@
+{
+  "width": 1280,
+  "height": 800,
+  "bit_depth": 12,
+  "storage": "uint16_le",
+  "bayer_pattern": "RGGB",
+  "byte_order": "little",
+  "row_stride_bytes": 0,
+  "offset_bytes": 0,
+  "black_level": [
+    64.0,
+    64.0,
+    64.0,
+    64.0
+  ],
+  "white_level": 4095.0,
+  "flip_horizontal": false,
+  "flip_vertical": false
+}
