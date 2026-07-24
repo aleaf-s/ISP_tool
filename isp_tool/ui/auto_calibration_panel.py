@@ -1293,12 +1293,11 @@ class AutoCalibrationPanel(ttk.Frame):
                 **advanced,
             }
         if module == "AWB":
-            # AWB must measure LSC output before existing WB gains. Measuring
-            # stage 3 would analyze an already white-balanced image and drift
-            # toward unity on every re-analysis.
-            return AWBAnalyzerAdapter(), 2, {"method": method, **advanced}
+            # results[0] is RAW Input, so results[3] is LSC output:
+            # BLC/DPC/LSC have run, while WB has not.
+            return AWBAnalyzerAdapter(), 3, {"method": method, **advanced}
         if module == "AE":
-            return AEAnalyzerAdapter(), 2, {
+            return AEAnalyzerAdapter(), 3, {
                 "method": method,
                 "domain": "bayer",
                 **advanced,

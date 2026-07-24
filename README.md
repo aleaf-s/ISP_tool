@@ -1,6 +1,6 @@
-# ISP RAW Visual Simulator V0.4.4
+# ISP RAW Visual Simulator V0.4.5
 
-桌面端 RAW ISP 视觉效果仿真、参数调试与离线校准工具。V0.4.4
+桌面端 RAW ISP 视觉效果仿真、参数调试与离线校准工具。V0.4.5
 参考 ART/RawTherapee 的中央预览与单一参数检查器，并保留 Simatest
 式的有序 ISP Pipeline。默认工作区强调快速调参，完整工程信息通过
 Advanced、Scope 和专家模式按需显示。
@@ -16,6 +16,33 @@ python run.py
 
 启动后可在主界面直接查看当前模块的自动建议状态，或点击顶部
 `Calibration` 打开完整校准工作区。
+
+## V0.4.5 自定义 ROI 与最终效果分析
+
+- ROI 分块改为明确的“先框选外接区域 → 在当前选区内自定义分块”
+- 自定义行数、列数和单元格内缩比例，最多生成 96 个 ROI
+- Bayer ROI 使用向内偶数对齐，小框不会越出用户选区
+- 分块后保留外接区域虚线和行列数标记，可确认分块来源
+- `预览 → 最终效果与模块影响` 打开独立分析页
+- 最终效果页列出所有 ISP 模块，点击模块后临时旁路它，并重新运行后续流水线
+- 同时显示完整 Final、Bypass Final 和 P99 归一化差异热力图
+- 提供 Mean/P95/Max 绝对差异与有效变化像素比例
+- 最终效果计算位于独立工作线程，快速切换模块时丢弃过期 UI 结果
+
+本版同步完成一次功能重叠清理：
+
+- 固定 4×6、6×4 ROI 入口合并为一个自定义分块对话框
+- ROI 管理器只负责选择、增删和坐标微调，不再重复提供分块入口
+- 顶部 `Scope` 和 `View` 合并为 `预览` 下拉菜单
+- 删除右侧自动分析区从未显示的 `Open` 按钮
+- Calibration 不再创建四套不可见的旧 LSC/AWB/AE/CCM 标签页
+
+以下看似重复的入口仍有不同用途，因此保留：
+
+- 主预览 Compare：比较当前模块输入/输出；最终效果页：比较模块旁路对最终输出的影响
+- Gray Picker：单击局部灰点快速估计；Auto AWB：带样本筛选、置信度和证据的完整分析
+- 顶部 Calibration：打开全局工作区；当前模块 Auto/More：直接跳转到对应校准步骤
+- 菜单栏文件操作：为快捷键和键盘访问保留；工具栏提供高频操作
 
 ## V0.4.4 多图校准与参数确认
 
@@ -92,7 +119,7 @@ python run.py
 - Auto BLC：当前暗区 ROI、Optical Black ROI 或外部暗场，分别测量 R/Gr/Gb/B
 - DPC：单帧候选检测，以及暗场/平场多帧固定坏点标定
 - LSC：平场自动生成四通道 Mesh
-- AWB：ROI Neutral、Gray World、Shades of Gray、White Patch
+- AWB：Robust Neutral、ROI Neutral、Gray World、Shades of Gray、White Patch
 - AE：Mean、Median、Percentile、Highlight Protected
 - CCM：使用 ColorChecker 色块求解矩阵与 Offset
 - Noise Profile：均值—方差模型、Shot Noise、Read Noise 与 NR 参数建议
@@ -296,7 +323,7 @@ Calibration Workspace 支持导出：
 ```json
 {
   "schema_version": 4,
-  "tool_version": "0.4.4",
+  "tool_version": "0.4.5",
   "raw": {},
   "pipeline": [],
   "calibration": {
@@ -348,7 +375,7 @@ python -m unittest discover -s tests -v
 - V1/V2/V3→V4 迁移及外部 DPC NPZ
 - Calibration UI 状态机合法/非法转换和 Stale 检测
 - FileList 元数据校验、ROI 接受/拒绝状态和 Artifact 类型转换
-- V0.4.1/V0.4.2/V0.4.3/V0.4.4 UI 状态持久化
+- V0.4.1/V0.4.2/V0.4.3/V0.4.4/V0.4.5 UI 状态持久化
 - 隐藏 Tk 窗口下的应用、工作区、Preview、切换自动 Revert 和关闭冒烟流程
 
 ## 快捷键

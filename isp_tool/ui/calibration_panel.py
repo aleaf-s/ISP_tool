@@ -34,7 +34,7 @@ class CalibrationWorkspace(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.title("Calibration Workspace · V0.4.4")
+        self.title("Calibration Workspace · V0.4.5")
         self.geometry("1180x720")
         self.minsize(900, 620)
         self.transient(parent)
@@ -87,20 +87,12 @@ class CalibrationWorkspace(tk.Toplevel):
                 widget = ttk.Entry(session_bar, textvariable=variable, width=width)
             widget.pack(side="left", padx=(0, 8))
 
-        # The specialist widgets are retained as an implementation detail so
-        # existing calibration algorithms and variables stay source-compatible.
-        # V0.4.1 presents one unified workflow instead of exposing five tabs.
-        self.legacy_host = ttk.Frame(self)
+        # The unified AutoCalibrationPanel only needs shared calibration state.
+        # Older hidden LSC/AWB/AE/CCM tabs duplicated the same workflow and
+        # created dozens of invisible widgets, so V0.4.5 no longer builds them.
+        self._init_shared_calibration_state()
         self.auto_tab = ttk.Frame(self, padding=(8, 0, 8, 8))
         self.auto_tab.pack(fill="both", expand=True)
-        self.lsc_tab = ttk.Frame(self.legacy_host, padding=12)
-        self.awb_tab = ttk.Frame(self.legacy_host, padding=12)
-        self.ae_tab = ttk.Frame(self.legacy_host, padding=12)
-        self.ccm_tab = ttk.Frame(self.legacy_host, padding=12)
-        self._build_lsc()
-        self._build_awb()
-        self._build_ae()
-        self._build_ccm()
         self.auto_panel = AutoCalibrationPanel(
             self.auto_tab, self, self.app
         )
@@ -108,6 +100,29 @@ class CalibrationWorkspace(tk.Toplevel):
         self.load_ui_state(
             getattr(self.app, "loaded_ui_state", {}).get("calibration", {})
         )
+
+    def _init_shared_calibration_state(self) -> None:
+        self.mesh_rows_var = tk.IntVar(value=13)
+        self.mesh_cols_var = tk.IntVar(value=17)
+        self.mesh_stat_var = tk.StringVar(value="Median")
+        self.awb_method_var = tk.StringVar(value="Robust Neutral")
+        self.awb_use_roi_var = tk.BooleanVar(value=True)
+        self.ae_method_var = tk.StringVar(
+            value="Highlight Protected"
+        )
+        self.ae_target_var = tk.DoubleVar(value=0.45)
+        self.ae_use_roi_var = tk.BooleanVar(value=False)
+        self.corner_vars = [
+            tk.StringVar(value=value)
+            for value in (
+                "20,20", "620,20", "620,420", "20,420"
+            )
+        ]
+        self.ccm_rotation_var = tk.IntVar(value=0)
+        self.ccm_flip_var = tk.BooleanVar(value=False)
+        self.ccm_offset_var = tk.BooleanVar(value=True)
+        self.ccm_ridge_var = tk.DoubleVar(value=0.0001)
+        self.ccm_exclude_var = tk.StringVar(value="")
 
     def _result_area(self, parent):
         text = ScrolledText(
@@ -408,7 +423,7 @@ class CalibrationWorkspace(tk.Toplevel):
 
     def _calculate_awb(self):
         try:
-            stage = self._full_stage(2)
+            stage = self._full_stage(3)
             image, metadata = stage.image.copy(), copy.deepcopy(self.app.loaded.metadata)
             method = self.awb_method_var.get()
             roi = self._roi(self.awb_use_roi_var.get())
@@ -457,7 +472,7 @@ class CalibrationWorkspace(tk.Toplevel):
 
     def _calculate_ae(self):
         try:
-            stage = self._full_stage(2)
+            stage = self._full_stage(3)
             image, domain = stage.image.copy(), stage.domain
             metadata = copy.deepcopy(self.app.loaded.metadata)
             method, target = self.ae_method_var.get(), float(self.ae_target_var.get())
@@ -701,7 +716,6 @@ class CalibrationWorkspace(tk.Toplevel):
         if hasattr(self, "auto_panel"):
             self.app.loaded_ui_state["calibration"] = self.get_ui_state()
             self.auto_panel.close()
-        self._revert_lsc_preview_on_close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.app.calibration_workspace = None
         self.destroy()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from .models import ImageROI
+from .models import ISPError, ImageROI
 
 
 def generate_grid_rois(
@@ -35,7 +35,27 @@ def generate_grid_rois(
                 max(1, y1 - y0 - 2 * inset_y),
             )
             if bayer_aligned:
-                roi = roi.align_for_bayer(image_shape)
+                # Align inward so a CFA-safe sample never leaks outside the
+                # user-selected grid cell or its outer bounding ROI.
+                aligned_x0 = roi.x + (roi.x % 2)
+                aligned_y0 = roi.y + (roi.y % 2)
+                aligned_x1 = roi.x2 - (roi.x2 % 2)
+                aligned_y1 = roi.y2 - (roi.y2 % 2)
+                if (
+                    aligned_x1 - aligned_x0 < 2
+                    or aligned_y1 - aligned_y0 < 2
+                ):
+                    raise ISPError(
+                        "ROI 分块过密，Bayer 对齐后小框不足 2×2；"
+                        "请减少行列数或减小内缩"
+                    )
+                roi = ImageROI(
+                    aligned_x0,
+                    aligned_y0,
+                    aligned_x1 - aligned_x0,
+                    aligned_y1 - aligned_y0,
+                )
+                roi.validate(image_shape)
             else:
                 roi.validate(image_shape)
             output.append(roi)

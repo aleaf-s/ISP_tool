@@ -2,16 +2,159 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Callable, List
+from typing import Callable, List, Optional, Tuple
 
 from ..models import ImageROI
-from ..roi_tools import clamp_roi, generate_grid_rois
+from ..roi_tools import clamp_roi
+
+
+MAX_ROI_COUNT = 96
+
+
+class ROIGridDialog(tk.Toplevel):
+    """Ask for a grid layout that will be generated inside one selected ROI."""
+
+    def __init__(
+        self,
+        parent,
+        rows: int = 4,
+        cols: int = 6,
+        inset_percent: float = 12.0,
+    ):
+        super().__init__(parent)
+        self.title("ROI 自定义分块")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result: Optional[Tuple[int, int, float]] = None
+        self.rows_var = tk.StringVar(value=str(rows))
+        self.cols_var = tk.StringVar(value=str(cols))
+        self.inset_var = tk.StringVar(value=f"{inset_percent:g}")
+        self.summary_var = tk.StringVar()
+        self.error_var = tk.StringVar()
+        self._build()
+        for variable in (
+            self.rows_var, self.cols_var, self.inset_var
+        ):
+            variable.trace_add("write", self._update_summary)
+        self._update_summary()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="在当前选中的 ROI 外接区域内生成网格",
+            style="Title.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            body,
+            text="每个小框都会严格限制在所选区域中。",
+            style="Muted.TLabel",
+        ).grid(
+            row=1, column=0, columnspan=2,
+            sticky="w", pady=(2, 12),
+        )
+        for row, (label, variable) in enumerate(
+            (
+                ("行数", self.rows_var),
+                ("列数", self.cols_var),
+                ("单元格内缩 (%)", self.inset_var),
+            ),
+            start=2,
+        ):
+            ttk.Label(body, text=label).grid(
+                row=row, column=0, sticky="w", pady=4,
+            )
+            ttk.Entry(
+                body, textvariable=variable, width=12
+            ).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Label(
+            body, textvariable=self.summary_var,
+            style="Muted.TLabel",
+        ).grid(
+            row=5, column=0, columnspan=2,
+            sticky="w", pady=(8, 2),
+        )
+        ttk.Label(
+            body, textvariable=self.error_var,
+            foreground="#ff6b6b",
+        ).grid(
+            row=6, column=0, columnspan=2,
+            sticky="w",
+        )
+        actions = ttk.Frame(body)
+        actions.grid(
+            row=7, column=0, columnspan=2,
+            sticky="e", pady=(14, 0),
+        )
+        ttk.Button(
+            actions, text="取消", command=self.destroy
+        ).pack(side="right")
+        ttk.Button(
+            actions,
+            text="生成",
+            command=self._accept,
+            style="Primary.TButton",
+        ).pack(side="right", padx=(0, 6))
+
+    def _values(self) -> Tuple[int, int, float]:
+        rows = int(self.rows_var.get())
+        cols = int(self.cols_var.get())
+        inset = float(self.inset_var.get())
+        if rows < 1 or cols < 1:
+            raise ValueError("行数和列数必须大于 0")
+        if rows * cols > MAX_ROI_COUNT:
+            raise ValueError(
+                f"小框总数不能超过 {MAX_ROI_COUNT}"
+            )
+        if not 0.0 <= inset <= 40.0:
+            raise ValueError("内缩比例必须在 0～40%")
+        return rows, cols, inset
+
+    def _update_summary(self, *_args) -> None:
+        try:
+            rows, cols, inset = self._values()
+            self.summary_var.set(
+                f"{rows} × {cols} = {rows * cols} 个 ROI · "
+                f"内缩 {inset:g}%"
+            )
+            self.error_var.set("")
+        except (TypeError, ValueError, tk.TclError) as exc:
+            self.summary_var.set("")
+            self.error_var.set(str(exc))
+
+    def _accept(self) -> None:
+        try:
+            rows, cols, inset = self._values()
+        except (TypeError, ValueError, tk.TclError) as exc:
+            self.error_var.set(str(exc))
+            return
+        self.result = (rows, cols, inset / 100.0)
+        self.destroy()
+
+
+def ask_roi_grid(
+    parent,
+    rows: int = 4,
+    cols: int = 6,
+    inset_percent: float = 12.0,
+):
+    dialog = ROIGridDialog(
+        parent, rows=rows, cols=cols,
+        inset_percent=inset_percent,
+    )
+    parent.wait_window(dialog)
+    return dialog.result
 
 
 class ROIEditor(tk.Toplevel):
     """Manage up to 24 sampling rectangles with exact coordinate editing."""
 
-    MAX_ROIS = 24
+    MAX_ROIS = MAX_ROI_COUNT
 
     def __init__(
         self,
@@ -45,7 +188,7 @@ class ROIEditor(tk.Toplevel):
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="ROI LIST · 最多 24 个框",
+            text=f"ROI LIST · 最多 {self.MAX_ROIS} 个框",
             style="Title.TLabel",
         ).pack(anchor="w")
         ttk.Label(
@@ -107,9 +250,6 @@ class ROIEditor(tk.Toplevel):
 
         actions = ttk.Frame(body)
         actions.pack(fill="x")
-        ttk.Button(
-            actions, text="生成 4×6 小框", command=self._generate_24
-        ).pack(side="left")
         ttk.Button(
             actions, text="新增", command=self._add
         ).pack(side="left", padx=4)
@@ -190,27 +330,6 @@ class ROIEditor(tk.Toplevel):
             self.image_shape,
             self.bayer_aligned,
         )
-        self._refresh()
-
-    def _generate_24(self) -> None:
-        height, width = self.image_shape[:2]
-        if 0 <= self.active_index < len(self.rois):
-            bounds = self.rois[self.active_index]
-        else:
-            bounds = ImageROI(
-                round(width * 0.1),
-                round(height * 0.1),
-                max(1, round(width * 0.8)),
-                max(1, round(height * 0.8)),
-            )
-        self.rois = generate_grid_rois(
-            bounds,
-            self.image_shape,
-            rows=4,
-            cols=6,
-            bayer_aligned=self.bayer_aligned,
-        )
-        self.active_index = 0
         self._refresh()
 
     def _add(self) -> None:

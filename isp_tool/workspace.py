@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from .models import CalibrationSession, ImageROI, LoadedImage
 
@@ -17,6 +17,10 @@ class ImageWorkItem:
     calibration_session: CalibrationSession
     rois: List[ImageROI] = field(default_factory=list)
     active_roi_index: int = -1
+    roi_grid_bounds: Optional[ImageROI] = None
+    roi_grid_rows: int = 4
+    roi_grid_cols: int = 6
+    roi_grid_inset: float = 0.12
     manual_parameter_snapshots: Dict[str, Dict] = field(
         default_factory=dict
     )

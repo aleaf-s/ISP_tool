@@ -46,15 +46,16 @@ from ..workspace import (
 from .calibration_panel import CalibrationWorkspace
 from .dialogs import ask_raw_metadata
 from .dpi import enable_process_dpi_awareness
+from .final_preview import FinalImpactWindow
 from .performance_metrics import PerformanceMetrics
 from .render_cache import RenderCache
-from .roi_editor import ROIEditor
+from .roi_editor import MAX_ROI_COUNT, ROIEditor, ask_roi_grid
 from .scrolling import MouseWheelRouter
 from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, InlineMessage, StatusBadge, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.4 · 多图校准工作区"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.5 · 最终效果分析"
 BG = COLORS["background"]
 PANEL = COLORS["panel"]
 PANEL_2 = COLORS["panel_alt"]
@@ -136,6 +137,7 @@ class ISPApplication:
         ]
         self.current_image_index = 0
         self.calibration_workspace: Optional[CalibrationWorkspace] = None
+        self.final_preview_window: Optional[FinalImpactWindow] = None
         self.calibration_polygons = []
         self.preview_image = self.loaded.image
         self.results: List[StageResult] = []
@@ -183,6 +185,10 @@ class ISPApplication:
         self.rois: List[ImageROI] = []
         self.roi: Optional[ImageROI] = None
         self.active_roi_index = -1
+        self.roi_grid_bounds: Optional[ImageROI] = None
+        self.roi_grid_rows = 4
+        self.roi_grid_cols = 6
+        self.roi_grid_inset = 0.12
         self.roi_drag_start: Optional[Tuple[int, int]] = None
         self.roi_drag_original: Optional[ImageROI] = None
         self.roi_drag_mode = ""
@@ -247,6 +253,10 @@ class ISPApplication:
         view_menu.add_command(label="重置当前模块", command=self.reset_current_module)
         view_menu.add_command(
             label="Calibration Workspace", command=self.open_calibration_workspace
+        )
+        view_menu.add_command(
+            label="最终效果与模块影响",
+            command=self.open_final_preview,
         )
         view_menu.add_command(
             label="Performance Details", command=self.show_performance_details
@@ -376,17 +386,23 @@ class ISPApplication:
         ttk.Button(
             toolbar, text="Calibration", command=self.open_calibration_workspace
         ).pack(side="left", padx=(5, 0))
-        ttk.Button(
-            toolbar, text="Scope", command=self._toggle_analysis_panel
-        ).pack(side="left", padx=(5, 0))
-        view_menu = ActionMenu(toolbar, "视图")
-        view_menu.add_checkbutton(
+        preview_menu = ActionMenu(toolbar, "预览")
+        preview_menu.add_command(
+            "最终效果与模块影响…", self.open_final_preview
+        )
+        preview_menu.add_command(
+            "显示 / 隐藏 Scopes", self._toggle_analysis_panel
+        )
+        preview_menu.add_separator()
+        preview_menu.add_checkbutton(
             "专家模式", self.expert_mode_var,
             command=self._apply_expert_mode,
         )
-        view_menu.add_separator()
-        view_menu.add_command("Performance Details", self.show_performance_details)
-        view_menu.pack(side="left", padx=(5, 0))
+        preview_menu.add_command(
+            "Performance Details", self.show_performance_details
+        )
+        preview_menu.pack(side="left", padx=(5, 0))
+        self.preview_menu = preview_menu
         self.stage_selector = ttk.Frame(toolbar)
         ttk.Separator(
             self.stage_selector, orient="vertical"
@@ -468,12 +484,8 @@ class ISPApplication:
             command=self._roi_processing_changed,
         )
         roi_menu.add_command(
-            "生成 4×6 色块 ROI", self.generate_24_rois,
-            enabled=lambda: self.roi is not None,
-        )
-        roi_menu.add_command(
-            "生成 6×4 色块 ROI（旋转色卡）",
-            lambda: self.generate_24_rois(rows=6, cols=4),
+            "在当前选区内自定义分块…",
+            self.open_roi_grid_dialog,
             enabled=lambda: self.roi is not None,
         )
         roi_menu.add_command(
@@ -619,9 +631,6 @@ class ISPApplication:
             text="Auto",
             style="Primary.TButton",
             command=self.analyze_current_module,
-        )
-        self.auto_open_button = ttk.Button(
-            auto_actions, text="Open", command=self.open_current_calibration
         )
         self.auto_preview_button = ttk.Button(
             auto_actions, text="Preview", command=self.preview_auto_suggestion
@@ -1364,9 +1373,6 @@ class ISPApplication:
         self.auto_analyze_button.configure(
             state="normal" if can_analyze else "disabled"
         )
-        self.auto_open_button.configure(
-            state="normal" if name is not None else "disabled"
-        )
         self.auto_preview_button.configure(
             state="normal" if can_preview else "disabled"
         )
@@ -1379,7 +1385,6 @@ class ISPApplication:
         state_value = getattr(state, "value", str(state))
         for widget in (
             self.auto_analyze_button,
-            self.auto_open_button,
             self.auto_preview_button,
             self.auto_apply_button,
             self.auto_revert_button,
@@ -2228,6 +2233,33 @@ class ISPApplication:
             canvas_w - 10, 10, text=overlay_text, anchor="ne",
             fill=FG, font=FONTS["body"], tags="view_info",
         )
+        if (
+            self.roi_grid_bounds is not None
+            and not self.roi_process_var.get()
+        ):
+            bounds = self.roi_grid_bounds
+            bx0 = self.canvas_origin[0] + bounds.x * self.zoom
+            by0 = self.canvas_origin[1] + bounds.y * self.zoom
+            bx1 = self.canvas_origin[0] + bounds.x2 * self.zoom
+            by1 = self.canvas_origin[1] + bounds.y2 * self.zoom
+            self.image_canvas.create_rectangle(
+                bx0, by0, bx1, by1,
+                outline=COLORS["calibration_overlay"],
+                width=2,
+                dash=(8, 4),
+                tags="roi_grid_bounds",
+            )
+            self.image_canvas.create_text(
+                bx0 + 5, by0 - 5,
+                text=(
+                    f"GRID AREA · {self.roi_grid_rows}×"
+                    f"{self.roi_grid_cols}"
+                ),
+                anchor="sw",
+                fill=COLORS["calibration_overlay"],
+                font=FONTS["section"],
+                tags="roi_grid_bounds",
+            )
         if self.roi is not None and not self.rois:
             self.rois = [self.roi]
             self.active_roi_index = 0
@@ -2446,10 +2478,11 @@ class ISPApplication:
                 self.roi_drag_mode = "move"
                 self.roi_drag_original = self.roi
             else:
-                if len(self.rois) >= 24:
+                if len(self.rois) >= MAX_ROI_COUNT:
                     self.roi_drag_start = None
                     self.toast.show(
-                        "ROI 数量已达到 24 个，请先删除一个框",
+                        f"ROI 数量已达到 {MAX_ROI_COUNT} 个，"
+                        "请先删除一个框",
                         "warning",
                     )
                     return
@@ -2581,6 +2614,7 @@ class ISPApplication:
         self.rois = []
         self.active_roi_index = -1
         self.roi = None
+        self.roi_grid_bounds = None
         self.roi_process_var.set(False)
         self._update_roi_label()
         if was_processing:
@@ -2604,6 +2638,7 @@ class ISPApplication:
         )
         if self.roi is None:
             self.roi_process_var.set(False)
+            self.roi_grid_bounds = None
         self._update_roi_label()
         if was_processing:
             self.schedule_process(immediate=True)
@@ -2611,20 +2646,34 @@ class ISPApplication:
             self.render_current(schedule_analysis=True)
 
     def generate_24_rois(
-        self, rows: int = 4, cols: int = 6
+        self,
+        rows: int = 4,
+        cols: int = 6,
+        inset_fraction: float = 0.12,
     ) -> None:
         if self.roi is None:
             self.toast.show(
                 "请先框选色卡或采样区域的外接矩形", "warning"
             )
             return
-        self.rois = generate_grid_rois(
-            self.roi,
-            self.preview_image.shape,
-            rows=rows,
-            cols=cols,
-            bayer_aligned=self.loaded.domain == "bayer",
-        )
+        bounds = self.roi
+        try:
+            generated = generate_grid_rois(
+                bounds,
+                self.preview_image.shape,
+                rows=rows,
+                cols=cols,
+                inset_fraction=inset_fraction,
+                bayer_aligned=self.loaded.domain == "bayer",
+            )
+        except ISPError as exc:
+            self.toast.show(str(exc), "warning")
+            return
+        self.roi_grid_bounds = bounds
+        self.roi_grid_rows = int(rows)
+        self.roi_grid_cols = int(cols)
+        self.roi_grid_inset = float(inset_fraction)
+        self.rois = generated
         self.active_roi_index = 0
         self.roi = self.rois[0]
         self.roi_process_var.set(False)
@@ -2636,10 +2685,32 @@ class ISPApplication:
             "success",
         )
 
+    def open_roi_grid_dialog(self) -> None:
+        if self.roi is None:
+            self.toast.show(
+                "请先框选分块区域，再打开自定义分块",
+                "warning",
+            )
+            return
+        result = ask_roi_grid(
+            self.root,
+            rows=self.roi_grid_rows,
+            cols=self.roi_grid_cols,
+            inset_percent=self.roi_grid_inset * 100.0,
+        )
+        if result is None:
+            return
+        rows, cols, inset_fraction = result
+        self.generate_24_rois(
+            rows=rows,
+            cols=cols,
+            inset_fraction=inset_fraction,
+        )
+
     def _roi_editor_changed(
         self, rois: List[ImageROI], active_index: int
     ) -> None:
-        self.rois = list(rois[:24])
+        self.rois = list(rois[:MAX_ROI_COUNT])
         self.active_roi_index = (
             min(max(active_index, 0), len(self.rois) - 1)
             if self.rois else -1
@@ -2782,12 +2853,12 @@ class ISPApplication:
         module = self.pipeline.module_by_id("white_balance")
         awb_source = self.preview_image
         if (
-            len(self.results) > 2
-            and self.results[2].domain == "bayer"
-            and self.results[2].image.shape[:2]
+            len(self.results) > 3
+            and self.results[3].domain == "bayer"
+            and self.results[3].image.shape[:2]
             == self.preview_image.shape[:2]
         ):
-            awb_source = self.results[2].image
+            awb_source = self.results[3].image
         try:
             result = estimate_awb(
                 awb_source,
@@ -3275,6 +3346,19 @@ class ISPApplication:
         self.calibration_workspace = CalibrationWorkspace(self.root, self)
         self._refresh_auto_summary()
 
+    def open_final_preview(self) -> None:
+        if (
+            self.final_preview_window is not None
+            and self.final_preview_window.winfo_exists()
+        ):
+            self.final_preview_window.lift()
+            self.final_preview_window.focus_set()
+            self.final_preview_window.refresh_from_app()
+            return
+        self.final_preview_window = FinalImpactWindow(
+            self.root, self
+        )
+
     @staticmethod
     def _image_filetypes():
         return [
@@ -3311,7 +3395,7 @@ class ISPApplication:
             return
         if 0 <= self.active_roi_index < len(self.rois):
             self.rois[self.active_roi_index] = self.roi
-        elif len(self.rois) < 24:
+        elif len(self.rois) < MAX_ROI_COUNT:
             self.rois.append(self.roi)
             self.active_roi_index = len(self.rois) - 1
 
@@ -3331,6 +3415,10 @@ class ISPApplication:
         )
         item.rois = list(self.rois)
         item.active_roi_index = self.active_roi_index
+        item.roi_grid_bounds = self.roi_grid_bounds
+        item.roi_grid_rows = self.roi_grid_rows
+        item.roi_grid_cols = self.roi_grid_cols
+        item.roi_grid_inset = self.roi_grid_inset
         item.manual_parameter_snapshots = copy.deepcopy(
             self.manual_parameter_snapshots
         )
@@ -3366,6 +3454,10 @@ class ISPApplication:
         self.rois = list(item.rois)
         self.active_roi_index = item.active_roi_index
         self.roi = item.active_roi()
+        self.roi_grid_bounds = item.roi_grid_bounds
+        self.roi_grid_rows = item.roi_grid_rows
+        self.roi_grid_cols = item.roi_grid_cols
+        self.roi_grid_inset = item.roi_grid_inset
         self.calibration_polygons = []
         self.roi_process_var.set(False)
         self.input_revision += 1
@@ -3397,6 +3489,11 @@ class ISPApplication:
         self._update_roi_label()
         self._set_loaded_status()
         self.schedule_process(immediate=True)
+        if (
+            self.final_preview_window is not None
+            and self.final_preview_window.winfo_exists()
+        ):
+            self.final_preview_window.refresh_from_app()
 
     def _on_image_selected(self, _event=None) -> None:
         index = self.image_combo.current()
@@ -3612,6 +3709,15 @@ class ISPApplication:
                 "roi": self.roi.to_dict() if self.roi else None,
                 "rois": [roi.to_dict() for roi in self.rois],
                 "active_roi_index": self.active_roi_index,
+                "roi_grid": {
+                    "bounds": (
+                        self.roi_grid_bounds.to_dict()
+                        if self.roi_grid_bounds else None
+                    ),
+                    "rows": self.roi_grid_rows,
+                    "cols": self.roi_grid_cols,
+                    "inset_fraction": self.roi_grid_inset,
+                },
                 "process_roi": self.roi_process_var.get(),
                 "analyze_roi": self.analysis_roi_var.get(),
                 "waveform_mode": self.waveform_mode_var.get(),
@@ -3719,7 +3825,7 @@ class ISPApplication:
             if isinstance(rois_data, list):
                 self.rois = [
                     ImageROI.from_dict(item)
-                    for item in rois_data[:24]
+                    for item in rois_data[:MAX_ROI_COUNT]
                     if isinstance(item, dict)
                 ]
             else:
@@ -3754,6 +3860,29 @@ class ISPApplication:
                 self.rois[self.active_roi_index]
                 if self.active_roi_index >= 0 else None
             )
+            grid_state = ui_state.get("roi_grid", {})
+            if isinstance(grid_state, dict):
+                bounds_data = grid_state.get("bounds")
+                self.roi_grid_bounds = (
+                    ImageROI.from_dict(bounds_data)
+                    if isinstance(bounds_data, dict) else None
+                )
+                if self.roi_grid_bounds is not None:
+                    self.roi_grid_bounds.validate(
+                        self.preview_image.shape
+                    )
+                self.roi_grid_rows = max(
+                    1, int(grid_state.get("rows", 4))
+                )
+                self.roi_grid_cols = max(
+                    1, int(grid_state.get("cols", 6))
+                )
+                self.roi_grid_inset = float(np.clip(
+                    grid_state.get("inset_fraction", 0.12),
+                    0.0, 0.4,
+                ))
+            else:
+                self.roi_grid_bounds = None
             self.roi_process_var.set(bool(ui_state.get("process_roi", False) and self.roi))
             self.analysis_roi_var.set(bool(ui_state.get("analyze_roi", True)))
             self.channel_var.set(ui_state.get("channel", "RGB"))
@@ -3927,7 +4056,7 @@ class ISPApplication:
     def show_about(self) -> None:
         messagebox.showinfo(
             "关于",
-            "ISP RAW Visual Simulator 0.4.4\n\n"
+            "ISP RAW Visual Simulator 0.4.5\n\n"
             "用于 RAW ISP 模块的离线视觉效果快速仿真。\n"
             "内部使用 float32；当前不保证与硬件 ISP 逐位一致。",
             parent=self.root,
@@ -3974,6 +4103,11 @@ class ISPApplication:
             and self.calibration_workspace.winfo_exists()
         ):
             self.calibration_workspace.close()
+        if (
+            self.final_preview_window is not None
+            and self.final_preview_window.winfo_exists()
+        ):
+            self.final_preview_window.close()
         self.toast.close()
         self.wheel_router.close()
         self.executor.shutdown(wait=False, cancel_futures=True)

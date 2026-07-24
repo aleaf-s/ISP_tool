@@ -169,7 +169,7 @@ class HiddenTkV044Tests(unittest.TestCase):
             _analyzer, stage_index, _options = (
                 panel._analysis_request()
             )
-            self.assertEqual(stage_index, 2)
+            self.assertEqual(stage_index, 3)
         finally:
             if root.winfo_exists():
                 root.update()
@@ -262,7 +262,9 @@ class HiddenTkV044Tests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_is_v044(self):
-        self.assertEqual(__version__, "0.4.4")
+        self.assertGreaterEqual(
+            tuple(map(int, __version__.split("."))), (0, 4, 4)
+        )
 
 
 if __name__ == "__main__":
