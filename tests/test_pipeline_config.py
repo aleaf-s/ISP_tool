@@ -21,7 +21,7 @@ class PipelineConfigTests(unittest.TestCase):
         source = synthetic_bayer(160, 120)
         pipeline = ISPPipeline()
         pipeline.module_by_id("white_balance").parameters["r_gain"] = 2.345
-        pipeline.module_by_id("sharpen").enabled = False
+        pipeline.module_by_id("color_correction_matrix").enabled = False
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             save_config(str(path), source.metadata, pipeline)
@@ -31,7 +31,11 @@ class PipelineConfigTests(unittest.TestCase):
             self.assertEqual(
                 restored.module_by_id("white_balance").parameters["r_gain"], 2.345
             )
-            self.assertFalse(restored.module_by_id("sharpen").enabled)
+            self.assertFalse(
+                restored.module_by_id(
+                    "color_correction_matrix"
+                ).enabled
+            )
 
     def test_incremental_processing_reuses_unchanged_prefix(self):
         source = synthetic_bayer(160, 120)
@@ -41,18 +45,20 @@ class PipelineConfigTests(unittest.TestCase):
         first = pipeline.process_cached(
             source.image, source.domain, source.metadata, first_snapshot, cache, 1
         )
-        pipeline.module_by_id("sharpen").parameters["strength"] = 1.0
+        pipeline.module_by_id(
+            "color_correction_matrix"
+        ).parameters["strength"] = 0.8
         second = pipeline.process_cached(
             source.image, source.domain, source.metadata, pipeline.snapshot(), cache, 1
         )
-        sharpen_index = next(
+        ccm_index = next(
             index for index, module in enumerate(pipeline.modules)
-            if module.module_id == "sharpen"
+            if module.module_id == "color_correction_matrix"
         )
-        # Result zero is the input; every stage before Sharpen is reused.
-        for result_index in range(sharpen_index + 1):
+        # Result zero is the input; every stage before CCM is reused.
+        for result_index in range(ccm_index + 1):
             self.assertIs(first[result_index], second[result_index])
-        self.assertIsNot(first[sharpen_index + 1], second[sharpen_index + 1])
+        self.assertIsNot(first[ccm_index + 1], second[ccm_index + 1])
 
 
 if __name__ == "__main__":

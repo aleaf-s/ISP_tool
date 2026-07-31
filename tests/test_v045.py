@@ -126,7 +126,7 @@ class HiddenTkV045Tests(unittest.TestCase):
             self.assertTrue(hasattr(workspace, "mesh_rows_var"))
             self.assertTrue(hasattr(workspace, "ccm_rotation_var"))
             self.assertEqual(
-                len(workspace.auto_panel.workspace_paned.panes()), 2
+                len(workspace.auto_panel.workspace_paned.panes()), 1
             )
         finally:
             if root.winfo_exists():
@@ -135,8 +135,10 @@ class HiddenTkV045Tests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_version_is_v045(self):
-        self.assertEqual(__version__, "0.4.5")
+    def test_version_is_at_least_v045(self):
+        self.assertGreaterEqual(
+            tuple(map(int, __version__.split("."))), (0, 4, 5)
+        )
 
 
 if __name__ == "__main__":

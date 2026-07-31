@@ -78,23 +78,23 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             app.pipeline_list.selection_clear(0, "end")
             app.pipeline_list.selection_set(demosaic_index)
             app._on_module_select()
-            self.assertFalse(app.auto_card.winfo_manager())
+            self.assertFalse(app.auto_mode_frame.winfo_manager())
         finally:
             if root.winfo_exists():
                 app.close()
 
-    def test_calibration_uses_two_panes_and_progressive_actions(self):
+    def test_calibration_uses_single_quick_correction_pane(self):
         root = self._root()
         app = ISPApplication(root)
         try:
             app.open_calibration_workspace()
             root.update()
             panel = app.calibration_workspace.auto_panel
-            self.assertEqual(len(panel.workspace_paned.panes()), 2)
-            self.assertTrue(panel.module_combo.winfo_manager())
-            self.assertFalse(panel.preview_button.winfo_manager())
-            self.assertFalse(panel.apply_button.winfo_manager())
-            self.assertFalse(panel.revert_button.winfo_manager())
+            self.assertEqual(len(panel.workspace_paned.panes()), 1)
+            self.assertFalse(hasattr(panel, "module_combo"))
+            self.assertFalse(hasattr(panel, "view"))
+            self.assertFalse(hasattr(panel, "advanced_section"))
+            self.assertTrue(panel.analyze_button.winfo_manager())
 
             module = app.pipeline.module_by_id(
                 "black_level_correction"
@@ -114,14 +114,10 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             machine.start(current)
             machine.transition(CalibrationUIState.SUGGESTED)
             panel._update_action_states()
-            self.assertTrue(panel.preview_button.winfo_manager())
-            self.assertFalse(panel.apply_button.winfo_manager())
-
-            machine.transition(CalibrationUIState.PREVIEWING)
-            panel._update_action_states()
-            self.assertFalse(panel.preview_button.winfo_manager())
-            self.assertTrue(panel.apply_button.winfo_manager())
-            self.assertTrue(panel.revert_button.winfo_manager())
+            self.assertEqual(
+                str(panel.analyze_button["text"]),
+                "矫正并应用",
+            )
         finally:
             if root.winfo_exists():
                 app.close()

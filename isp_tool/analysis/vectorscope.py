@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from ..models import ISPError, RawMetadata
-from ..preview import display_rgb
+from ..preview import bayer_cell_rgb, display_rgb
 
 
 def vectorscope_coordinates(
@@ -51,7 +51,11 @@ def compute_vectorscope(
     max_samples: int = 200000,
 ) -> np.ndarray:
     size = max(96, int(size))
-    rgb = display_rgb(image, domain, metadata)
+    rgb = (
+        bayer_cell_rgb(image, metadata)
+        if domain == "bayer"
+        else display_rgb(image, domain, metadata)
+    )
     flat = rgb.reshape(-1, 3)
     if len(flat) > max_samples:
         step = int(np.ceil(len(flat) / max_samples))
@@ -100,4 +104,3 @@ def compute_vectorscope(
     skin_point = (int(sx[0] * (size - 1)), int((1 - sy[0]) * (size - 1)))
     cv2.line(canvas, center_px, skin_point, (80, 110, 180), 1, cv2.LINE_AA)
     return canvas.astype(np.float32) / 255.0
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from ..models import ParameterSpec
@@ -42,11 +43,26 @@ class ColorCorrectionMatrix(ISPModule):
             self.parameters["offset_g"],
             self.parameters["offset_b"],
         ], np.float32)
-        corrected = np.einsum("...c,dc->...d", src, matrix) + offset
         strength = float(self.parameters["strength"])
-        output = src * (1.0 - strength) + corrected * strength
-        return output.astype(np.float32), "rgb", {
+        effective_matrix = (
+            np.eye(3, dtype=np.float32) * (1.0 - strength)
+            + matrix * strength
+        )
+        effective_offset = offset * strength
+        if (
+            np.array_equal(effective_matrix, np.eye(3, dtype=np.float32))
+            and not np.any(effective_offset)
+        ):
+            output = src
+        else:
+            output = cv2.transform(src, effective_matrix)
+            if np.any(effective_offset):
+                output = output + effective_offset
+        out_of_range = (
+            np.count_nonzero(output < 0)
+            + np.count_nonzero(output > 1)
+        ) / max(output.size, 1)
+        return output.astype(np.float32, copy=False), "rgb", {
             "矩阵行列式": float(np.linalg.det(matrix)),
-            "输出越界比例": float(np.mean((output < 0) | (output > 1))),
+            "输出越界比例": float(out_of_range),
         }
-

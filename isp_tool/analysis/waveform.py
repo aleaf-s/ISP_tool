@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from ..models import RawMetadata
-from ..preview import display_rgb
+from ..preview import bayer_cell_rgb, display_rgb
 
 
 def _density(channel: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -34,7 +34,11 @@ def compute_waveform(
     """Return a display-ready float RGB waveform image in [0, 1]."""
     width = max(48, int(width))
     height = max(32, int(height))
-    rgb = display_rgb(image, domain, metadata)
+    rgb = (
+        bayer_cell_rgb(image, metadata)
+        if domain == "bayer"
+        else display_rgb(image, domain, metadata)
+    )
     if mode == "Luma":
         y = np.sum(rgb * np.array([0.2126, 0.7152, 0.0722], np.float32), axis=2)
         density = _density(y, width, height)

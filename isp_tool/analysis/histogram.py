@@ -5,7 +5,7 @@ from typing import Dict
 import numpy as np
 
 from ..models import RawMetadata
-from ..preview import display_rgb
+from ..preview import bayer_cell_rgb, display_rgb
 
 
 def compute_histogram(
@@ -14,7 +14,11 @@ def compute_histogram(
     metadata: RawMetadata,
     bins: int = 256,
 ) -> Dict[str, np.ndarray]:
-    rgb = display_rgb(image, domain, metadata)
+    rgb = (
+        bayer_cell_rgb(image, metadata)
+        if domain == "bayer"
+        else display_rgb(image, domain, metadata)
+    )
     result = {}
     for index, name in enumerate(("R", "G", "B")):
         result[name] = np.histogram(rgb[:, :, index], bins=bins, range=(0, 1))[0]
@@ -23,4 +27,3 @@ def compute_histogram(
     )
     result["Y"] = np.histogram(luminance, bins=bins, range=(0, 1))[0]
     return result
-

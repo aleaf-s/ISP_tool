@@ -127,7 +127,13 @@ def sample_colorchecker(
     height, width = image.shape[:2]
     patches = []
     for patch_id, polygon in enumerate(polygons):
-        points = np.round(np.asarray(polygon, dtype=np.float32)).astype(np.int32)
+        polygon_array = np.asarray(polygon, dtype=np.float32)
+        # Sample the central part again even when the grid itself was already
+        # inset.  This deliberately avoids printed borders and perspective
+        # interpolation leakage between neighbouring patches.
+        center = polygon_array.mean(axis=0, keepdims=True)
+        sample_polygon = center + (polygon_array - center) * 0.82
+        points = np.round(sample_polygon).astype(np.int32)
         if (
             points[:, 0].min() < 0 or points[:, 1].min() < 0
             or points[:, 0].max() >= width or points[:, 1].max() >= height
@@ -135,14 +141,56 @@ def sample_colorchecker(
             raise ISPError(f"色块 {patch_id + 1} ROI 超出图像")
         mask = np.zeros((height, width), np.uint8)
         cv2.fillConvexPoly(mask, points, 1)
-        samples = image[mask.astype(bool), :3]
-        if samples.shape[0] < 9:
+        raw_samples = image[mask.astype(bool), :3]
+        finite_mask = np.all(np.isfinite(raw_samples), axis=1)
+        finite = raw_samples[finite_mask]
+        if finite.shape[0] < 9:
             raise ISPError(f"色块 {patch_id + 1} 有效像素不足")
-        measured = (
-            np.median(samples, axis=0)
-            if statistic == "Median"
-            else np.mean(samples, axis=0)
-        ).astype(np.float32)
+        clipped_mask = np.any(finite >= 0.985, axis=1)
+        dark_mask = np.all(finite <= 0.008, axis=1)
+        usable = finite[~clipped_mask & ~dark_mask]
+        if usable.shape[0] < 9:
+            usable = finite
+
+        median = np.median(usable, axis=0)
+        mad = np.median(np.abs(usable - median), axis=0)
+        robust_scale = np.maximum(mad * 1.4826, 1e-5)
+        inlier_mask = np.max(
+            np.abs(usable - median) / robust_scale,
+            axis=1,
+        ) <= 3.5
+        inliers = usable[inlier_mask]
+        if inliers.shape[0] < 9:
+            inliers = usable
+
+        statistic_key = str(statistic).strip().lower()
+        if statistic_key == "median":
+            measured = np.median(inliers, axis=0)
+        elif statistic_key in {"trimmed mean", "截尾均值"}:
+            ordered = np.sort(inliers, axis=0)
+            trim = min(int(len(ordered) * 0.1), max(0, len(ordered) // 2 - 1))
+            measured = np.mean(
+                ordered[trim:len(ordered) - trim] if trim else ordered,
+                axis=0,
+            )
+        else:
+            # Robust Mean is the default for unrecognised legacy labels.
+            measured = np.mean(inliers, axis=0)
+        measured = measured.astype(np.float32)
+        clipped_ratio = float(np.mean(clipped_mask))
+        dark_ratio = float(np.mean(dark_mask))
+        variation = float(
+            np.max(mad / np.maximum(np.abs(median), 0.02))
+        )
+        reasons = []
+        if clipped_ratio > 0.12:
+            reasons.append("过曝像素过多")
+        if dark_ratio > 0.45:
+            reasons.append("欠曝像素过多")
+        if variation > 0.18:
+            reasons.append("色块内部不均匀")
+        if inliers.shape[0] < max(9, int(finite.shape[0] * 0.35)):
+            reasons.append("异常像素过多")
         reference_index = int(order[patch_id])
         delta, measured_lab, reference_lab = delta_e_values(
             measured[None, :], references[reference_index][None, :], "CIE 2000"
@@ -156,5 +204,19 @@ def sample_colorchecker(
             measured_lab[0].astype(np.float32),
             reference_lab[0].astype(np.float32),
             float(delta[0]),
+            {
+                "valid": not reasons,
+                "reasons": reasons,
+                "pixel_count": int(raw_samples.shape[0]),
+                "finite_count": int(finite.shape[0]),
+                "sample_count": int(inliers.shape[0]),
+                "rejected_count": int(usable.shape[0] - inliers.shape[0]),
+                "clipped_ratio": clipped_ratio,
+                "dark_ratio": dark_ratio,
+                "variation": variation,
+                "statistic": statistic,
+                "sample_inner_scale": 0.82,
+                "reference_index": reference_index,
+            },
         ))
     return patches

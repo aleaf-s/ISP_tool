@@ -86,15 +86,35 @@ class PerformanceMetrics:
 
     def details_text(self) -> str:
         snapshot = self.snapshot()
-        lines = ["PERFORMANCE DETAILS", ""]
-        for name in sorted(snapshot["timings"]):
-            values = snapshot["timings"][name]
+        timings = snapshot["timings"]
+        lines = ["PERFORMANCE DETAILS", "", "END-TO-END"]
+        for name in sorted(
+            item for item in timings if not item.startswith("module:")
+        ):
+            values = timings[name]
             lines.append(
-                f"{name:<16} latest {values['latest']:8.2f} ms  "
+                f"{name:<24} latest {values['latest']:8.2f} ms  "
                 f"avg {values['average']:8.2f} ms  "
                 f"p50 {values['p50']:8.2f} ms  "
                 f"p95 {values['p95']:8.2f} ms"
             )
+        module_rows = sorted(
+            (
+                (name.removeprefix("module:"), values)
+                for name, values in timings.items()
+                if name.startswith("module:")
+            ),
+            key=lambda item: item[1]["average"],
+            reverse=True,
+        )
+        if module_rows:
+            lines.extend(["", "ISP MODULES · slowest rolling average first"])
+            for name, values in module_rows:
+                lines.append(
+                    f"{name:<32} latest {values['latest']:8.2f} ms  "
+                    f"avg {values['average']:8.2f} ms  "
+                    f"p95 {values['p95']:8.2f} ms"
+                )
         if snapshot["values"]:
             lines.extend(["", "STATE"])
             lines.extend(

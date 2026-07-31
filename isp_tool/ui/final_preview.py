@@ -246,6 +246,9 @@ class FinalImpactWindow(tk.Toplevel):
             cache_matches = (
                 self.app.pipeline_cache.get("input_revision")
                 == self.app.input_revision
+                and self.app.pipeline_cache.get(
+                    "backend_cache_key"
+                ) == self.app.pipeline.backend_cache_key
                 and self.app.pipeline_cache.get("snapshot")
                 == self.snapshot
                 and self.app.pipeline_cache.get(
@@ -320,12 +323,17 @@ class FinalImpactWindow(tk.Toplevel):
         metadata = copy.deepcopy(self.metadata)
         snapshot = copy.deepcopy(self.snapshot)
         baseline_stage = self.baseline_stage
+        backend = self.app.pipeline.backend
+        backend_preference = self.app.pipeline.backend_preference
         self.status_var.set(f"正在计算：{module_name}")
         self.bypass_pane.clear(f"正在旁路 {module_name}")
         self.diff_pane.clear("正在计算影响")
 
         def task():
-            pipeline = ISPPipeline()
+            pipeline = ISPPipeline(
+                backend=backend,
+                backend_preference=backend_preference,
+            )
             baseline = baseline_stage
             if baseline is None:
                 baseline = pipeline.process(

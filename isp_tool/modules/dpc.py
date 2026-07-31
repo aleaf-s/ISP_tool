@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
+from ..backends import get_default_backend
 from ..models import ParameterSpec
 from .base import ISPModule
 
@@ -80,41 +80,49 @@ class DefectivePixelCorrection(ISPModule):
                 raise ValueError(
                     "Static DPC map shape does not match the current image"
                 )
-        # Work per CFA plane by comparing pixels two sensor pixels apart.
-        corrected = src.copy()
-        hot_mask_full = np.zeros(src.shape, dtype=bool)
-        dark_mask_full = np.zeros(src.shape, dtype=bool)
-        for y in range(2):
-            for x in range(2):
-                plane = src[y::2, x::2]
-                median = cv2.medianBlur(plane, kernel)
-                delta = plane - median
-                hot_mask = np.zeros_like(plane, dtype=bool)
-                dark_mask = np.zeros_like(plane, dtype=bool)
-                if self.parameters["detect_hot"]:
-                    hot_mask = delta > float(self.parameters["threshold"])
-                if self.parameters["detect_dark"]:
-                    dark_mask = delta < -float(self.parameters["threshold"])
-                mode = self.parameters.get("mode", "Dynamic")
-                if mode == "Static Map":
-                    hot_mask[:] = False
-                    dark_mask[:] = False
-                if static_map is not None and mode in {"Static Map", "Hybrid"}:
-                    static_plane = static_map[y::2, x::2]
-                    hot_mask |= static_plane == 1
-                    dark_mask |= static_plane == 2
-                mask = hot_mask | dark_mask
-                corrected[y::2, x::2][mask] = median[mask]
-                hot_mask_full[y::2, x::2] = hot_mask
-                dark_mask_full[y::2, x::2] = dark_mask
-        defect_mask = hot_mask_full.astype(np.uint8) + dark_mask_full.astype(np.uint8) * 2
-        count = int(np.count_nonzero(defect_mask))
-        return corrected, "bayer", {
-            "坏点数量": count,
-            "亮坏点": int(hot_mask_full.sum()),
-            "暗坏点": int(dark_mask_full.sum()),
-            "坏点比例": count / max(src.size, 1),
+        mode = self.parameters.get("mode", "Dynamic")
+        dynamic_enabled = (
+            mode in {"Dynamic", "Hybrid"}
+            and (
+                bool(self.parameters["detect_hot"])
+                or bool(self.parameters["detect_dark"])
+            )
+        )
+        static_enabled = (
+            static_map is not None
+            and mode in {"Static Map", "Hybrid"}
+            and bool(np.any(static_map))
+        )
+        if not dynamic_enabled and not static_enabled:
+            defect_mask = np.zeros(src.shape, dtype=np.uint8)
+            return src, "bayer", {
+                "坏点数量": 0,
+                "亮坏点": 0,
+                "暗坏点": 0,
+                "坏点比例": 0.0,
+                "Mode": mode,
+                "Backend": "bypass",
+            }, {
+                "Defect Mask": defect_mask,
+            }
+        backend = self.processing_backend or get_default_backend()
+        kernel_result = backend.correct_defective_pixels(
+            src,
+            kernel=kernel,
+            threshold=float(self.parameters["threshold"]),
+            detect_hot=bool(self.parameters["detect_hot"]),
+            detect_dark=bool(self.parameters["detect_dark"]),
+            static_map=static_map,
+            dynamic_enabled=dynamic_enabled,
+            static_enabled=static_enabled,
+        )
+        return kernel_result.corrected, "bayer", {
+            "坏点数量": kernel_result.corrected_count,
+            "亮坏点": kernel_result.hot_count,
+            "暗坏点": kernel_result.dark_count,
+            "坏点比例": kernel_result.corrected_count / max(src.size, 1),
             "Mode": self.parameters.get("mode", "Dynamic"),
+            "Backend": kernel_result.implementation,
         }, {
-            "Defect Mask": defect_mask,
+            "Defect Mask": kernel_result.defect_mask,
         }

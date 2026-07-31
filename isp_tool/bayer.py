@@ -80,7 +80,7 @@ def resize_bayer_preview(image: np.ndarray, pattern: str, max_side: int = 1400) 
 def bayer_to_rgb_bilinear(image: np.ndarray, pattern: str) -> np.ndarray:
     """Normalized-convolution bilinear demosaic; output is RGB float32."""
     src = np.asarray(image, dtype=np.float32)
-    cfa_masks = masks(src.shape, pattern)
+    positions = channel_positions(pattern)
     kernels = {
         "R": np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], np.float32),
         "G": np.array([[0, 1, 0], [1, 4, 1], [0, 1, 0]], np.float32),
@@ -88,27 +88,179 @@ def bayer_to_rgb_bilinear(image: np.ndarray, pattern: str) -> np.ndarray:
     }
     rgb_channels = []
     for channel in ("R", "G", "B"):
+        sampled = np.zeros_like(src)
         if channel == "G":
-            mask = cfa_masks["Gr"] | cfa_masks["Gb"]
+            for green in ("Gr", "Gb"):
+                y, x = positions[green]
+                sampled[y::2, x::2] = src[y::2, x::2]
         else:
-            mask = cfa_masks[channel]
-        weights = mask.astype(np.float32)
+            y, x = positions[channel]
+            sampled[y::2, x::2] = src[y::2, x::2]
         kernel = kernels[channel]
-        numerator = cv2.filter2D(src * weights, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
-        denominator = cv2.filter2D(weights, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
-        rgb_channels.append(numerator / np.maximum(denominator, 1e-8))
-    return np.stack(rgb_channels, axis=-1).astype(np.float32)
+        # For a 2x2 Bayer lattice these interpolation kernels, together with
+        # REFLECT_101 borders, have a constant normalization denominator of 4.
+        # Avoid rebuilding masks and filtering three invariant denominator
+        # images on every preview refresh.
+        numerator = cv2.filter2D(
+            sampled, -1, kernel, borderType=cv2.BORDER_REFLECT_101
+        )
+        rgb_channels.append(numerator * 0.25)
+    return np.stack(rgb_channels, axis=-1).astype(np.float32, copy=False)
+
+
+def _nearest_lattice_plane(
+    src: np.ndarray,
+    position: Tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand one CFA lattice to full resolution with nearest-neighbour lookup."""
+    height, width = src.shape
+    y0, x0 = position
+    rows = np.arange(y0, height, 2)
+    columns = np.arange(x0, width, 2)
+    if rows.size == 0 or columns.size == 0:
+        empty = np.zeros_like(src, dtype=np.float32)
+        distance = np.full(src.shape, np.inf, dtype=np.float32)
+        return empty, distance
+
+    y_index = np.floor(
+        (np.arange(height, dtype=np.float32) - y0) * 0.5 + 0.5
+    ).astype(np.intp)
+    x_index = np.floor(
+        (np.arange(width, dtype=np.float32) - x0) * 0.5 + 0.5
+    ).astype(np.intp)
+    np.clip(y_index, 0, rows.size - 1, out=y_index)
+    np.clip(x_index, 0, columns.size - 1, out=x_index)
+    nearest_rows = rows[y_index]
+    nearest_columns = columns[x_index]
+    plane = src[np.ix_(nearest_rows, nearest_columns)]
+    distance = (
+        (np.arange(height) - nearest_rows)[:, None] ** 2
+        + (np.arange(width) - nearest_columns)[None, :] ** 2
+    )
+    return (
+        np.asarray(plane, dtype=np.float32),
+        np.asarray(distance, dtype=np.float32),
+    )
+
+
+def bayer_to_rgb_nearest(image: np.ndarray, pattern: str) -> np.ndarray:
+    """Nearest-neighbour demosaic that preserves every measured CFA sample."""
+    src = np.asarray(image, dtype=np.float32)
+    positions = channel_positions(pattern)
+    red, _ = _nearest_lattice_plane(src, positions["R"])
+    blue, _ = _nearest_lattice_plane(src, positions["B"])
+    green_r, distance_r = _nearest_lattice_plane(src, positions["Gr"])
+    green_b, distance_b = _nearest_lattice_plane(src, positions["Gb"])
+    green = np.where(
+        distance_r < distance_b,
+        green_r,
+        np.where(distance_b < distance_r, green_b, 0.5 * (green_r + green_b)),
+    )
+    return np.stack((red, green, blue), axis=-1).astype(
+        np.float32, copy=False
+    )
+
+
+def bayer_to_rgb_adaptive(image: np.ndarray, pattern: str) -> np.ndarray:
+    """Directional adaptive interpolation.
+
+    Red and blue start from bilinear interpolation. Green values at red/blue
+    sites select the smoother of the horizontal and vertical directions using
+    first- and second-order Bayer gradients.
+    """
+    src = np.asarray(image, dtype=np.float32)
+    output = bayer_to_rgb_bilinear(src, pattern)
+    padded = np.pad(src, 2, mode="reflect")
+    center = padded[2:-2, 2:-2]
+    left = padded[2:-2, 1:-3]
+    right = padded[2:-2, 3:-1]
+    up = padded[1:-3, 2:-2]
+    down = padded[3:-1, 2:-2]
+    left2 = padded[2:-2, :-4]
+    right2 = padded[2:-2, 4:]
+    up2 = padded[:-4, 2:-2]
+    down2 = padded[4:, 2:-2]
+
+    horizontal = 0.5 * (left + right)
+    vertical = 0.5 * (up + down)
+    horizontal_gradient = (
+        np.abs(left - right)
+        + np.abs(2.0 * center - left2 - right2)
+    )
+    vertical_gradient = (
+        np.abs(up - down)
+        + np.abs(2.0 * center - up2 - down2)
+    )
+    adaptive_green = np.where(
+        horizontal_gradient < vertical_gradient,
+        horizontal,
+        np.where(
+            vertical_gradient < horizontal_gradient,
+            vertical,
+            0.5 * (horizontal + vertical),
+        ),
+    )
+    cfa_masks = masks(src.shape, pattern)
+    red_or_blue = cfa_masks["R"] | cfa_masks["B"]
+    output[..., 1][red_or_blue] = adaptive_green[red_or_blue]
+    return output.astype(np.float32, copy=False)
+
+
+def bayer_to_rgb_constant_color_difference(
+    image: np.ndarray,
+    pattern: str,
+) -> np.ndarray:
+    """Demosaic using locally smooth R-G and B-G color differences."""
+    src = np.asarray(image, dtype=np.float32)
+    output = bayer_to_rgb_adaptive(src, pattern)
+    green = output[..., 1]
+    positions = channel_positions(pattern)
+    kernel = np.array(
+        [[1, 2, 1], [2, 4, 2], [1, 2, 1]],
+        dtype=np.float32,
+    )
+    for output_index, channel in ((0, "R"), (2, "B")):
+        sampled_difference = np.zeros_like(src, dtype=np.float32)
+        y, x = positions[channel]
+        sampled_difference[y::2, x::2] = (
+            src[y::2, x::2] - green[y::2, x::2]
+        )
+        difference = cv2.filter2D(
+            sampled_difference,
+            -1,
+            kernel,
+            borderType=cv2.BORDER_REFLECT_101,
+        ) * 0.25
+        output[..., output_index] = green + difference
+        output[y::2, x::2, output_index] = src[y::2, x::2]
+    return output.astype(np.float32, copy=False)
+
+
+def bayer_to_rgb_opencv_bilinear(image: np.ndarray, pattern: str) -> np.ndarray:
+    """Fast OpenCV bilinear demosaic with adaptive uint16 scaling.
+
+    This path is intended for interactive preview. It preserves values above
+    one by scaling against the current Bayer maximum before uint16 conversion.
+    The outermost border follows OpenCV's interpolation convention and may
+    differ from the exact normalized-convolution implementation above.
+    """
+    src = np.asarray(image, dtype=np.float32)
+    scale = max(float(src.max(initial=1.0)), 1.0)
+    src16 = np.round(
+        np.clip(src, 0.0, scale) * (65535.0 / scale)
+    ).astype(np.uint16)
+    codes = {
+        "RGGB": cv2.COLOR_BayerRG2BGR,
+        "GRBG": cv2.COLOR_BayerGR2BGR,
+        "GBRG": cv2.COLOR_BayerGB2BGR,
+        "BGGR": cv2.COLOR_BayerBG2BGR,
+    }
+    return (
+        cv2.cvtColor(src16, codes[pattern]).astype(np.float32)
+        * (scale / 65535.0)
+    )
 
 
 def bayer_to_rgb_edge_aware(image: np.ndarray, pattern: str) -> np.ndarray:
-    src16 = np.clip(np.asarray(image) * 65535.0, 0, 65535).astype(np.uint16)
-    # OpenCV's Bayer*2BGR constants produce channel order R,G,B for a mosaic
-    # whose pattern is named from the top-left pixel. Verify this explicitly in
-    # tests because the constant naming is otherwise easy to misinterpret.
-    codes = {
-        "RGGB": cv2.COLOR_BayerRG2BGR_EA,
-        "GRBG": cv2.COLOR_BayerGR2BGR_EA,
-        "GBRG": cv2.COLOR_BayerGB2BGR_EA,
-        "BGGR": cv2.COLOR_BayerBG2BGR_EA,
-    }
-    return cv2.cvtColor(src16, codes[pattern]).astype(np.float32) / 65535.0
+    """Deprecated compatibility alias for adaptive interpolation."""
+    return bayer_to_rgb_adaptive(image, pattern)

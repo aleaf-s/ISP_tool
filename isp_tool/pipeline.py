@@ -3,45 +3,98 @@ from __future__ import annotations
 import copy
 import math
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from concurrent.futures import CancelledError
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 
+from .backends import (
+    DEFAULT_BACKEND_PREFERENCE,
+    BackendSelection,
+    ProcessingBackend,
+    select_backend,
+)
 from .models import ISPError, ImageROI, RawMetadata, StageResult
 from .modules import (
     BlackLevelCorrection,
-    ColorAdjustment,
     ColorCorrectionMatrix,
-    DefectivePixelCorrection,
     Demosaic,
     LensShadingCorrection,
-    NoiseReduction,
-    Sharpen,
-    ToneMapping,
     WhiteBalance,
 )
 
 
 class ISPPipeline:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        backend: Optional[ProcessingBackend] = None,
+        backend_preference: str = DEFAULT_BACKEND_PREFERENCE,
+    ) -> None:
+        selection = select_backend(backend_preference)
+        if backend is not None:
+            selection = BackendSelection(
+                selection.preference,
+                backend,
+                selection.native,
+            )
+        self.backend_selection = selection
         self.modules = [
             BlackLevelCorrection(),
-            DefectivePixelCorrection(),
             LensShadingCorrection(),
             WhiteBalance(),
             Demosaic(),
             ColorCorrectionMatrix(),
-            ToneMapping(),
-            NoiseReduction(),
-            Sharpen(),
-            ColorAdjustment(),
         ]
+        self._assign_backend()
+
+    @property
+    def backend(self) -> ProcessingBackend:
+        return self.backend_selection.backend
+
+    @property
+    def backend_preference(self) -> str:
+        return self.backend_selection.preference
+
+    @property
+    def backend_cache_key(self) -> str:
+        return self.backend_selection.cache_key
+
+    @property
+    def native_backend_available(self) -> bool:
+        return self.backend_selection.native.available
+
+    def _assign_backend(self) -> None:
+        for module in self.modules:
+            module.processing_backend = self.backend
+
+    def set_backend_preference(
+        self, preference: str
+    ) -> BackendSelection:
+        self.backend_selection = select_backend(preference)
+        self._assign_backend()
+        return self.backend_selection
+
+    def set_backend(
+        self,
+        backend: ProcessingBackend,
+        preference: Optional[str] = None,
+    ) -> BackendSelection:
+        current = self.backend_selection
+        self.backend_selection = BackendSelection(
+            preference or current.preference,
+            backend,
+            current.native,
+        )
+        self._assign_backend()
+        return self.backend_selection
 
     def module_by_id(self, module_id: str):
         return next(module for module in self.modules if module.module_id == module_id)
 
     @staticmethod
-    def _normalize_module_output(output, module_name: str):
+    def _normalize_module_output(
+        output, module_name: str, validated_input: Optional[np.ndarray] = None
+    ):
         if not isinstance(output, tuple) or len(output) not in {3, 4}:
             raise ISPError(f"{module_name} 返回了无效的模块结果")
         if len(output) == 3:
@@ -50,7 +103,7 @@ class ISPPipeline:
         else:
             image, domain, diagnostics, artifacts = output
         image = np.asarray(image, dtype=np.float32)
-        if not np.all(np.isfinite(image)):
+        if image is not validated_input and not np.all(np.isfinite(image)):
             count = int(np.size(image) - np.count_nonzero(np.isfinite(image)))
             raise ISPError(f"{module_name} 输出包含 {count} 个 NaN 或 Infinity")
         return image, domain, dict(diagnostics or {}), dict(artifacts or {})
@@ -84,6 +137,7 @@ class ISPPipeline:
         current: np.ndarray,
         current_domain: str,
         metadata: RawMetadata,
+        backend: ProcessingBackend,
     ) -> StageResult:
         enabled = bool(config["enabled"])
         if not enabled or current_domain not in module.input_domains:
@@ -97,8 +151,12 @@ class ISPPipeline:
                 {"状态": reason},
                 {},
             )
-        worker_module = copy.deepcopy(module)
+        # A full deepcopy duplicates DPC maps and other calibration state for
+        # every refresh. The detached snapshot below is the worker's source of
+        # truth, so a shallow module shell is sufficient and much cheaper.
+        worker_module = copy.copy(module)
         worker_module.enabled = enabled
+        worker_module.processing_backend = backend
         worker_module.parameters = dict(config["parameters"])
         worker_module.load_state(config.get("state", {}))
         try:
@@ -106,7 +164,7 @@ class ISPPipeline:
             raw_output = worker_module.process(current, current_domain, metadata)
             elapsed = (time.perf_counter() - started) * 1000.0
             image, domain, diagnostics, artifacts = self._normalize_module_output(
-                raw_output, module.name
+                raw_output, module.name, current
             )
         except ISPError:
             raise
@@ -159,8 +217,14 @@ class ISPPipeline:
         input_revision: int,
         roi: Optional[ImageROI] = None,
         roi_halo: int = 24,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> List[StageResult]:
         """Process a full preview or a halo-expanded ROI with prefix caching."""
+        process_started = time.perf_counter()
+        # Capture one backend for the entire worker request. A UI backend
+        # switch can then safely supersede this request without mixing kernels.
+        processing_backend = self.backend
+        backend_cache_key = processing_backend.cache_key
         source = np.asarray(image, dtype=np.float32)
         if source.ndim not in {2, 3}:
             raise ISPError(f"流水线输入维度无效：{source.shape}")
@@ -187,6 +251,7 @@ class ISPPipeline:
         public_results = cache.get("results")
         cache_valid = (
             cache.get("input_revision") == input_revision
+            and cache.get("backend_cache_key") == backend_cache_key
             and cache.get("roi_key") == roi_key
             and isinstance(working_results, list)
             and len(working_results) == len(self.modules) + 1
@@ -204,16 +269,22 @@ class ISPPipeline:
                     dirty_index = index
                     break
             if dirty_index == len(self.modules):
+                wall_elapsed = (time.perf_counter() - process_started) * 1000.0
                 cache["last_metrics"] = {
                     "cache_hits": len(self.modules),
                     "recomputed": 0,
                     "elapsed_ms": 0.0,
+                    "wall_elapsed_ms": wall_elapsed,
+                    "overhead_ms": wall_elapsed,
+                    "module_timings": {},
+                    "dirty_index": len(self.modules),
+                    "backend_cache_key": backend_cache_key,
                     "roi": requested.to_dict() if roi is not None else None,
                     "halo": roi_halo if roi is not None else 0,
                 }
                 return public_results
 
-        process_metadata = copy.deepcopy(metadata)
+        process_metadata = copy.copy(metadata)
         # Runtime-only coordinates let spatial modules such as LSC evaluate an
         # ROI in the same coordinate system as the full preview.
         process_metadata._processing_frame_width = source.shape[1]
@@ -245,24 +316,43 @@ class ISPPipeline:
             new_public = [self._public_result(input_working, core)]
 
         for module, config in zip(self.modules[dirty_index:], snapshot[dirty_index:]):
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("Superseded ISP preview")
             result = self._run_module(
-                module, config, current, current_domain, process_metadata
+                module,
+                config,
+                current,
+                current_domain,
+                process_metadata,
+                processing_backend,
             )
             current, current_domain = result.image, result.domain
             new_working.append(result)
             new_public.append(self._public_result(result, core))
 
         cache["input_revision"] = input_revision
+        cache["backend_cache_key"] = backend_cache_key
         cache["roi_key"] = roi_key
         cache["snapshot"] = copy.deepcopy(snapshot)
         cache["working_results"] = new_working
         cache["results"] = new_public
+        recomputed_results = new_working[dirty_index + 1:]
+        module_elapsed = float(
+            sum(result.elapsed_ms for result in recomputed_results)
+        )
+        wall_elapsed = (time.perf_counter() - process_started) * 1000.0
         cache["last_metrics"] = {
             "cache_hits": dirty_index,
             "recomputed": len(self.modules) - dirty_index,
-            "elapsed_ms": float(
-                sum(result.elapsed_ms for result in new_working[dirty_index + 1:])
-            ),
+            "elapsed_ms": module_elapsed,
+            "wall_elapsed_ms": wall_elapsed,
+            "overhead_ms": max(0.0, wall_elapsed - module_elapsed),
+            "module_timings": {
+                result.module_id: float(result.elapsed_ms)
+                for result in recomputed_results
+            },
+            "dirty_index": dirty_index,
+            "backend_cache_key": backend_cache_key,
             "roi": requested.to_dict() if roi is not None else None,
             "halo": roi_halo if roi is not None else 0,
         }

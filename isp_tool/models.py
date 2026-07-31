@@ -468,6 +468,7 @@ class ColorCheckerPatch:
     measured_lab: np.ndarray = field(default_factory=lambda: np.zeros(3, np.float32))
     reference_lab: np.ndarray = field(default_factory=lambda: np.zeros(3, np.float32))
     delta_e: float = 0.0
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -479,6 +480,7 @@ class ColorCheckerPatch:
             "measured_lab": np.asarray(self.measured_lab).tolist(),
             "reference_lab": np.asarray(self.reference_lab).tolist(),
             "delta_e": self.delta_e,
+            "diagnostics": _json_safe(self.diagnostics),
         }
 
     @classmethod
@@ -492,6 +494,7 @@ class ColorCheckerPatch:
             measured_lab=np.asarray(data.get("measured_lab", [0, 0, 0]), dtype=np.float32),
             reference_lab=np.asarray(data.get("reference_lab", [0, 0, 0]), dtype=np.float32),
             delta_e=float(data.get("delta_e", 0.0)),
+            diagnostics=dict(data.get("diagnostics", {})),
         )
 
 

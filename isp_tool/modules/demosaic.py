@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..bayer import bayer_to_rgb_bilinear, bayer_to_rgb_edge_aware
+from ..backends import get_default_backend
 from ..models import ParameterSpec
 from .base import ISPModule
 
@@ -14,16 +14,24 @@ class Demosaic(ISPModule):
         super().__init__([
             ParameterSpec(
                 "algorithm", "Algorithm", "choice", "Bilinear",
-                choices=("Bilinear", "Edge-aware"),
+                choices=(
+                    "Nearest Neighbor",
+                    "Bilinear",
+                    "Adaptive Interpolation",
+                    "Constant Color Difference",
+                ),
             ),
             ParameterSpec("false_color_suppression", "False Color Suppression", "float", 0.0, 0, 1, 0.01),
         ])
 
     def process(self, image, domain, metadata):
-        if self.parameters["algorithm"] == "Edge-aware":
-            output = bayer_to_rgb_edge_aware(image, metadata.bayer_pattern)
-        else:
-            output = bayer_to_rgb_bilinear(image, metadata.bayer_pattern)
+        backend = self.processing_backend or get_default_backend()
+        kernel_result = backend.demosaic(
+            image,
+            metadata.bayer_pattern,
+            self.parameters["algorithm"],
+        )
+        output = kernel_result.image
         strength = float(self.parameters["false_color_suppression"])
         if strength > 0:
             import cv2
@@ -32,5 +40,7 @@ class Demosaic(ISPModule):
             chroma = output - luminance
             smooth = cv2.GaussianBlur(chroma, (0, 0), 0.7)
             output = luminance + (1.0 - strength) * chroma + strength * smooth
-        return output, "rgb", {"算法": self.parameters["algorithm"]}
-
+        return output, "rgb", {
+            "算法": self.parameters["algorithm"],
+            "Backend": kernel_result.implementation,
+        }

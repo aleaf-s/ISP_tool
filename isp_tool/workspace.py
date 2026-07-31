@@ -3,9 +3,26 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import CalibrationSession, ImageROI, LoadedImage
+
+
+@dataclass
+class RuntimePreviewState:
+    """Non-persistent, bounded cache entry for one processed work image."""
+
+    preview_quality: str
+    preview_max_side: int
+    backend_cache_key: str
+    preview_image: Any
+    pipeline_snapshot: List[Dict]
+    pipeline_cache: Dict[str, Any]
+    results: List[Any]
+    input_revision: int
+    image_identity: int
+    memory_bytes: int
+    last_used: int = 0
 
 
 @dataclass
@@ -25,6 +42,11 @@ class ImageWorkItem:
         default_factory=dict
     )
     manual_dirty_modules: List[str] = field(default_factory=list)
+    preview_shape: Optional[tuple] = None
+    input_revision: int = 0
+    runtime_preview: Optional[RuntimePreviewState] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def label(self) -> str:

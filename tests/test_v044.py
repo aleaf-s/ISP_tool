@@ -169,7 +169,7 @@ class HiddenTkV044Tests(unittest.TestCase):
             _analyzer, stage_index, _options = (
                 panel._analysis_request()
             )
-            self.assertEqual(stage_index, 3)
+            self.assertEqual(stage_index, 2)
         finally:
             if root.winfo_exists():
                 root.update()

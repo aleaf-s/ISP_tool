@@ -185,6 +185,7 @@ def configure_theme(
     style.configure("TFrame", background=c["panel"])
     style.configure("TLabel", background=c["panel"], foreground=c["foreground"])
     style.configure("Title.TLabel", font=FONTS["title"], foreground=c["foreground"])
+    style.configure("Mono.TLabel", font=FONTS["mono"], foreground=c["foreground"])
     style.configure("Muted.TLabel", foreground=c["muted"])
     style.configure("Success.TLabel", foreground=c["success"])
     style.configure("Warning.TLabel", foreground=c["warning"])

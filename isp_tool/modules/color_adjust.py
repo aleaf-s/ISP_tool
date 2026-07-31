@@ -25,17 +25,41 @@ class ColorAdjustment(ISPModule):
 
     def process(self, image, domain, metadata):
         src = np.asarray(image, dtype=np.float32)
-        output = src * np.array([
+        gains = np.array([
             self.parameters["r_gain"],
             self.parameters["g_gain"],
             self.parameters["b_gain"],
         ], np.float32)
-        output = (output - 0.5) * float(self.parameters["contrast"]) + 0.5
-        output += float(self.parameters["brightness"])
+        brightness = float(self.parameters["brightness"])
+        contrast = float(self.parameters["contrast"])
+        saturation = float(self.parameters["saturation"])
+        hue = float(self.parameters["hue"])
+        neutral_linear = (
+            np.array_equal(gains, np.ones(3, np.float32))
+            and brightness == 0.0
+            and contrast == 1.0
+        )
+        if neutral_linear:
+            output = src
+        else:
+            output = src * gains
+            output = (output - 0.5) * contrast + 0.5
+            output += brightness
+        if (
+            neutral_linear
+            and saturation == 1.0
+            and hue == 0.0
+            and float(src.min(initial=0.0)) >= 0.0
+            and float(src.max(initial=1.0)) <= 1.0
+        ):
+            return src, "rgb", {"算法": "Bypass in-range"}
         clipped = np.clip(output, 0.0, 1.0)
+        if saturation == 1.0 and hue == 0.0:
+            return clipped.astype(np.float32, copy=False), "rgb", {
+                "算法": "RGB only"
+            }
         hsv = cv2.cvtColor(clipped, cv2.COLOR_RGB2HSV)
-        hsv[:, :, 0] = (hsv[:, :, 0] + float(self.parameters["hue"])) % 360.0
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * float(self.parameters["saturation"]), 0, 1)
+        hsv[:, :, 0] = (hsv[:, :, 0] + hue) % 360.0
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 1)
         output = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-        return output.astype(np.float32), "rgb", {}
-
+        return output.astype(np.float32, copy=False), "rgb", {}

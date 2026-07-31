@@ -43,5 +43,4 @@ class WhiteBalance(ISPModule):
                 self.parameters["r_gain"], green, self.parameters["b_gain"]
             ], np.float32)
             output = src * np.minimum(gains * exposure, limit)
-        return output.astype(np.float32), domain, {"最大输出": float(output.max())}
-
+        return output.astype(np.float32, copy=False), domain, {"最大输出": float(output.max())}

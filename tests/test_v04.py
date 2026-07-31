@@ -26,7 +26,21 @@ from isp_tool.bayer import channel_positions
 from isp_tool.config import load_config, migrate_config, save_config
 from isp_tool.calibration.report import export_calibration_report
 from isp_tool.models import CalibrationSession, ImageROI, RawMetadata
+from isp_tool.modules import (
+    DefectivePixelCorrection,
+    NoiseReduction,
+    Sharpen,
+    ToneMapping,
+)
 from isp_tool.pipeline import ISPPipeline
+
+
+def pipeline_with_legacy_module(module):
+    """Exercise retained algorithms without restoring them to the product UI."""
+    pipeline = ISPPipeline()
+    module.processing_backend = pipeline.backend
+    pipeline.modules.append(module)
+    return pipeline
 
 
 class AutoBLCTests(unittest.TestCase):
@@ -88,7 +102,9 @@ class DPCCalibrationTests(unittest.TestCase):
             dark[20 + index, 30] = 0.8  # non-persistent random outlier
             dark_frames.append(dark)
             flat_frames.append(flat)
-        result = AutoCalibrationController(ISPPipeline()).analyze(
+        result = AutoCalibrationController(
+            pipeline_with_legacy_module(DefectivePixelCorrection())
+        ).analyze(
             DPCCalibrator(),
             dark_frames[0],
             self.metadata,
@@ -106,7 +122,9 @@ class DPCCalibrationTests(unittest.TestCase):
         frames = [np.full((48, 64), 0.02, np.float32) for _ in range(4)]
         for frame in frames:
             frame[8, 8] = 1.0
-        recommendation = AutoCalibrationController(ISPPipeline()).analyze(
+        recommendation = AutoCalibrationController(
+            pipeline_with_legacy_module(DefectivePixelCorrection())
+        ).analyze(
             DPCCalibrator(),
             frames[0],
             self.metadata,
@@ -128,7 +146,9 @@ class DPCCalibrationTests(unittest.TestCase):
     def test_single_frame_recommends_valid_threshold(self):
         image = np.full((48, 64), 0.2, np.float32)
         image[10, 10] = 0.9
-        result = AutoCalibrationController(ISPPipeline()).analyze(
+        result = AutoCalibrationController(
+            pipeline_with_legacy_module(DefectivePixelCorrection())
+        ).analyze(
             DPCAnalyzer(), image, self.metadata
         )
         self.assertGreaterEqual(result.suggested_parameters["threshold"], 0.005)
@@ -151,7 +171,9 @@ class NoiseProfileTests(unittest.TestCase):
             image[y0:y0 + band] = np.clip(values, 0, 1)
             rois.append(ImageROI(4, y0 + 4, width - 8, band - 8))
         metadata = RawMetadata(width=width, height=height)
-        result = AutoCalibrationController(ISPPipeline()).analyze(
+        result = AutoCalibrationController(
+            pipeline_with_legacy_module(NoiseReduction())
+        ).analyze(
             NoiseProfiler(),
             image,
             metadata,
@@ -173,7 +195,9 @@ class ToneAndSharpenTests(unittest.TestCase):
         self.rgb = np.repeat(linear[:, :, None], 3, axis=2)
 
     def test_tone_curve_is_monotonic_and_finite(self):
-        result = AutoCalibrationController(ISPPipeline()).analyze(
+        result = AutoCalibrationController(
+            pipeline_with_legacy_module(ToneMapping())
+        ).analyze(
             ToneAnalyzer(), self.rgb, self.metadata, mode="Natural"
         )
         curve = result.artifacts["Suggested Tone Curve"][:, 1]
@@ -182,7 +206,9 @@ class ToneAndSharpenTests(unittest.TestCase):
         self.assertTrue(result.measurements["curve_monotonic"])
 
     def test_highlight_mode_clips_less_than_high_contrast(self):
-        controller = AutoCalibrationController(ISPPipeline())
+        controller = AutoCalibrationController(
+            pipeline_with_legacy_module(ToneMapping())
+        )
         protected = controller.analyze(
             ToneAnalyzer(), self.rgb, self.metadata, mode="Preserve Highlights"
         )
@@ -201,7 +227,9 @@ class ToneAndSharpenTests(unittest.TestCase):
         rng = np.random.default_rng(2)
         clean = np.clip(base + rng.normal(0, 0.002, base.shape), 0, 1)
         noisy = np.clip(base + rng.normal(0, 0.055, base.shape), 0, 1)
-        controller = AutoCalibrationController(ISPPipeline())
+        controller = AutoCalibrationController(
+            pipeline_with_legacy_module(Sharpen())
+        )
         clean_result = controller.analyze(
             SharpenAnalyzer(), clean, self.metadata
         )
@@ -299,7 +327,9 @@ class V4PersistenceTests(unittest.TestCase):
             self.assertIn("artifact_file", data)
 
     def test_static_dpc_map_is_externalized_and_loaded(self):
-        pipeline = ISPPipeline()
+        pipeline = pipeline_with_legacy_module(
+            DefectivePixelCorrection()
+        )
         module = pipeline.module_by_id("defective_pixel_correction")
         defect = np.zeros((32, 48), np.uint8)
         defect[4, 6] = 1

@@ -28,7 +28,7 @@ class NoiseReduction(ISPModule):
         if radius % 2 == 0:
             radius += 1
         if strength <= 0 and float(self.parameters["chroma_strength"]) <= 0:
-            return src.copy(), "rgb", {"算法": "Bypass strength=0"}
+            return src, "rgb", {"算法": "Bypass strength=0"}
         if self.parameters["algorithm"] == "Gaussian":
             filtered = cv2.GaussianBlur(src, (radius, radius), 0)
         else:
@@ -43,5 +43,4 @@ class NoiseReduction(ISPModule):
             chroma = output - y
             chroma_smooth = cv2.GaussianBlur(chroma, (radius, radius), 0)
             output = y + chroma * (1.0 - chroma_strength) + chroma_smooth * chroma_strength
-        return output.astype(np.float32), "rgb", {"算法": self.parameters["algorithm"]}
-
+        return output.astype(np.float32, copy=False), "rgb", {"算法": self.parameters["algorithm"]}

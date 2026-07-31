@@ -6,7 +6,7 @@ import numpy as np
 
 from ..calibration.ae import estimate_exposure
 from ..calibration.awb import estimate_awb
-from ..calibration.ccm_solver import solve_ccm_from_patches
+from ..calibration.ccm_solver import apply_ccm, solve_ccm_from_patches
 from ..calibration.flat_field import generate_lsc_mesh
 from ..models import (
     ColorCheckerPatch,
@@ -226,7 +226,7 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
         source_description: str = "ColorChecker patches",
         **options: Any,
     ) -> ParameterRecommendation:
-        del image, metadata, roi
+        del metadata, roi
         token = cancel_token or CancellationToken()
         token.check()
         if not patches:
@@ -234,10 +234,62 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
         result = solve_ccm_from_patches(
             patches,
             include_offset=bool(options.get("include_offset", True)),
-            ridge=float(options.get("ridge", 1e-4)),
+            ridge=float(options.get("ridge", 0.015)),
             weights=options.get("weights"),
             white_constraint=bool(options.get("white_constraint", True)),
+            row_sum_regularization=float(
+                options.get("row_sum_regularization", 0.25)
+            ),
+            perceptual_weight=float(
+                options.get("perceptual_weight", 0.08)
+            ),
+            structure_prior=bool(
+                options.get("structure_prior", True)
+            ),
+            sign_regularization=float(
+                options.get("sign_regularization", 0.35)
+            ),
         )
+        source = np.asarray(image, dtype=np.float32)
+        if source.ndim == 3 and source.shape[2] >= 3:
+            step = max(
+                1,
+                int(np.ceil(
+                    np.sqrt(source.shape[0] * source.shape[1] / 250_000)
+                )),
+            )
+            predicted_frame = apply_ccm(
+                source[::step, ::step, :3],
+                result.matrix,
+                result.offset,
+            )
+            frame_negative_ratio = float(
+                np.mean(predicted_frame < 0.0)
+            )
+            frame_overflow_ratio = float(
+                np.mean(predicted_frame > 1.0)
+            )
+            result.diagnostics["frame_negative_ratio"] = (
+                frame_negative_ratio
+            )
+            result.diagnostics["frame_overflow_ratio"] = (
+                frame_overflow_ratio
+            )
+            rejection_reasons = list(
+                result.diagnostics.get("rejection_reasons", [])
+            )
+            if frame_negative_ratio > 0.15:
+                rejection_reasons.append(
+                    "整幅校正预览出现大量负值"
+                )
+            if frame_overflow_ratio > 0.20:
+                rejection_reasons.append(
+                    "整幅校正预览出现大量通道溢出"
+                )
+            result.diagnostics["rejection_reasons"] = (
+                rejection_reasons
+            )
+            result.diagnostics["safe_to_apply"] = not rejection_reasons
         suggested = {
             f"m{row}{col}": float(result.matrix[row, col])
             for row in range(3) for col in range(3)
@@ -248,9 +300,17 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
             "offset_b": float(result.offset[2]),
             "strength": 1.0,
         })
-        warnings = []
-        if result.condition_number > 1e5:
-            warnings.append("CCM 求解矩阵病态，建议检查色块选择和曝光")
+        warnings = list(
+            result.diagnostics.get("rejection_reasons", [])
+        )
+        rejected_patch_ids = result.diagnostics.get(
+            "rejected_patch_ids", []
+        )
+        if rejected_patch_ids:
+            warnings.append(
+                "已排除异常色块："
+                + ", ".join(map(str, rejected_patch_ids))
+            )
         improvement = (
             result.delta_e_before.get("mean", 0.0)
             - result.delta_e_after.get("mean", 0.0)
@@ -269,8 +329,59 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                 "method": result.method,
                 "condition_number": result.condition_number,
                 "delta_e_before": result.delta_e_before,
+                "delta_e_initial": result.diagnostics.get(
+                    "delta_e_initial", {}
+                ),
                 "delta_e_after": result.delta_e_after,
                 "patch_count": len(result.patches),
+                "valid_patch_count": len(
+                    result.diagnostics.get("valid_patch_ids", [])
+                ),
+                "matrix": result.matrix.astype(float).tolist(),
+                "offset": result.offset.astype(float).tolist(),
+                "initial_matrix": result.diagnostics.get(
+                    "initial_matrix"
+                ),
+                "initial_offset": result.diagnostics.get(
+                    "initial_offset"
+                ),
+                "row_sums": result.diagnostics.get("row_sums"),
+                "row_sums_initial": result.diagnostics.get(
+                    "row_sums_initial"
+                ),
+                "diagonal_values": result.diagnostics.get(
+                    "diagonal_values", []
+                ),
+                "positive_off_diagonal_count": result.diagnostics.get(
+                    "positive_off_diagonal_count", 0
+                ),
+                "negative_off_diagonal_count": result.diagnostics.get(
+                    "negative_off_diagonal_count", 0
+                ),
+                "safe_to_apply": bool(
+                    result.diagnostics.get("safe_to_apply", False)
+                ),
+                "rejection_reasons": warnings,
+                "negative_ratio": result.diagnostics.get(
+                    "negative_ratio", 0.0
+                ),
+                "overflow_ratio": result.diagnostics.get(
+                    "overflow_ratio", 0.0
+                ),
+                "frame_negative_ratio": result.diagnostics.get(
+                    "frame_negative_ratio", 0.0
+                ),
+                "frame_overflow_ratio": result.diagnostics.get(
+                    "frame_overflow_ratio", 0.0
+                ),
+                "valid_patch_ids": result.diagnostics.get(
+                    "valid_patch_ids", []
+                ),
+                "rejected_patch_ids": rejected_patch_ids,
+                "patches": [
+                    patch.to_dict() for patch in result.patches
+                ],
+                "diagnostics": dict(result.diagnostics),
             },
             confidence=confidence,
             warnings=warnings,

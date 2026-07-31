@@ -25,7 +25,7 @@ class Sharpen(ISPModule):
         strength = float(self.parameters["strength"])
         if strength <= 0:
             empty = np.zeros(src.shape[:2], dtype=np.uint8)
-            return src.copy(), "rgb", {"边缘像素比例": 0.0}, {"Sharpen Edge Mask": empty}
+            return src, "rgb", {"边缘像素比例": 0.0}, {"Sharpen Edge Mask": empty}
         blur = cv2.GaussianBlur(src, (0, 0), float(self.parameters["radius"]))
         detail = src - blur
         magnitude = np.max(np.abs(detail), axis=2, keepdims=True)
@@ -33,7 +33,7 @@ class Sharpen(ISPModule):
         limit = 0.25 * (1.0 - 0.8 * float(self.parameters["halo_suppression"]))
         detail = np.clip(detail, -limit, limit)
         output = src + strength * detail * mask
-        return output.astype(np.float32), "rgb", {
+        return output.astype(np.float32, copy=False), "rgb", {
             "边缘像素比例": float(mask.mean())
         }, {
             "Sharpen Edge Mask": mask[:, :, 0].astype(np.uint8)

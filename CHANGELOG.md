@@ -1,5 +1,144 @@
 # Changelog
 
+## 0.4.16
+
+- Demosaic 页面移除没有实际意义的“手动 / 自动”切换栏，直接显示算法参数。
+- Demosaic 算法列表收敛为 Nearest Neighbor、Bilinear、Adaptive Interpolation 和 Constant Color Difference 四项。
+- 新增逐 CFA 晶格的最邻近插值、方向梯度自适应插值，以及基于 R-G / B-G 局部恒定假设的色差插值。
+- 自动 CCM 新增结构先验：主对角线严格大于 1，非对角元素限制为小正值或负值，并对正非对角元素施加额外惩罚。
+- CCM 安全检查和结果摘要新增主对角元素、负非对角元素数量等可观测信息。
+
+## 0.4.15
+
+- 移除自动页重复的“快速自动矫正 / Module”表头及模块下拉选择，自动页只显示当前流水线模块的校正设置。
+- RAW Input 悬停新增原始 DN、Normalized 数值及当前 Bit Depth 范围。
+- 线性 Bayer 阶段新增当前位深等效绝对码值。
+- RGB 阶段新增三通道当前位深等效绝对码值，并保留高精度 Linear RGB。
+- 码值转换不隐藏负值或溢出，便于定位模块输出越界。
+- 新增自动页重复导航清理和 Bayer/RGB 像素双表示测试。
+- 自动化测试由 159 项增加到 162 项。
+
+## 0.4.14
+
+- 高倍缩放改为视口裁剪渲染，不再为整张图创建 2×～16×巨型 PhotoImage。
+- 可见源图范围按画布、平移原点和 Zoom 动态计算，并保留 2 像素边缘缓冲。
+- Raster Cache 加入视口源坐标；同一像素范围内平移可复用现有位图。
+- ROI、Compare、色卡 Overlay、鼠标坐标及完整图像变换继续使用全局坐标。
+- 新增 8×/16×视口范围、内存规模及真实 Tk PhotoImage 尺寸测试。
+- 自动化测试由 155 项增加到 159 项。
+
+## 0.4.13
+
+- Demosaic 前的主预览改为严格逐像素 Bayer CFA 马赛克，不再执行 Gaussian 扩散或通道填充。
+- RAW 缩小显示使用最近邻采样，避免显示缩放混合相邻 R/Gr/Gb/B 像素。
+- RAW Input 按四个 CFA 通道各自 Black/White Level 归一化；BLC 后明确使用线性范围。
+- 修复 WB/LSC 后大于 2 的合法线性值被误判成原始 DN 并重复归一化的问题。
+- Bayer 阶段鼠标读值显示实际 CFA 通道、DN/Linear 数值和 Bayer Pattern。
+- Bayer Histogram、Waveform 和 Vectorscope 改用无空间插值的原生 2×2 CFA Cell 数据。
+- WB 手动与自动页面增加 Bayer 绿色采样密度说明，避免依据马赛克整体颜色错误放大 R/B。
+- 新增严格 CFA 显示、强增益归一化和 WB→Demosaic 通道一致性测试。
+- 自动化测试由 150 项增加到 155 项。
+
+## 0.4.12
+
+- 手动调整与自动校正改为主检查器内的双模式切换，不再创建新的校正窗口。
+- 自动模式、手动参数、当前图像、ROI、色卡检测结果及最近参数在模式切换时保持不变。
+- 增加独立的线性 RGB → sRGB 显示编码及 ±3 EV 预览亮度控制；显示变换不进入流水线、像素读值、色卡采样或导出。
+- ColorChecker 改用中心有效区、Median/MAD 异常剔除，并标记过曝、欠曝、内部不均匀和异常像素色块。
+- CCM 改为中性/肤色加权、单位矩阵正则、行和约束、有界最小二乘和感知误差二次优化。
+- CCM 内嵌结果区新增优化前/后矩阵、原图/校正图、24 色块 RGB/ΔE、平均与最大 ΔE、行和、条件数、负值和溢出率。
+- 平均 ΔE 无明显改善、最大 ΔE 恶化、中性色偏、矩阵不稳定或输出越界时禁止自动应用。
+- UI 状态新增手动/自动模式与预览 EV 持久化。
+- 新增 SciPy 显式运行依赖及 V0.4.12 显示隔离、稳健采样、约束 CCM 和安全拒绝测试。
+- 自动化测试由 145 项增加到 150 项。
+
+## 0.4.11
+
+- 产品范围收敛为 BLC、LSC、WB、Demosaic、CCM 五模块快速矫正流水线。
+- 从活动流水线、模块列表和自动分析导航移除 DPC、Tone Mapping、Noise Reduction、Sharpen 与 Color Adjustment。
+- 自动矫正窗口改为单栏布局，只保留模块、方法、区域/校准图像、运行状态和“矫正并应用”。
+- 移除 Review & Apply、Measurements、Warnings、Artifacts、Advanced Options 及多阶段 Preview/Apply 操作界面。
+- 移除 Calibration Workspace 会话表头、报告/建议导出、ISP 参数配置导入导出、CCM 参数导入导出和跨图像校准刷入口。
+- BLC、LSC、AWB、AE、CCM 统一为显式的一键分析并应用；AWB 保留全图与当前 ROI 两种来源。
+- 自动矫正阶段索引改为按模块 ID 动态解析，流水线增删模块后不再依赖硬编码下标。
+- Compare 分割线命中优先于 ROI 框选；拖动分割线不会再创建或移动 ROI。
+- 旧算法实现仍保留为非活动兼容代码，不进入 V0.4.11 的产品流水线。
+- 1500×1000 Auto 冷流水线本机参考中位数约 34.13 ms，缓存 CCM 编辑约 4.68 ms。
+- 新增精简模块集合、单栏自动矫正、AWB 一键应用和 Compare/ROI 手势冲突测试。
+- 自动化测试由 140 项增加到 145 项。
+
+## 0.4.10
+
+- 使用本机 Visual Studio C++、Python 3.9 与 pybind11 实际编译并加载 Native ABI 1 扩展。
+- Native C++ 新增 DPC 3×3/5×5 内核，覆盖 Dynamic、Static Map、Hybrid、亮点和暗点检测。
+- Native Bilinear Demosaic 与 DPC 均释放 GIL，并按图像规模使用 std::thread 并行处理。
+- DPC 3×3 使用固定 median-of-nine 排序网络，避免逐像素通用 nth_element。
+- 新增 qualified_kernels 性能资格契约；Auto 仅启用通过当前发布机性能门槛的原生内核。
+- 当前 Native Demosaic 参考加速约 1.68×；Native DPC 仅约 0.87×，Auto 因此自动回退到更快的 OpenCV DPC。
+- 显式 Native C++ 模式会强制启用实验内核，Auto 与强制模式使用不同缓存键。
+- Performance Details 新增 kernel_backends，展示 DPC/Demosaic 实际执行实现。
+- 新增 setuptools 构建入口，自动定位未加入 PATH 的 MSVC 和 Windows SDK rc/mt 工具，不再强制依赖 CMake。
+- 新增一键构建批处理、PowerShell 构建脚本及 Native Backend Doctor。
+- Doctor 提供工具链诊断、扩展 ABI/能力查看、Native/OpenCV 输出一致性和 1500×1000 性能对比。
+- 1500×1000 默认冷流水线由固定 OpenCV 约 84.53 ms 降至 Auto 混合后端约 76.48 ms，参考提升约 9.5%。
+- 新增性能资格、强制实验内核、混合执行诊断和已编译扩展契约测试。
+- 自动化测试由 134 项增加到 140 项。
+
+## 0.4.9
+
+- 新增 UI 无关的 ProcessingBackend 抽象，首批将 DPC 与 Demosaic 热点迁移到统一执行接口。
+- 新增 Auto、OpenCV/NumPy、Native C++ 三种后端偏好；Native 缺失、ABI 不匹配或内核不支持时可靠回退。
+- Native C++ 未安装时菜单选项明确禁用，并提供后端状态对话框。
+- 流水线任务会为整次请求捕获同一后端，避免切换过程中混用不同实现。
+- Pipeline Cache 与工作集多图缓存增加 backend cache key，切换后端时不复用旧中间结果。
+- 最终效果与模块影响页继承主应用后端，并校验基线结果的后端标识。
+- Performance Details 新增后端偏好、实际执行后端、Native 可用性及回退原因。
+- JSON UI State 新增 processing_backend，旧配置默认使用 Auto。
+- 新增 CMake/pybind11 ABI 1 原生扩展骨架与首个精确 Bilinear Demosaic C++ 内核。
+- 基准工具新增 `--backend auto|opencv|native`，请求 Native 但不可用时输出真实回退原因。
+- 新增后端选择、ABI、原生调用分发、逐内核回退和缓存隔离测试。
+- 自动化测试由 126 项增加到 134 项。
+
+## 0.4.8
+
+- 新增每图运行时预览缓存，保存预览输入、流水线缓存、全部 StageResult 和实际处理快照。
+- 多图切回时校验输入修订、图像对象、Pipeline 快照和预览质量；命中后直接恢复，不提交新流水线任务。
+- 图像激活时立即取消待提交请求、通知运行任务停止并推进任务代际，修复缓存命中时旧图迟到结果仍可能覆盖界面的竞态。
+- 输入修订号改为随工作图像保存，图像切换本身不再伪造输入内容变化。
+- 缓存采用最多 3 张、总计 384 MiB 的双重 LRU 限制，超限时优先淘汰最久未使用的非当前图像。
+- ROI 局部结果不会污染完整图像切换缓存；运行时 Pipeline Cache 使用独立浅层容器，避免后续任务覆盖缓存字典。
+- 参数刷、元数据、参数快照、预览质量或图像内容变化会自动使对应缓存失效。
+- Performance Details 新增工作集缓存占用及 Hit/Miss/Invalidation/Eviction/Manual Clear 计数。
+- “预览”和“视图”菜单新增手动清除多图预览缓存入口。
+- 新增容量限制、内存预算、快照失效、无任务恢复和手动清理测试。
+- 自动化测试由 120 项增加到 126 项。
+
+## 0.4.7
+
+- DPC 动态检测迁移到 OpenCV uint8 Mask、`countNonZero` 与 `copyTo`，参考模块耗时由约 28 ms 降至约 15 ms。
+- DPC Static Map 无有效坏点时增加零拷贝快速旁路，并保留可查看的空 Defect Mask。
+- 新增快速 900 px、平衡 1200 px、精细 1500 px 三档预览质量，收纳于“预览”下拉菜单。
+- 预览质量变化时自动缩放现有 ROI 和网格边界；多图工作集记录各自预览尺寸并在激活时换算 ROI。
+- Calibration 辅助 Bayer 帧跟随当前预览质量，避免 900/1200 px 模式下被误判为尺寸不匹配。
+- Demosaic 新增可选 `OpenCV Fast Bilinear`，使用自适应 uint16 缩放保留高光动态范围；精确 Bilinear 仍为默认值。
+- 中性最终颜色调整在输入已经位于 0～1 时直接复用，减少重复 Clip 和大数组分配。
+- 基准工具增加 `--fast-demosaic` 对比选项。
+- 1500×1000 精确默认冷流水线参考中位数进一步降至约 86 ms，缓存 Tone 调参约 26 ms。
+- 自动化测试由 112 项增加到 120 项。
+
+## 0.4.6
+
+- 完成首轮基于基准的 CPU 热点优化，1500×1000 默认冷流水线参考基准由约 400 ms 降至约 120 ms。
+- Bilinear Demosaic 去除恒定归一化分母的重复 Mask 构造与卷积，并增加旧公式全 Bayer Pattern/边界等价测试。
+- Tone Mapping 改用 OpenCV float32 向量化幂运算；CCM 改用等价有效矩阵与 `cv2.transform`。
+- LSC、CCM、NR、Sharpen 和基础颜色调整增加中性参数快速路径，减少无效处理和大数组复制。
+- 预览流水线增加模块边界协作取消；新请求启动后，旧请求不再无条件运行完整条处理链。
+- Fit Raster 改为 float32 `INTER_AREA` 缩放后量化，降低图像刷新占用 UI 主线程的时间。
+- Performance Details 增加 Pipeline Modules、Overhead、Preview Latency 与逐模块耗时排行。
+- 流水线 `last_metrics` 增加 wall/overhead/dirty index/module timings，内存估算按共享底层数组去重。
+- 新增 `tools/benchmark_pipeline.py` 固定尺寸回归基准。
+- 自动化测试由 102 项增加到 112 项。
+
 ## 0.4.5
 
 - ROI 分块统一为“当前选区内自定义网格”，支持行、列、内缩比例和最多 96 个小框。

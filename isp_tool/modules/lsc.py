@@ -62,14 +62,8 @@ class LensShadingCorrection(ISPModule):
         frame_h = int(getattr(metadata, "_processing_frame_height", h))
         origin_x = int(getattr(metadata, "_processing_origin_x", 0))
         origin_y = int(getattr(metadata, "_processing_origin_y", 0))
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        xx += origin_x
-        yy += origin_y
         cx = float(self.parameters["center_x"]) * max(frame_w - 1, 1)
         cy = float(self.parameters["center_y"]) * max(frame_h - 1, 1)
-        nx = (xx - cx) / max(frame_w * 0.5, 1)
-        ny = (yy - cy) / max(frame_h * 0.5, 1)
-        radius2 = nx * nx + ny * ny
         gains = np.ones((h, w), np.float32)
         strengths = {
             "R": self.parameters["r_strength"],
@@ -77,6 +71,15 @@ class LensShadingCorrection(ISPModule):
             "Gb": self.parameters["gb_strength"],
             "B": self.parameters["b_strength"],
         }
+        if not any(float(value) != 0.0 for value in strengths.values()):
+            return gains, cx - origin_x, cy - origin_y, False
+        nx = (
+            np.arange(w, dtype=np.float32) + origin_x - cx
+        ) / max(frame_w * 0.5, 1)
+        ny = (
+            np.arange(h, dtype=np.float32) + origin_y - cy
+        ) / max(frame_h * 0.5, 1)
+        radius2 = ny[:, None] * ny[:, None] + nx[None, :] * nx[None, :]
         for name, (y, x) in channel_positions(metadata.bayer_pattern).items():
             gain = 1.0 + float(strengths[name]) * radius2[y::2, x::2]
             gains[y::2, x::2] = np.clip(
@@ -133,9 +136,16 @@ class LensShadingCorrection(ISPModule):
         src = np.asarray(image, dtype=np.float32)
         if self.parameters["mode"] == "Mesh Model":
             gains, cx, cy, cache_hit = self._mesh_gains(src.shape, metadata)
+            neutral = False
         else:
             gains, cx, cy, cache_hit = self._radial_gains(src.shape, metadata)
-        output = src * gains
+            neutral = not any(
+                float(self.parameters[key]) != 0.0
+                for key in (
+                    "r_strength", "gr_strength", "gb_strength", "b_strength"
+                )
+            )
+        output = src if neutral else src * gains
         h, w = src.shape
         corners = (gains[0, 0], gains[0, -1], gains[-1, 0], gains[-1, -1])
         local_cx = min(max(int(cx), 0), w - 1)

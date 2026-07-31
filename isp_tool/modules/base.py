@@ -15,6 +15,9 @@ class ISPModule:
 
     def __init__(self, specs: Iterable[ParameterSpec], enabled: bool = True):
         self.enabled = enabled
+        # Runtime-only dependency supplied by ISPPipeline. It is intentionally
+        # excluded from JSON configuration and module parameter snapshots.
+        self.processing_backend = None
         self.specs = OrderedDict((spec.key, spec) for spec in specs)
         self.parameters: Dict[str, Any] = {
             spec.key: spec.default for spec in self.specs.values()

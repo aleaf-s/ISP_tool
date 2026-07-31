@@ -34,9 +34,9 @@ class CalibrationWorkspace(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.title("Calibration Workspace · V0.4.5")
-        self.geometry("1180x720")
-        self.minsize(900, 620)
+        self.title("快速自动矫正 · V0.4.15")
+        self.geometry("720x700")
+        self.minsize(620, 560)
         self.transient(parent)
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="isp-calibration")
         self.current_future: Optional[Future] = None
@@ -55,42 +55,12 @@ class CalibrationWorkspace(tk.Toplevel):
         return self.app.calibration_session
 
     def _build(self):
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill="x")
-        ttk.Label(
-            top, text="CALIBRATION WORKSPACE", style="Title.TLabel"
-        ).pack(side="left")
-        ttk.Button(top, text="Export Report", command=self._export_report).pack(side="right")
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(
-            side="right", padx=12
-        )
-        session_bar = ttk.Frame(self, padding=(8, 0, 8, 8))
-        session_bar.pack(fill="x")
+        self._init_shared_calibration_state()
         self.session_name_var = tk.StringVar(value=self.session.name)
         self.sensor_name_var = tk.StringVar(value=self.session.sensor_name)
         self.illuminant_var = tk.StringVar(value=self.session.illuminant)
         self.notes_var = tk.StringVar(value=self.session.notes)
-        for label, variable, width in (
-            ("Session", self.session_name_var, 18),
-            ("Sensor", self.sensor_name_var, 16),
-            ("Illuminant", self.illuminant_var, 8),
-            ("Notes", self.notes_var, 28),
-        ):
-            ttk.Label(session_bar, text=label).pack(side="left", padx=(0, 3))
-            if label == "Illuminant":
-                widget = ttk.Combobox(
-                    session_bar, textvariable=variable,
-                    values=("D65", "D50", "A"), state="readonly", width=width,
-                )
-            else:
-                widget = ttk.Entry(session_bar, textvariable=variable, width=width)
-            widget.pack(side="left", padx=(0, 8))
-
-        # The unified AutoCalibrationPanel only needs shared calibration state.
-        # Older hidden LSC/AWB/AE/CCM tabs duplicated the same workflow and
-        # created dozens of invisible widgets, so V0.4.5 no longer builds them.
-        self._init_shared_calibration_state()
         self.auto_tab = ttk.Frame(self, padding=(8, 0, 8, 8))
         self.auto_tab.pack(fill="both", expand=True)
         self.auto_panel = AutoCalibrationPanel(
@@ -727,3 +697,187 @@ class CalibrationWorkspace(tk.Toplevel):
         self._revert_awb()
         self._revert_ae()
         self._revert_ccm()
+
+
+class InlineCalibrationWorkspace(ttk.Frame):
+    """Calibration services hosted directly inside the main inspector."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="isp-inline-calibration"
+        )
+        self.current_future: Optional[Future] = None
+        self.generation = 0
+        self.status_var = tk.StringVar(value="Ready")
+        self._init_state()
+        self.auto_panel = AutoCalibrationPanel(self, self, app)
+        self.auto_panel.pack(fill="both", expand=True)
+        self.load_ui_state(
+            getattr(app, "loaded_ui_state", {}).get(
+                "calibration", {}
+            )
+        )
+
+    @property
+    def session(self) -> CalibrationSession:
+        return self.app.calibration_session
+
+    def _init_state(self) -> None:
+        session = self.app.calibration_session
+        self.session_name_var = tk.StringVar(value=session.name)
+        self.sensor_name_var = tk.StringVar(value=session.sensor_name)
+        self.illuminant_var = tk.StringVar(value=session.illuminant)
+        self.notes_var = tk.StringVar(value=session.notes)
+        self.mesh_rows_var = tk.IntVar(value=13)
+        self.mesh_cols_var = tk.IntVar(value=17)
+        self.mesh_stat_var = tk.StringVar(value="Median")
+        self.ccm_rotation_var = tk.IntVar(value=0)
+        self.ccm_flip_var = tk.BooleanVar(value=False)
+        self.ccm_offset_var = tk.BooleanVar(value=True)
+        self.ccm_ridge_var = tk.DoubleVar(value=0.015)
+        self.ccm_exclude_var = tk.StringVar(value="")
+        self.corner_vars = [
+            tk.StringVar(value=value)
+            for value in (
+                "20,20", "620,20", "620,420", "20,420"
+            )
+        ]
+
+    def _run_async(
+        self, label: str, task: Callable, callback: Callable
+    ) -> None:
+        self.generation += 1
+        generation = self.generation
+        self.status_var.set(f"{label}…")
+        if self.current_future is not None:
+            self.current_future.cancel()
+        future = self.executor.submit(task)
+        self.current_future = future
+
+        def poll() -> None:
+            if not future.done():
+                if self.winfo_exists():
+                    self.after(20, poll)
+                return
+            if generation != self.generation or not self.winfo_exists():
+                return
+            try:
+                result = future.result()
+            except Exception as exc:
+                self.status_var.set("Failed")
+                messagebox.showerror(
+                    f"{label} 失败", str(exc), parent=self
+                )
+                return
+            self.status_var.set("Ready")
+            callback(result)
+
+        self.after(20, poll)
+
+    def _full_stage(self, index: int):
+        if not self.app.results:
+            raise ISPError("请等待 ISP 预览处理完成")
+        if self.app.roi_process_var.get():
+            raise ISPError(
+                "自动矫正前请关闭“仅处理 ROI”，以保持完整坐标"
+            )
+        return self.app.results[index]
+
+    def _corners_from_roi(self) -> None:
+        roi = self.app.roi
+        if roi is None:
+            messagebox.showinfo(
+                "ColorChecker",
+                "请先在主预览框选色卡外框。",
+                parent=self,
+            )
+            return
+        points = (
+            (roi.x, roi.y),
+            (roi.x2, roi.y),
+            (roi.x2, roi.y2),
+            (roi.x, roi.y2),
+        )
+        self._set_colorchecker_corners(points)
+
+    def _parse_corners(self):
+        corners = []
+        for variable in self.corner_vars:
+            tokens = variable.get().replace("，", ",").split(",")
+            if len(tokens) != 2:
+                raise ISPError("角点格式应为 x,y")
+            corners.append((float(tokens[0]), float(tokens[1])))
+        return corners
+
+    def _edit_colorchecker_corners(self) -> None:
+        try:
+            stage_index = next(
+                index
+                for index, module in enumerate(
+                    self.app.pipeline.modules
+                )
+                if module.module_id == "color_correction_matrix"
+            )
+            stage = self._full_stage(stage_index)
+            if stage.domain != "rgb":
+                raise ISPError("色卡四角编辑需要线性 RGB 输入")
+            corners = self._parse_corners()
+        except Exception as exc:
+            messagebox.showerror(
+                "ColorChecker", str(exc), parent=self
+            )
+            return
+        ColorCheckerCornerEditor(
+            self,
+            stage.image,
+            corners,
+            int(self.ccm_rotation_var.get()),
+            self._set_colorchecker_corners,
+        )
+
+    def _set_colorchecker_corners(self, corners) -> None:
+        for variable, point in zip(self.corner_vars, corners):
+            variable.set(f"{point[0]:.3f},{point[1]:.3f}")
+
+    def sync_session(self) -> None:
+        self.session.name = self.session_name_var.get().strip()
+        self.session.sensor_name = self.sensor_name_var.get().strip()
+        self.session.illuminant = (
+            self.illuminant_var.get().strip() or "D65"
+        )
+        self.session.notes = self.notes_var.get().strip()
+        self.session.raw_metadata = copy.deepcopy(
+            self.app.loaded.metadata
+        )
+
+    def select_auto_module(self, name: str) -> None:
+        self.auto_panel.select_module(name)
+
+    def refresh_session(self) -> None:
+        session = self.app.calibration_session
+        self.session_name_var.set(session.name)
+        self.sensor_name_var.set(session.sensor_name)
+        self.illuminant_var.set(session.illuminant)
+        self.notes_var.set(session.notes)
+        self.auto_panel.refresh_session()
+
+    def get_ui_state(self) -> dict:
+        return self.auto_panel.get_ui_state()
+
+    def load_ui_state(self, state: dict) -> None:
+        if isinstance(state, dict):
+            self.auto_panel.load_ui_state(state)
+
+    def close(self) -> None:
+        self.generation += 1
+        if self.current_future is not None:
+            self.current_future.cancel()
+        if hasattr(self, "auto_panel"):
+            self.app.loaded_ui_state["calibration"] = (
+                self.get_ui_state()
+            )
+            self.auto_panel.close()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
