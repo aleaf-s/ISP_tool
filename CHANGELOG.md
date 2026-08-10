@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.17
+
+- 修复 RAW Input 与 BLC 输出使用不同显示归一化规则导致的亮度误判。
+- RAW Input 预览不再提前扣除元数据 Black Level，仅按 White Level 映射传感器 DN。
+- 当 R/Gr/Gb/B Black 和 Global Offset 均为 0 时，BLC 输出预览与未校正 RAW 预览逐像素一致。
+- RAW 悬停读数同时显示未校正 Normalized 值和按元数据估算的 BLC 参考值。
+
 ## 0.4.16
 
 - Demosaic 页面移除没有实际意义的“手动 / 自动”切换栏，直接显示算法参数。

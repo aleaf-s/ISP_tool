@@ -1,6 +1,6 @@
-# ISP RAW Visual Simulator V0.4.16
+# ISP RAW Visual Simulator V0.4.17
 
-桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.16 将产品范围收敛为
+桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.17 将产品范围收敛为
 `BLC → LSC → WB → Demosaic → CCM`，重点是用尽量少的界面操作快速看到
 矫正效果。
 
@@ -16,6 +16,13 @@ python run.py
 启动后可在支持自动校正的模块中，于右侧检查器顶部直接切换 `手动 / 自动`；
 两种模式共用当前图像预览，不再打开额外的校正窗口。Demosaic 直接显示算法
 选项，不显示无意义的模式切换。
+
+## V0.4.17 BLC 零校正预览一致性
+
+- RAW Input 是未校正传感器信号，显示时只按 White Level 缩放，不再提前扣除 Black Level
+- BLC 使用 `(DN - Black) / (White - Black)` 在线性域完成校正和归一化
+- 四通道 Black 与 Global Offset 全部为 0 时，BLC 前后预览现在严格一致
+- RAW 悬停信息分别显示原始 DN、未校正 Normalized 值和元数据 BLC 参考值
 
 ## V0.4.16 Demosaic 与自动 CCM 约束
 

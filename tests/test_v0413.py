@@ -28,7 +28,7 @@ class BayerMosaicDisplayTests(unittest.TestCase):
             white_level=4095,
         )
 
-    def test_raw_preview_keeps_one_native_channel_per_pixel(self):
+    def test_raw_preview_does_not_apply_black_level_correction(self):
         normalized = {
             "R": 0.20,
             "Gr": 0.40,
@@ -52,7 +52,9 @@ class BayerMosaicDisplayTests(unittest.TestCase):
         for name, (y, x) in channel_positions("RGGB").items():
             samples = preview[y::2, x::2]
             expected = np.zeros(3, np.float32)
-            expected[channel_index[name]] = normalized[name]
+            expected[channel_index[name]] = (
+                float(raw[y, x]) / self.metadata.white_level
+            )
             np.testing.assert_allclose(
                 samples,
                 np.broadcast_to(expected, samples.shape),

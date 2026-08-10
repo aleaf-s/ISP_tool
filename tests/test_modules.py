@@ -10,6 +10,7 @@ from isp_tool.modules import (
     ToneMapping,
     WhiteBalance,
 )
+from isp_tool.preview import bayer_mosaic_rgb
 
 
 class ModuleTests(unittest.TestCase):
@@ -32,6 +33,45 @@ class ModuleTests(unittest.TestCase):
         self.assertAlmostEqual(float(output[:4].max()), 0.0)
         self.assertAlmostEqual(float(output[4:].min()), 1.0)
         self.assertEqual(diagnostics["负值截断"], 0)
+
+    def test_zero_blc_matches_uncorrected_raw_preview(self):
+        source = np.linspace(
+            0.0,
+            self.metadata.white_level,
+            64,
+            dtype=np.float32,
+        ).reshape(8, 8)
+        module = BlackLevelCorrection()
+        module.parameters.update({
+            "r": 0.0,
+            "gr": 0.0,
+            "gb": 0.0,
+            "b": 0.0,
+            "global_offset": 0.0,
+        })
+
+        output, _, _ = module.process(
+            source,
+            "bayer",
+            self.metadata,
+        )
+        before = bayer_mosaic_rgb(
+            source,
+            self.metadata,
+            already_normalized=False,
+        )
+        after = bayer_mosaic_rgb(
+            output,
+            self.metadata,
+            already_normalized=True,
+        )
+
+        np.testing.assert_allclose(
+            output,
+            source / self.metadata.white_level,
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(after, before, atol=1e-7)
 
     def test_white_balance_uses_four_bayer_gains(self):
         source = np.ones((8, 8), np.float32)
@@ -66,4 +106,3 @@ class ModuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

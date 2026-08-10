@@ -75,6 +75,7 @@ class HiddenTkV0415Tests(unittest.TestCase):
             input_status = app.status_var.get()
             self.assertIn("DN=", input_status)
             self.assertIn("Normalized=", input_status)
+            self.assertIn("BLC参考=", input_status)
             self.assertIn(
                 f"{app.loaded.metadata.bit_depth}-bit范围",
                 input_status,

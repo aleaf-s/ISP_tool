@@ -45,18 +45,11 @@ def _normalize_bayer_for_display(
         )
     if already_normalized:
         return np.clip(src, 0.0, 1.0)
-    normalized = np.empty_like(src)
-    black_levels = dict(zip(
-        ("R", "Gr", "Gb", "B"),
-        metadata.black_level,
-    ))
-    for name, (y, x) in channel_positions(
-        metadata.bayer_pattern
-    ).items():
-        black = float(black_levels[name])
-        normalized[y::2, x::2] = (
-            src[y::2, x::2] - black
-        ) / max(float(metadata.white_level) - black, 1.0)
+    # RAW Input is the uncorrected sensor signal.  Its display transform must
+    # not silently subtract metadata black levels before the BLC stage, or a
+    # BLC configured with zero black would appear to change brightness merely
+    # because the before/after previews used different normalization rules.
+    normalized = src / max(float(metadata.white_level), 1.0)
     return np.clip(normalized, 0.0, 1.0)
 
 

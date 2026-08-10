@@ -3399,7 +3399,11 @@ class ISPApplication:
                     self.loaded.metadata.black_level,
                 ))
                 black = float(black_by_channel[channel])
-                normalized_value = (
+                normalized_value = raw_value / max(
+                    float(self.loaded.metadata.white_level),
+                    1.0,
+                )
+                blc_reference_value = (
                     raw_value - black
                 ) / max(
                     float(self.loaded.metadata.white_level)
@@ -3409,6 +3413,7 @@ class ISPApplication:
                 value_text = (
                     f"DN={raw_value:.2f} · "
                     f"Normalized={normalized_value:.6f} · "
+                    f"BLC参考={blc_reference_value:.6f} · "
                     f"{bit_depth}-bit范围=0…{code_max}"
                 )
             self.status_var.set(
