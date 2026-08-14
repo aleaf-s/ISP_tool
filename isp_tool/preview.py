@@ -200,9 +200,19 @@ def encode_display_rgb(
 def encode_display_uint8(
     linear_rgb: np.ndarray,
     exposure_ev: float = 0.0,
+    already_encoded: bool = False,
 ) -> np.ndarray:
     """Fast preview raster encoding using a 12-bit sRGB lookup table."""
     gain = 2.0 ** float(np.clip(exposure_ev, -6.0, 6.0))
+    if already_encoded:
+        return np.round(
+            np.clip(
+                np.asarray(linear_rgb, dtype=np.float32) * gain,
+                0.0,
+                1.0,
+            )
+            * 255.0
+        ).astype(np.uint8)
     indices = np.clip(
         np.asarray(linear_rgb, dtype=np.float32)
         * (gain * (_DISPLAY_LUT_SIZE - 1)),

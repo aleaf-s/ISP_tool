@@ -1,0 +1,15 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "pixel_format": "NV12",
+  "bit_depth": 8,
+  "color_matrix": "BT.709",
+  "color_range": "Limited",
+  "chroma_siting": "Center",
+  "chroma_upsampling": "Bilinear",
+  "endianness": "little",
+  "y_stride": 0,
+  "uv_stride": 0,
+  "data_offset": 0,
+  "frame_index": 0
+}

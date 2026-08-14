@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.23
+
+- Histogram 从主界面底部抽屉迁移为单例非模态窗口，关闭后可从工具栏或预览菜单再次打开。
+- 删除 Histogram 数据源与显示模式选择，统一跟随当前选中模块的实际输出。
+- 按数据域精简通道：RAW 为 R/Gr/Gb/B，RGB 为 R/G/B，YUV 为原生 Y/U/V，并确保至少启用一个通道。
+- 支持参数、模块、图像和 ROI 改变后的后台延迟刷新、过期结果丢弃与小型结果缓存，不因缩放和平移重复计算。
+- 保存 Histogram 窗口几何信息、Log/Linear 和 ROI 状态；主窗口底部仅保留 Waveform、Vectorscope 与 Statistics 高级分析。
+
+## 0.4.22
+
+- 主预览工具栏新增可发现的 Histogram 按钮和底部分析抽屉，Waveform/Vectorscope/Statistics 收纳到“更多分析”。
+- Histogram 数据源支持当前显示、模块输入/输出和最终输出，并支持当前 ROI、Log/Linear 纵轴和状态持久化。
+- RAW 直接按实际位深 DN 统计 R/Gr/Gb/B；RGB 支持 Overlay/Luma/单通道；YUV 支持原生 Y/U/V 和转换后 RGB。
+- YUV Limited Range 增加合法范围标记；增加暗部、高光、Min/Max、越界占比及悬停 bin 读数。
+- 直方图延续使用延迟后台分析、过期请求取消和按阶段/ROI/模式缓存，隐藏时不运行。
+
+## 0.4.21
+
+- YUV Display Preview 的 Pixel Format 下拉框改为全部支持格式，并增加 Bit Depth 和 Endianness 快速选项。
+- P010/YUV420P10LE 自动匹配 10-bit little-endian，YUYV/UYVY 自动匹配 8-bit；切换时重新校验文件并更新帧数。
+- 底部像素栏取消归一化 RGB 数值，只显示源码值、裁剪前绝对 RGB 与显示 RGB 绝对码值。
+- 移除主预览工具栏的 Gray/1:1 按钮以及视图菜单的 1:1 入口。
+
+## 0.4.20
+
+- YUV 导入支持从文件名提取分辨率、`8/10/12/16-bit`、格式、Color Matrix、Range、大小端和 Linear Layout。
+- 支持 `420sp` 与 `420p` 通用命名；分别暂按 NV12 和 I420，并在元数据窗口提示 UV/VU 或 U/V 平面顺序存在歧义。
+- 明确的 NV12/NV21/I420/YV12/P010 标记优先，高位深 420SP 会额外提示 P010/对齐方式需要人工确认。
+
+## 0.4.19
+
+- 主工具栏新增显性 `RAW ISP` / `YUV 预览` 工作区切换，当前工作区使用高亮状态。
+- 新增“从工作区移除当前图像”，不会删除磁盘源文件；图像选择框改为更宽的动态宽度。
+- 移除专家模式入口，旧配置中的专家模式状态不再恢复。
+- 精简工具栏与视图菜单：计算后端、性能详情和缓存管理集中到“高级工具”子菜单。
+
+## 0.4.18
+
+- 新增独立 `isp_tool/yuv/` 算法层，覆盖格式定义、元数据、文件校验、逐帧读取、色度上采样、YUV→RGB 和原生直方图。
+- 支持 I420、YV12、NV12、NV21、YUYV、UYVY、YUV444P、YUV422P、Gray、P010 与 YUV420P10LE。
+- 新增 YUV 元数据对话框、文件名推测、1080p/4K 预设、每帧字节数和完整帧校验。
+- 新增 BT.601/709/2020、Full/Limited Range、8/10/12/16-bit 归一化以及 Center/Left/Top-left 色度定位。
+- YUV 使用独立四阶段预览路径；RAW BLC/LSC/WB/Demosaic/CCM 和自动校正不会运行。
+- 新增逐帧 memmap 读取、前后帧/方向键导航、可取消后台转换和最近两项独立 YUV 缓存。
+- 新增 Y/U/V 单通道、原生 YUV + RGB Histogram、YUV/RGB 悬停码值、越界诊断和 YUV 元数据/平面导出。
+- 保留现有高倍缩放视口渲染；缩放和平移不会重新执行 YUV 转换。
+- 自动化测试增加到 184 项并全部通过。
+
 ## 0.4.17
 
 - 修复 RAW Input 与 BLC 输出使用不同显示归一化规则导致的亮度误判。

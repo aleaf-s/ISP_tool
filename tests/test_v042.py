@@ -92,7 +92,7 @@ class DeferredAnalysisTests(unittest.TestCase):
             key: np.zeros(256, np.int64) for key in ("R", "G", "B", "Y")
         }
         with patch(
-            "isp_tool.ui.app.compute_histogram", return_value=histogram
+            "isp_tool.ui.app.compute_histogram_details", return_value=histogram
         ) as hist, patch(
             "isp_tool.ui.app.compute_waveform"
         ) as waveform, patch(
@@ -158,7 +158,7 @@ class HiddenTkV042Tests(unittest.TestCase):
             ]
             self.assertEqual(
                 tabs,
-                ["Histogram", "Waveform", "Vectorscope", "Statistics"],
+                ["Waveform", "Vectorscope", "Statistics"],
             )
             app._on_canvas_resize()
             first_resize = app.canvas_resize_after

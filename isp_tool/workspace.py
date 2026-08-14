@@ -76,6 +76,8 @@ def snapshot_for_image(
     """Create a per-image snapshot and initialize BLC from its metadata."""
 
     snapshot = copy.deepcopy(list(base_snapshot))
+    if loaded.domain == "yuv":
+        return snapshot
     for item in snapshot:
         if item.get("id") != "black_level_correction":
             continue
@@ -120,6 +122,8 @@ def compatible_for_transfer(
         warnings.append(
             f"输入域不同：{source.domain} → {target.domain}"
         )
+    if source.domain == "yuv" or target.domain == "yuv":
+        return warnings
     sensor_modules = {
         "black_level_correction",
         "defective_pixel_correction",

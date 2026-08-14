@@ -25,7 +25,7 @@ from ..backends import (
 from ..bayer import channel_positions, resize_bayer_preview
 from ..calibration.awb import estimate_awb
 from ..analysis import (
-    compute_histogram,
+    compute_histogram_details,
     compute_statistics,
     compute_vectorscope,
     compute_waveform,
@@ -47,7 +47,22 @@ from ..preview import (
     export_image,
     resize_bayer_mosaic_preview,
 )
-from ..raw_io import PLAIN_EXTENSIONS, load_image, synthetic_bayer
+from ..raw_io import (
+    PLAIN_EXTENSIONS,
+    YUV_EXTENSIONS,
+    load_image,
+    synthetic_bayer,
+)
+from ..yuv import (
+    PIXEL_FORMATS,
+    YUVFrame,
+    YUVMetadata,
+    compute_yuv_histogram_details,
+    read_yuv_frame,
+    upsample_planes,
+    validate_yuv_file,
+    yuv_to_rgb,
+)
 from ..roi_tools import clamp_roi, generate_grid_rois
 from ..workspace import (
     ImageWorkItem,
@@ -57,9 +72,10 @@ from ..workspace import (
     transfer_module_settings,
 )
 from .calibration_panel import InlineCalibrationWorkspace
-from .dialogs import ask_raw_metadata
+from .dialogs import ask_raw_metadata, ask_yuv_metadata
 from .dpi import enable_process_dpi_awareness
 from .final_preview import FinalImpactWindow
+from .histogram_window import HistogramWindow
 from .performance_metrics import PerformanceMetrics
 from .render_cache import RenderCache
 from .roi_editor import MAX_ROI_COUNT, ROIEditor, ask_roi_grid
@@ -68,7 +84,7 @@ from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.15 · 精简自动页与码值读数"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.23 · 独立 Histogram"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,
@@ -160,6 +176,10 @@ class ISPApplication:
         ] = None
         self.adjustment_mode = "manual"
         self.final_preview_window: Optional[FinalImpactWindow] = None
+        self.histogram_window: Optional[HistogramWindow] = None
+        self.histogram_window_geometry = ""
+        self.histogram_scale = "Log"
+        self.histogram_use_roi = True
         self.calibration_polygons = []
         self.preview_image = self.loaded.image
         self.results: List[StageResult] = []
@@ -177,6 +197,7 @@ class ISPApplication:
         self.import_generation = 0
         self.import_poll_after: Optional[str] = None
         self.pipeline_cache: Dict[str, object] = {}
+        self.yuv_request_cache: Dict[tuple, dict] = {}
         self.render_cache = RenderCache()
         self.performance = PerformanceMetrics()
         self._update_backend_performance_state()
@@ -200,6 +221,7 @@ class ISPApplication:
         self.display_is_pure_bayer_mosaic = False
         self.display_compare_sources = None
         self.preview_exposure_ev = 0.0
+        self.display_is_encoded_rgb = False
         self._display_revision = 0
         self._raster_key = None
         self._raster_photo: Optional[ImageTk.PhotoImage] = None
@@ -238,6 +260,8 @@ class ISPApplication:
         self.selected_module_index = 0
         self.loaded_ui_state: Dict[str, object] = {}
         self.last_directory = ""
+        self.last_yuv_metadata = YUVMetadata()
+        self.yuv_vars: Dict[str, tk.Variable] = {}
         self.analysis_collapsed = True
         self.expert_mode = False
         self.wheel_router = MouseWheelRouter(self.root)
@@ -290,33 +314,25 @@ class ISPApplication:
         menu = tk.Menu(self.root, tearoff=False)
         file_menu = tk.Menu(menu, tearoff=False, bg=PANEL_2, fg=FG)
         file_menu.add_command(
-            label="导入一张或多张图像 / RAW…    Ctrl+O",
+            label="导入一张或多张 RAW / YUV / 图像…    Ctrl+O",
             command=self.open_files,
         )
+        file_menu.add_command(
+            label="从工作区移除当前图像",
+            command=self.remove_current_image,
+        )
         file_menu.add_command(label="裸 RAW 元数据…", command=self.edit_raw_metadata)
+        file_menu.add_command(label="YUV 元数据…", command=self.edit_yuv_metadata)
         file_menu.add_separator()
         file_menu.add_command(label="导出当前结果…    Ctrl+E", command=self.export_current)
         file_menu.add_command(label="导出 ROI…", command=self.export_roi)
+        file_menu.add_command(label="导出 YUV 元数据…", command=self.export_yuv_metadata)
+        file_menu.add_command(label="导出 Y/U/V 平面…", command=self.export_yuv_planes)
+        file_menu.add_command(label="导出 YUV 当前帧 RGB…", command=self.export_yuv_rgb_frame)
         file_menu.add_command(label="退出", command=self.close)
         menu.add_cascade(label="文件", menu=file_menu)
         view_menu = tk.Menu(menu, tearoff=False, bg=PANEL_2, fg=FG)
         view_menu.add_command(label="适合窗口    F", command=self.fit_image)
-        view_menu.add_command(label="1:1 像素    1", command=self.actual_size)
-        view_menu.add_command(label="重置当前模块", command=self.reset_current_module)
-        view_menu.add_command(
-            label="快速自动矫正", command=self.open_calibration_workspace
-        )
-        view_menu.add_command(
-            label="最终效果与模块影响",
-            command=self.open_final_preview,
-        )
-        view_menu.add_command(
-            label="Performance Details", command=self.show_performance_details
-        )
-        view_menu.add_command(
-            label="清除多图预览缓存",
-            command=self.clear_runtime_preview_cache,
-        )
         scale_menu = tk.Menu(view_menu, tearoff=False, bg=PANEL_2, fg=FG)
         for label in UI_SCALE_CHOICES:
             scale_menu.add_radiobutton(
@@ -339,10 +355,23 @@ class ISPApplication:
         view_menu.add_cascade(
             label="预览质量", menu=quality_menu
         )
-        view_menu.add_cascade(
-            label="计算后端",
-            menu=self._create_backend_menu(view_menu),
+        advanced_menu = tk.Menu(
+            view_menu, tearoff=False, bg=PANEL_2, fg=FG
         )
+        advanced_menu.add_cascade(
+            label="计算后端",
+            menu=self._create_backend_menu(advanced_menu),
+        )
+        advanced_menu.add_command(
+            label="性能详情…", command=self.show_performance_details
+        )
+        advanced_menu.add_command(
+            label="清除预览缓存",
+            command=self.clear_runtime_preview_cache,
+        )
+        view_menu.add_separator()
+        view_menu.add_cascade(label="高级工具", menu=advanced_menu)
+        self.advanced_tools_menu = advanced_menu
         menu.add_cascade(label="视图", menu=view_menu)
         help_menu = tk.Menu(menu, tearoff=False, bg=PANEL_2, fg=FG)
         help_menu.add_command(label="关于", command=self.show_about)
@@ -387,7 +416,7 @@ class ISPApplication:
             self.root.bind(
                 f"<{key}>",
                 lambda event, x=dx, y=dy:
-                self._nudge_active_roi(event, x, y),
+                self._handle_arrow_key(event, x, y),
             )
 
     def _build_layout(self) -> None:
@@ -401,7 +430,8 @@ class ISPApplication:
         self.analysis_panel_collapsed_var = tk.BooleanVar(
             value=self.analysis_collapsed
         )
-        self.expert_mode_var = tk.BooleanVar(value=self.expert_mode)
+        # V0.4.19 固定为简洁工作区。保留该变量仅用于兼容旧配置。
+        self.expert_mode_var = tk.BooleanVar(value=False)
 
         toolbar = ttk.Frame(self.root, padding=(8, 7))
         toolbar.pack(fill="x")
@@ -409,17 +439,40 @@ class ISPApplication:
             toolbar, text="导入图像", style="Accent.TButton",
             command=self.open_files,
         ).pack(side="left")
+        self.workspace_switch = ttk.Frame(toolbar)
+        self.workspace_switch.pack(side="left", padx=(7, 5))
+        self.isp_workspace_button = ttk.Button(
+            self.workspace_switch,
+            text="RAW ISP",
+            command=lambda: self._switch_workspace("isp"),
+            style="Primary.TButton",
+        )
+        self.isp_workspace_button.pack(side="left")
+        self.yuv_workspace_button = ttk.Button(
+            self.workspace_switch,
+            text="YUV 预览",
+            command=lambda: self._switch_workspace("yuv"),
+            style="Secondary.TButton",
+        )
+        self.yuv_workspace_button.pack(side="left", padx=(2, 0))
         self.image_var = tk.StringVar()
         self.image_combo = ttk.Combobox(
             toolbar,
             textvariable=self.image_var,
             state="readonly",
-            width=23,
+            width=36,
         )
-        self.image_combo.pack(side="left", padx=(5, 8))
+        self.image_combo.pack(side="left", padx=(0, 4))
         self.image_combo.bind(
             "<<ComboboxSelected>>", self._on_image_selected
         )
+        self.remove_image_button = ttk.Button(
+            toolbar,
+            text="移除",
+            command=self.remove_current_image,
+            style="Secondary.TButton",
+        )
+        self.remove_image_button.pack(side="left", padx=(0, 8))
         self._refresh_image_selector()
         export_menu = ActionMenu(toolbar, "导出")
         export_menu.add_command(
@@ -430,16 +483,35 @@ class ISPApplication:
             "当前 ROI…", self.export_roi,
             enabled=lambda: bool(self.results and self.roi),
         )
+        export_menu.add_command(
+            "YUV 元数据…",
+            self.export_yuv_metadata,
+            enabled=lambda: self.loaded.domain == "yuv",
+        )
+        export_menu.add_command(
+            "Y/U/V 平面…",
+            self.export_yuv_planes,
+            enabled=lambda: self.loaded.domain == "yuv",
+        )
+        export_menu.add_command(
+            "YUV 当前帧 RGB…",
+            self.export_yuv_rgb_frame,
+            enabled=lambda: self.loaded.domain == "yuv",
+        )
         export_menu.pack(side="left")
-        ttk.Button(
+        self.auto_calibration_button = ttk.Button(
             toolbar, text="自动矫正", command=self.open_calibration_workspace
-        ).pack(side="left", padx=(5, 0))
+        )
+        self.auto_calibration_button.pack(side="left", padx=(5, 0))
         preview_menu = ActionMenu(toolbar, "预览")
         preview_menu.add_command(
             "最终效果与模块影响…", self.open_final_preview
         )
         preview_menu.add_command(
-            "显示 / 隐藏 Scopes", self._toggle_analysis_panel
+            "Histogram…", self.open_histogram_window
+        )
+        preview_menu.add_command(
+            "更多分析…", self._toggle_analysis_panel
         )
         quality_menu = tk.Menu(
             preview_menu.menu, tearoff=False, bg=PANEL_2, fg=FG
@@ -452,22 +524,6 @@ class ISPApplication:
                 command=self._apply_preview_quality_from_menu,
             )
         preview_menu.add_cascade("预览质量", quality_menu)
-        preview_menu.add_cascade(
-            "计算后端",
-            self._create_backend_menu(preview_menu.menu),
-        )
-        preview_menu.add_separator()
-        preview_menu.add_checkbutton(
-            "专家模式", self.expert_mode_var,
-            command=self._apply_expert_mode,
-        )
-        preview_menu.add_command(
-            "Performance Details", self.show_performance_details
-        )
-        preview_menu.add_command(
-            "清除多图预览缓存",
-            self.clear_runtime_preview_cache,
-        )
         preview_menu.pack(side="left", padx=(5, 0))
         self.preview_menu = preview_menu
         self.stage_selector = ttk.Frame(toolbar)
@@ -511,6 +567,7 @@ class ISPApplication:
             relief="flat", highlightthickness=1,
             highlightbackground=COLORS["border"],
             font=FONTS["body"], activestyle="none", width=26,
+            exportselection=False,
         )
         self.pipeline_list.pack(fill="both", expand=True)
         self.pipeline_list.bind("<<ListboxSelect>>", lambda _event: self._on_module_select())
@@ -534,11 +591,11 @@ class ISPApplication:
         self.image_canvas.bind("<ButtonRelease-1>", self._on_left_release)
 
         canvas_toolbar = ttk.Frame(center, padding=(8, 5))
+        self.canvas_toolbar = canvas_toolbar
         canvas_toolbar.pack(fill="x")
         ttk.Button(canvas_toolbar, text="适合窗口", command=self.fit_image).pack(side="left")
-        ttk.Button(canvas_toolbar, text="1:1", command=self.actual_size).pack(side="left", padx=5)
         self.zoom_label = ttk.Label(canvas_toolbar, text="100%", style="Muted.TLabel")
-        self.zoom_label.pack(side="left")
+        self.zoom_label.pack(side="left", padx=(5, 0))
         ttk.Separator(
             canvas_toolbar, orient="vertical"
         ).pack(side="left", fill="y", padx=6)
@@ -598,15 +655,12 @@ class ISPApplication:
             enabled=lambda: self.roi is not None and bool(self.results),
         )
         roi_menu.pack(side="left")
-        ttk.Button(
-            canvas_toolbar, text="Gray", command=self.arm_gray_picker
-        ).pack(side="left", padx=3)
         ttk.Checkbutton(
             canvas_toolbar, text="Compare", variable=self.compare_var,
             command=lambda: self.render_current(schedule_analysis=False),
         ).pack(side="left")
         self.display_menu = ActionMenu(canvas_toolbar, "Display")
-        for channel in ("RGB", "R", "G", "B", "Luma"):
+        for channel in ("RGB", "R", "G", "B", "Luma", "Y", "U", "V"):
             self.display_menu.add_radiobutton(
                 channel, self.channel_var, channel,
                 command=lambda: self.render_current(schedule_analysis=True),
@@ -623,6 +677,13 @@ class ISPApplication:
         self.artifact_submenu = tk.Menu(self.display_menu.menu, tearoff=False)
         self.display_menu.add_cascade("Artifact", self.artifact_submenu)
         self.display_menu.pack(side="left", padx=3)
+        self.histogram_button = ttk.Button(
+            canvas_toolbar,
+            text="Histogram",
+            style="Secondary.TButton",
+            command=self.open_histogram_window,
+        )
+        self.histogram_button.pack(side="left", padx=(2, 0))
         self.roi_label = ttk.Label(
             canvas_toolbar, text="ROI: Full frame", style="Muted.TLabel"
         )
@@ -750,9 +811,21 @@ class ISPApplication:
             style="Secondary.TButton", command=self._toggle_analysis_panel,
         )
         self.analysis_toggle_button.pack(side="right")
+        more_analysis = ActionMenu(analysis_controls, "更多分析")
+        for analysis_name in ("Waveform", "Vectorscope", "Statistics"):
+            more_analysis.add_command(
+                analysis_name,
+                lambda name=analysis_name: self._select_analysis_tool(name),
+            )
+        more_analysis.pack(side="right", padx=(0, 5))
+        self.more_analysis_menu = more_analysis
+        self.analysis_title_var = tk.StringVar(value="WAVEFORM")
         ttk.Label(
-            analysis_controls, text="SCOPES", style="Title.TLabel"
+            analysis_controls,
+            textvariable=self.analysis_title_var,
+            style="Title.TLabel",
         ).pack(side="left", padx=(0, 10))
+
         self.analysis_roi_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             analysis_controls,
@@ -763,13 +836,18 @@ class ISPApplication:
         self.waveform_mode_var = tk.StringVar(value="RGB Overlay")
         self.vectorscope_mode_var = tk.StringVar(value="YCbCr")
         self.vectorscope_scale_var = tk.DoubleVar(value=1.0)
-        self.analysis_notebook = ttk.Notebook(analysis_host, height=150)
+        style = ttk.Style(self.root)
+        try:
+            style.layout("HiddenTabs.TNotebook.Tab", [])
+        except tk.TclError:
+            pass
+        self.analysis_notebook = ttk.Notebook(
+            analysis_host, height=170, style="HiddenTabs.TNotebook"
+        )
         self.analysis_notebook.pack(fill="both", expand=True)
-        hist_tab = ttk.Frame(self.analysis_notebook)
         waveform_tab = ttk.Frame(self.analysis_notebook)
         vectorscope_tab = ttk.Frame(self.analysis_notebook)
         statistics_tab = ttk.Frame(self.analysis_notebook)
-        self.analysis_notebook.add(hist_tab, text="Histogram")
         self.analysis_notebook.add(waveform_tab, text="Waveform")
         self.analysis_notebook.add(vectorscope_tab, text="Vectorscope")
         self.analysis_notebook.add(statistics_tab, text="Statistics")
@@ -820,11 +898,6 @@ class ISPApplication:
             "<<ComboboxSelected>>",
             lambda _event: self.schedule_analysis_refresh(0),
         )
-        self.hist_canvas = tk.Canvas(
-            hist_tab, bg=COLORS["canvas_alt"], height=105,
-            highlightthickness=0,
-        )
-        self.hist_canvas.pack(fill="both", expand=True)
         self.waveform_canvas = tk.Canvas(
             waveform_tab, bg=COLORS["canvas_alt"], height=105,
             highlightthickness=0,
@@ -845,7 +918,7 @@ class ISPApplication:
         )
         self.analysis_notebook.bind(
             "<<NotebookTabChanged>>",
-            lambda _event: self.schedule_analysis_refresh(0),
+            self._analysis_tab_changed,
         )
         self.metrics_label = ttk.Label(
             statistics_tab, text="", style="Muted.TLabel",
@@ -918,6 +991,56 @@ class ISPApplication:
             panel.revert()
         self._refresh_auto_summary()
 
+    def _analysis_tab_for_name(self, name: str):
+        for tab_id in self.analysis_notebook.tabs():
+            if self.analysis_notebook.tab(tab_id, "text") == name:
+                return tab_id
+        return None
+
+    def _select_analysis_tool(self, name: str) -> None:
+        tab_id = self._analysis_tab_for_name(name)
+        if tab_id is None:
+            return
+        self.analysis_notebook.select(tab_id)
+        if self.analysis_collapsed:
+            self.analysis_panel_collapsed_var.set(False)
+            self._toggle_analysis_panel()
+        else:
+            self._analysis_tab_changed()
+
+    def open_histogram_window(self) -> None:
+        if (
+            self.histogram_window is not None
+            and self.histogram_window.winfo_exists()
+        ):
+            self.histogram_window.deiconify()
+            self.histogram_window.lift()
+            self.histogram_window.focus_force()
+            self.histogram_window.refresh(0)
+            return
+        self.histogram_window = HistogramWindow(self)
+        self.histogram_button.configure(style="Primary.TButton")
+
+    def _toggle_histogram_panel(self) -> None:
+        """Compatibility entry point; Histogram now uses its own window."""
+
+        self.open_histogram_window()
+
+    def _refresh_histogram_window(self, delay: int = 180) -> None:
+        if (
+            self.histogram_window is not None
+            and self.histogram_window.winfo_exists()
+        ):
+            self.histogram_window.refresh(delay)
+
+    def _analysis_tab_changed(self, _event=None) -> None:
+        analysis_type = self._active_analysis_type()
+        self.analysis_title_var.set(analysis_type.upper())
+        self.schedule_analysis_refresh(0)
+
+    def _analysis_result_index(self, analysis_type: str) -> int:
+        return self._current_result_index()
+
     def _toggle_analysis_panel(self) -> None:
         requested = bool(self.analysis_panel_collapsed_var.get())
         if requested == self.analysis_collapsed:
@@ -960,28 +1083,62 @@ class ISPApplication:
                 continue
 
     def _apply_expert_mode(self) -> None:
-        self.expert_mode = bool(self.expert_mode_var.get())
-        if self.expert_mode:
-            if not self.stage_selector.winfo_manager():
-                self.stage_selector.pack(side="left")
-            if not self.expert_diagnostics_label.winfo_manager():
-                self.expert_diagnostics_label.pack(
-                    fill="x", pady=(7, 0)
-                )
-            if not self.performance_status_label.winfo_manager():
-                self.performance_status_label.pack(side="right")
-        else:
-            self.stage_selector.pack_forget()
-            self.expert_diagnostics_label.pack_forget()
-            self.performance_status_label.pack_forget()
-        if self.pipeline.modules:
+        # 专家模式已从产品交互中移除：即使加载旧配置也不再展开。
+        self.expert_mode = False
+        self.expert_mode_var.set(False)
+        self.stage_selector.pack_forget()
+        self.expert_diagnostics_label.pack_forget()
+        self.performance_status_label.pack_forget()
+        if self.loaded.domain == "yuv":
+            self._build_yuv_parameter_panel()
+        elif self.pipeline.modules:
             module = self.pipeline.modules[self.selected_module_index]
             self._build_parameter_editor(module)
         self._refresh_pipeline_list()
 
+    def _restore_pipeline_selection(self, index: int | None = None) -> int:
+        """Keep one visible selection while focus moves to other controls."""
+        size = int(self.pipeline_list.size())
+        if size <= 0:
+            return 0
+        selected = self.selected_module_index if index is None else int(index)
+        selected = max(0, min(selected, size - 1))
+        self.pipeline_list.selection_clear(0, "end")
+        self.pipeline_list.selection_set(selected)
+        self.pipeline_list.activate(selected)
+        self.pipeline_list.see(selected)
+        return selected
+
     def _refresh_pipeline_list(self) -> None:
         selected = self.selected_module_index
         self.pipeline_list.delete(0, "end")
+        if self.loaded.domain == "yuv":
+            names = (
+                "YUV Input",
+                "Chroma Upsampling",
+                "YUV to RGB",
+                "Display Preview",
+            )
+            for index, name in enumerate(names):
+                elapsed = (
+                    f"   {self.results[index].elapsed_ms:.1f} ms"
+                    if index < len(self.results) else ""
+                )
+                self.pipeline_list.insert(
+                    "end", f"  ●  {name}{elapsed}"
+            )
+            selected = min(selected, len(names) - 1)
+            self.selected_module_index = selected
+            self._restore_pipeline_selection(selected)
+            self.stage_combo["values"] = [
+                f"{index:02d} · {name}"
+                for index, name in enumerate(names)
+            ]
+            previous = self.stage_combo.current()
+            self.stage_combo.current(
+                min(max(previous, 0), len(names) - 1)
+            )
+            return
         category_by_id = {
             "black_level_correction": "Sensor",
             "defective_pixel_correction": "Sensor",
@@ -1020,7 +1177,9 @@ class ISPApplication:
                     text += f"   {elapsed}"
             self.pipeline_list.insert("end", text)
         if self.pipeline.modules:
-            self.pipeline_list.selection_set(min(selected, len(self.pipeline.modules) - 1))
+            self._restore_pipeline_selection(
+                min(selected, len(self.pipeline.modules) - 1)
+            )
         names = ["00 · Input"] + [
             f"{index:02d} · {module.name}" for index, module in enumerate(self.pipeline.modules, 1)
         ]
@@ -1033,8 +1192,28 @@ class ISPApplication:
     def _on_module_select(self) -> None:
         selection = self.pipeline_list.curselection()
         if not selection:
+            self._restore_pipeline_selection()
             return
         self.selected_module_index = int(selection[0])
+        if self.loaded.domain == "yuv":
+            names = (
+                "YUV Input",
+                "Chroma Upsampling",
+                "YUV to RGB",
+                "Display Preview",
+            )
+            index = min(self.selected_module_index, len(names) - 1)
+            self.selected_module_index = index
+            self.module_title.configure(text=names[index])
+            self.module_state_var.set("YUV 专用路径 · RAW ISP 未执行")
+            self.stage_combo.current(index)
+            self._build_yuv_parameter_panel()
+            if self.results:
+                self._update_artifact_choices()
+                self.render_current()
+            return
+        self.parameters_label.configure(text="PARAMETERS")
+        self._set_adjustment_mode(self.adjustment_mode)
         module = self.pipeline.modules[self.selected_module_index]
         self.module_title.configure(text=module.name)
         self.enabled_var.set(module.enabled)
@@ -1047,7 +1226,244 @@ class ISPApplication:
             self._update_artifact_choices()
             self.render_current()
 
+    def _build_yuv_parameter_panel(self) -> None:
+        metadata = self.loaded.yuv_metadata
+        if metadata is None:
+            return
+        self.mode_switch.pack_forget()
+        self.module_actions.pack_forget()
+        self.auto_mode_frame.pack_forget()
+        if not self.parameters_separator.winfo_manager():
+            self.parameters_separator.pack(fill="x", pady=(0, 7))
+        if not self.parameters_label.winfo_manager():
+            self.parameters_label.pack(anchor="w", pady=(0, 3))
+        self.parameters_label.configure(text="YUV PREVIEW PARAMETERS")
+        if not self.manual_card.winfo_manager():
+            self.manual_card.pack(fill="both", expand=True)
+        for child in self.param_frame.winfo_children():
+            child.destroy()
+        self.yuv_vars = {
+            "pixel_format": tk.StringVar(value=metadata.pixel_format),
+            "bit_depth": tk.StringVar(value=str(metadata.bit_depth)),
+            "endianness": tk.StringVar(value=metadata.endianness),
+            "color_matrix": tk.StringVar(value=metadata.color_matrix),
+            "color_range": tk.StringVar(value=metadata.color_range),
+            "chroma_siting": tk.StringVar(value=metadata.chroma_siting),
+            "chroma_upsampling": tk.StringVar(value=metadata.chroma_upsampling),
+            "frame_index": tk.IntVar(value=metadata.frame_index),
+        }
+        choices = (
+            ("pixel_format", "Pixel Format", PIXEL_FORMATS),
+            ("bit_depth", "Bit Depth", ("8", "10", "12", "16")),
+            ("endianness", "Endianness", ("little", "big")),
+            ("color_matrix", "Color Matrix", ("BT.601", "BT.709", "BT.2020")),
+            ("color_range", "Color Range", ("Limited", "Full")),
+            ("chroma_siting", "Chroma Siting", ("Center", "Left", "Top-left")),
+            ("chroma_upsampling", "Chroma Upsampling", ("Bilinear", "Nearest")),
+        )
+        self.yuv_combos = {}
+        for row, (key, label, values) in enumerate(choices):
+            ttk.Label(self.param_frame, text=label).grid(
+                row=row, column=0, sticky="w", padx=(2, 8), pady=5
+            )
+            combo = ttk.Combobox(
+                self.param_frame,
+                textvariable=self.yuv_vars[key],
+                values=values,
+                state="readonly",
+                width=20,
+            )
+            self.yuv_combos[key] = combo
+            combo.grid(row=row, column=1, sticky="ew", pady=5)
+            command = (
+                self._on_yuv_format_changed
+                if key == "pixel_format"
+                else lambda _event: self._apply_yuv_panel_settings()
+            )
+            combo.bind("<<ComboboxSelected>>", command)
+        row = len(choices)
+        ttk.Label(self.param_frame, text="Frame").grid(
+            row=row, column=0, sticky="w", padx=(2, 8), pady=5
+        )
+        frame_controls = ttk.Frame(self.param_frame)
+        frame_controls.grid(row=row, column=1, sticky="ew", pady=5)
+        ttk.Button(
+            frame_controls,
+            text="‹",
+            width=3,
+            command=lambda: self._step_yuv_frame(-1),
+        ).pack(side="left")
+        self.yuv_frame_spin = ttk.Spinbox(
+            frame_controls,
+            from_=0,
+            to=max(metadata.frame_count - 1, 0),
+            textvariable=self.yuv_vars["frame_index"],
+            width=8,
+            command=self._apply_yuv_panel_settings,
+        )
+        self.yuv_frame_spin.pack(side="left", padx=4)
+        self.yuv_frame_spin.bind(
+            "<Return>", lambda _event: self._apply_yuv_panel_settings()
+        )
+        ttk.Button(
+            frame_controls,
+            text="›",
+            width=3,
+            command=lambda: self._step_yuv_frame(1),
+        ).pack(side="left")
+        self.yuv_info_var = tk.StringVar(
+            value=self._yuv_panel_info_text(metadata)
+        )
+        ttk.Label(
+            self.param_frame,
+            textvariable=self.yuv_info_var,
+            style="Muted.TLabel",
+            wraplength=285,
+        ).grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(10, 8))
+        ttk.Button(
+            self.param_frame,
+            text="恢复导入参数",
+            command=self._reset_yuv_parameters,
+        ).grid(row=row + 2, column=0, columnspan=2, sticky="e")
+        self.param_frame.columnconfigure(1, weight=1)
+
+    @staticmethod
+    def _yuv_panel_info_text(metadata: YUVMetadata) -> str:
+        return (
+            f"{metadata.width}×{metadata.height} · {metadata.bit_depth}-bit\n"
+            f"Frame {metadata.frame_index + 1}/{metadata.frame_count} · "
+            f"{metadata.endianness}-endian\n"
+            "YUV 保持原始平面；RAW ISP 模块不会执行。"
+        )
+
+    def _update_yuv_panel_info(self) -> None:
+        if self.loaded.domain != "yuv":
+            return
+        metadata = self.loaded.yuv_metadata
+        if hasattr(self, "yuv_info_var"):
+            self.yuv_info_var.set(self._yuv_panel_info_text(metadata))
+        if hasattr(self, "yuv_frame_spin"):
+            self.yuv_frame_spin.configure(
+                to=max(metadata.frame_count - 1, 0)
+            )
+
+    def _on_yuv_format_changed(self, _event=None) -> None:
+        pixel_format = self.yuv_vars["pixel_format"].get()
+        if pixel_format in {"P010", "YUV420P10LE"}:
+            self.yuv_vars["bit_depth"].set("10")
+            self.yuv_vars["endianness"].set("little")
+        elif pixel_format in {"YUYV", "UYVY"}:
+            self.yuv_vars["bit_depth"].set("8")
+        self._apply_yuv_panel_settings()
+
+    def _apply_yuv_panel_settings(self) -> None:
+        if self.loaded.domain != "yuv" or not self.yuv_vars:
+            return
+        previous = self.loaded.yuv_metadata
+        metadata = copy.deepcopy(previous)
+        try:
+            metadata.pixel_format = self.yuv_vars["pixel_format"].get()
+            metadata.bit_depth = int(self.yuv_vars["bit_depth"].get())
+            metadata.endianness = self.yuv_vars["endianness"].get()
+            metadata.color_matrix = self.yuv_vars["color_matrix"].get()
+            metadata.color_range = self.yuv_vars["color_range"].get()
+            metadata.chroma_siting = self.yuv_vars["chroma_siting"].get()
+            metadata.chroma_upsampling = self.yuv_vars[
+                "chroma_upsampling"
+            ].get()
+            metadata.frame_index = int(self.yuv_vars["frame_index"].get())
+            info = validate_yuv_file(self.loaded.source_path, metadata)
+            metadata.frame_count = info.frame_count
+            metadata.frame_index = max(
+                0, min(metadata.frame_index, metadata.frame_count - 1)
+            )
+        except Exception as exc:
+            self.toast.show(str(exc), "warning")
+            current = self.loaded.yuv_metadata
+            for key in (
+                "pixel_format", "bit_depth", "endianness",
+                "color_matrix", "color_range", "chroma_siting",
+                "chroma_upsampling", "frame_index",
+            ):
+                value = getattr(current, key)
+                self.yuv_vars[key].set(str(value))
+            return
+        storage_changed = any(
+            getattr(previous, key) != getattr(metadata, key)
+            for key in ("pixel_format", "bit_depth", "endianness")
+        )
+        self.loaded.yuv_metadata = metadata
+        if storage_changed:
+            # Do not let hover diagnostics mix an old decode with new labels
+            # while the replacement frame is being processed.
+            self.loaded.yuv_frame = None
+            self.loaded.yuv_conversion = None
+        self.yuv_vars["frame_index"].set(metadata.frame_index)
+        self._update_yuv_panel_info()
+        self.input_revision += 1
+        self.pipeline_cache = {}
+        self.render_cache.clear()
+        self.schedule_process(immediate=True)
+
+    def _step_yuv_frame(self, delta: int) -> None:
+        if self.loaded.domain != "yuv":
+            return
+        metadata = self.loaded.yuv_metadata
+        index = max(
+            0,
+            min(metadata.frame_count - 1, metadata.frame_index + int(delta)),
+        )
+        if index == metadata.frame_index:
+            return
+        self.yuv_vars["frame_index"].set(index)
+        self._apply_yuv_panel_settings()
+
+    def _reset_yuv_parameters(self) -> None:
+        if self.loaded.domain != "yuv":
+            return
+        baseline = copy.deepcopy(
+            self.loaded.yuv_original_metadata
+            or self.last_yuv_metadata
+        )
+        baseline.frame_index = 0
+        storage_changed = any(
+            getattr(self.loaded.yuv_metadata, key) != getattr(baseline, key)
+            for key in ("pixel_format", "bit_depth", "endianness")
+        )
+        self.loaded.yuv_metadata = baseline
+        if storage_changed:
+            self.loaded.yuv_frame = None
+            self.loaded.yuv_conversion = None
+        self._build_yuv_parameter_panel()
+        self.input_revision += 1
+        self.schedule_process(immediate=True)
+
     def _refresh_module_state(self) -> None:
+        if self.loaded.domain == "yuv":
+            elapsed = (
+                self.results[self.selected_module_index].elapsed_ms
+                if self.selected_module_index < len(self.results)
+                else None
+            )
+            self.module_state_var.set(
+                "YUV 专用路径 · RAW ISP 未执行"
+                + (f" · {elapsed:.2f} ms" if elapsed is not None else "")
+            )
+            diagnostics = (
+                self.loaded.yuv_conversion.diagnostics
+                if self.loaded.yuv_conversion is not None else {}
+            )
+            self.module_diagnostics_var.set(
+                "YUV→RGB 越界：负值 "
+                f"{float(diagnostics.get('negative_ratio', 0.0)) * 100:.2f}% · "
+                "高于 1 "
+                f"{float(diagnostics.get('overflow_ratio', 0.0)) * 100:.2f}% · "
+                "原始 Y 欠范围 "
+                f"{float(diagnostics.get('y_below_ratio', 0.0)) * 100:.2f}% · "
+                "过范围 "
+                f"{float(diagnostics.get('y_above_ratio', 0.0)) * 100:.2f}%"
+            )
+            return
         module = self.pipeline.modules[self.selected_module_index]
         elapsed = (
             self.results[self.selected_module_index].elapsed_ms
@@ -1335,6 +1751,8 @@ class ISPApplication:
             )
 
     def _auto_module_for_current(self) -> Optional[str]:
+        if self.loaded.domain == "yuv":
+            return None
         module_id = self.pipeline.modules[self.selected_module_index].module_id
         return {
             "black_level_correction": "BLC",
@@ -1354,6 +1772,8 @@ class ISPApplication:
         return None
 
     def _refresh_auto_summary(self) -> None:
+        if self.loaded.domain == "yuv":
+            return
         name = self._auto_module_for_current()
         if (
             self.calibration_workspace is not None
@@ -1386,6 +1806,9 @@ class ISPApplication:
 
     def _update_adjustment_mode_availability(self) -> None:
         """Keep Demosaic as a direct algorithm selector without mode tabs."""
+        if self.loaded.domain == "yuv":
+            self.mode_switch.pack_forget()
+            return
         module = self.pipeline.modules[self.selected_module_index]
         if module.module_id == "demosaic":
             if self.adjustment_mode != "manual":
@@ -1401,6 +1824,10 @@ class ISPApplication:
 
     def _set_adjustment_mode(self, mode: str) -> None:
         if mode not in {"manual", "auto"}:
+            return
+        if self.loaded.domain == "yuv":
+            self.adjustment_mode = "manual"
+            self._build_yuv_parameter_panel()
             return
         module = self.pipeline.modules[self.selected_module_index]
         if mode == "auto" and module.module_id == "demosaic":
@@ -1506,6 +1933,10 @@ class ISPApplication:
             self._refresh_auto_summary()
 
     def _on_stage_changed(self, _event=None) -> None:
+        if self.loaded.domain == "yuv":
+            self.selected_module_index = max(0, self.stage_combo.current())
+            self._restore_pipeline_selection(self.selected_module_index)
+            self._build_yuv_parameter_panel()
         self._update_artifact_choices()
         if (
             self.pending_artifact
@@ -1934,6 +2365,8 @@ class ISPApplication:
         )
 
     def _toggle_module(self) -> None:
+        if self.loaded.domain == "yuv":
+            return
         module = self.pipeline.modules[self.selected_module_index]
         module.enabled = bool(self.enabled_var.get())
         self._mark_manual_parameter_state(module)
@@ -1944,6 +2377,9 @@ class ISPApplication:
         self.schedule_process(immediate=True)
 
     def reset_current_module(self) -> None:
+        if self.loaded.domain == "yuv":
+            self._reset_yuv_parameters()
+            return
         module = self.pipeline.modules[self.selected_module_index]
         module.reset()
         if module.module_id == "black_level_correction":
@@ -2134,6 +2570,10 @@ class ISPApplication:
                 self.loaded.metadata.bayer_pattern,
                 max_side=self.preview_max_side,
             )
+        elif self.loaded.domain == "yuv":
+            self.preview_image = np.asarray(
+                self.loaded.image, dtype=np.float32
+            )
         else:
             image = self.loaded.image
             h, w = image.shape[:2]
@@ -2177,6 +2617,72 @@ class ISPApplication:
         self.pending_after = None
         self.generation += 1
         generation = self.generation
+        if self.loaded.domain == "yuv":
+            self.status_var.set("正在读取并转换 YUV…")
+            if self.pipeline_cancel_event is not None:
+                self.pipeline_cancel_event.set()
+            cancel_event = threading.Event()
+            self.pipeline_cancel_event = cancel_event
+            if self.current_future is not None and not self.current_future.done():
+                self.current_future.cancel()
+            submitted_at = time.perf_counter()
+            cache_key = self._yuv_request_cache_key(
+                self.loaded.source_path,
+                self.loaded.yuv_metadata,
+                self.preview_max_side,
+            )
+            cached = self.yuv_request_cache.get(cache_key)
+            if cached is not None:
+                payload = dict(cached)
+                payload["metrics"] = {
+                    **cached["metrics"],
+                    "cache_hits": 1,
+                    "recomputed": 0,
+                    "wall_elapsed_ms": 0.0,
+                    "overhead_ms": 0.0,
+                }
+                future = Future()
+                future.set_result(payload)
+                future.is_yuv_cached = True
+            else:
+                existing_frame = self.loaded.yuv_frame
+                if (
+                    existing_frame is None
+                    or existing_frame.frame_index
+                    != self.loaded.yuv_metadata.frame_index
+                    or existing_frame.metadata.pixel_format
+                    != self.loaded.yuv_metadata.pixel_format
+                    or existing_frame.metadata.width
+                    != self.loaded.yuv_metadata.width
+                    or existing_frame.metadata.height
+                    != self.loaded.yuv_metadata.height
+                    or existing_frame.metadata.bit_depth
+                    != self.loaded.yuv_metadata.bit_depth
+                    or existing_frame.metadata.endianness
+                    != self.loaded.yuv_metadata.endianness
+                    or existing_frame.metadata.y_stride
+                    != self.loaded.yuv_metadata.y_stride
+                    or existing_frame.metadata.uv_stride
+                    != self.loaded.yuv_metadata.uv_stride
+                    or existing_frame.metadata.data_offset
+                    != self.loaded.yuv_metadata.data_offset
+                ):
+                    existing_frame = None
+                future = self.executor.submit(
+                    self._process_yuv_request,
+                    self.loaded.source_path,
+                    copy.deepcopy(self.loaded.yuv_metadata),
+                    self.preview_max_side,
+                    cancel_event.is_set,
+                    existing_frame,
+                )
+                future.is_yuv_cached = False
+                future.yuv_cache_key = cache_key
+            future.isp_submitted_at = submitted_at
+            future.is_yuv_request = True
+            self.current_future = future
+            self._schedule_future_poll(future, generation)
+            return
         snapshot = self.pipeline.snapshot()
         image = np.asarray(self.preview_image, dtype=np.float32)
         metadata = self.loaded.metadata
@@ -2209,6 +2715,136 @@ class ISPApplication:
         self.current_future = future
         self._schedule_future_poll(future, generation)
 
+    @staticmethod
+    def _yuv_request_cache_key(path, metadata, preview_max_side):
+        source = Path(path)
+        stat = source.stat()
+        return (
+            str(source.resolve()),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            int(metadata.frame_index),
+            metadata.pixel_format,
+            int(metadata.bit_depth),
+            metadata.color_matrix,
+            metadata.color_range,
+            metadata.chroma_siting,
+            metadata.chroma_upsampling,
+            metadata.endianness,
+            int(metadata.y_stride),
+            int(metadata.uv_stride),
+            int(metadata.data_offset),
+            int(preview_max_side),
+        )
+
+    @staticmethod
+    def _process_yuv_request(
+        path,
+        metadata: YUVMetadata,
+        preview_max_side: int,
+        cancelled,
+        existing_frame=None,
+    ):
+        started = time.perf_counter()
+        read_started = started
+        if existing_frame is None:
+            frame = read_yuv_frame(path, metadata, metadata.frame_index)
+            read_ms = (time.perf_counter() - read_started) * 1000.0
+        else:
+            metadata.frame_count = existing_frame.metadata.frame_count
+            frame = YUVFrame(
+                existing_frame.y,
+                existing_frame.u,
+                existing_frame.v,
+                metadata,
+                metadata.frame_index,
+                existing_frame.source_size,
+                {**existing_frame.diagnostics, "reused_planes": True},
+            )
+            read_ms = 0.0
+        if cancelled():
+            raise RuntimeError("YUV request cancelled")
+        height, width = frame.shape
+        target_size = None
+        if max(width, height) > preview_max_side:
+            scale = preview_max_side / max(width, height)
+            target_size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+        conversion_started = time.perf_counter()
+        conversion = yuv_to_rgb(
+            frame, target_size=target_size, clip=False
+        )
+        conversion_ms = (
+            time.perf_counter() - conversion_started
+        ) * 1000.0
+        if cancelled():
+            raise RuntimeError("YUV request cancelled")
+        y_view = np.clip(conversion.y_normalized, 0.0, 1.0)
+        u_view = np.clip(conversion.u_normalized + 0.5, 0.0, 1.0)
+        v_view = np.clip(conversion.v_normalized + 0.5, 0.0, 1.0)
+        y_rgb = np.repeat(y_view[..., None], 3, axis=2)
+        channel_view = np.stack((y_view, u_view, v_view), axis=-1)
+        artifacts = {
+            "Y Plane": y_view,
+            "U Plane": u_view,
+            "V Plane": v_view,
+            "RGB Preview": np.clip(conversion.rgb, 0.0, 1.0),
+        }
+        common = {
+            "Pixel Format": metadata.pixel_format,
+            "Color Matrix": metadata.color_matrix,
+            "Range": metadata.color_range,
+            "Chroma Siting": metadata.chroma_siting,
+            "Frame": f"{metadata.frame_index + 1}/{metadata.frame_count}",
+            **conversion.diagnostics,
+        }
+        results = [
+            StageResult(
+                "yuv_input", "YUV Input", y_rgb, "yuv_rgb",
+                read_ms, dict(common), artifacts,
+            ),
+            StageResult(
+                "chroma_upsampling", "Chroma Upsampling", channel_view,
+                "yuv_rgb", conversion_ms * 0.4,
+                {**common, "Method": metadata.chroma_upsampling}, artifacts,
+            ),
+            StageResult(
+                "yuv_to_rgb", "YUV to RGB", conversion.rgb, "yuv_rgb",
+                conversion_ms * 0.6, dict(common), artifacts,
+            ),
+            StageResult(
+                "display_preview", "Display Preview",
+                np.clip(conversion.rgb, 0.0, 1.0), "yuv_rgb", 0.0,
+                dict(common), artifacts,
+            ),
+        ]
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        return {
+            "frame": frame,
+            "conversion": conversion,
+            "results": results,
+            "metrics": {
+                "cache_hits": 0,
+                "recomputed": 3,
+                "elapsed_ms": read_ms + conversion_ms,
+                "wall_elapsed_ms": wall_ms,
+                "overhead_ms": max(0.0, wall_ms - read_ms - conversion_ms),
+                "module_timings": {
+                    "yuv_input": read_ms,
+                    "chroma_upsampling": conversion_ms * 0.4,
+                    "yuv_to_rgb": conversion_ms * 0.6,
+                },
+                "yuv_cache_key": (
+                    str(path), metadata.frame_index, metadata.pixel_format,
+                    metadata.color_matrix, metadata.color_range,
+                    metadata.chroma_siting, metadata.chroma_upsampling,
+                    preview_max_side,
+                ),
+            },
+        }
+
     def _schedule_future_poll(
         self, future: Future, generation: int
     ) -> None:
@@ -2230,7 +2866,44 @@ class ISPApplication:
             self.performance.increment("dropped_pipeline_results")
             return
         try:
-            self.results = future.result()
+            payload = future.result()
+            if getattr(future, "is_yuv_request", False):
+                frame = payload["frame"]
+                conversion = payload["conversion"]
+                old_preview_shape = tuple(self.preview_image.shape[:2])
+                self.loaded.yuv_frame = frame
+                self.loaded.yuv_metadata = frame.metadata
+                self.loaded.yuv_conversion = conversion
+                self.loaded.image = conversion.rgb
+                self.loaded.metadata.width = frame.metadata.width
+                self.loaded.metadata.height = frame.metadata.height
+                self.loaded.metadata.bit_depth = frame.metadata.bit_depth
+                self.loaded.metadata.white_level = float(
+                    (1 << frame.metadata.bit_depth) - 1
+                )
+                self.loaded.description = (
+                    f"YUV · {frame.metadata.pixel_format} · "
+                    f"{frame.metadata.color_matrix} · {frame.metadata.color_range} · "
+                    f"Frame {frame.frame_index + 1}/{frame.metadata.frame_count}"
+                )
+                self._update_yuv_panel_info()
+                self.preview_image = conversion.rgb
+                if old_preview_shape != tuple(conversion.rgb.shape[:2]):
+                    self._rescale_current_rois(
+                        old_preview_shape,
+                        conversion.rgb.shape,
+                    )
+                self.results = payload["results"]
+                self.pipeline_cache["last_metrics"] = payload["metrics"]
+                if not getattr(future, "is_yuv_cached", False):
+                    cache_key = getattr(future, "yuv_cache_key", None)
+                    if cache_key is not None:
+                        self.yuv_request_cache[cache_key] = payload
+                        while len(self.yuv_request_cache) > 2:
+                            oldest = next(iter(self.yuv_request_cache))
+                            self.yuv_request_cache.pop(oldest, None)
+            else:
+                self.results = payload
         except Exception as exc:
             self.status_var.set(f"处理失败：{exc}")
             messagebox.showerror(
@@ -2324,6 +2997,8 @@ class ISPApplication:
         self.pending_artifact = None
         self.render_current(schedule_analysis=True)
         self._refresh_pipeline_list()
+        if self.loaded.domain == "yuv":
+            self._build_yuv_parameter_panel()
         self._refresh_module_state()
         self._refresh_auto_summary()
 
@@ -2336,6 +3011,24 @@ class ISPApplication:
     def _apply_view_options(self, rgb: np.ndarray) -> np.ndarray:
         rgb = np.asarray(rgb, dtype=np.float32).copy()
         channel = self.channel_var.get()
+        if (
+            self.loaded.domain == "yuv"
+            and channel in {"Y", "U", "V"}
+            and self.loaded.yuv_conversion is not None
+        ):
+            conversion = self.loaded.yuv_conversion
+            plane = {
+                "Y": conversion.y_normalized,
+                "U": conversion.u_normalized + 0.5,
+                "V": conversion.v_normalized + 0.5,
+            }[channel]
+            if plane.shape != rgb.shape[:2]:
+                plane = cv2.resize(
+                    plane,
+                    (rgb.shape[1], rgb.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            rgb = np.repeat(plane[..., None], 3, axis=2)
         if channel in {"R", "G", "B"}:
             idx = {"R": 0, "G": 1, "B": 2}[channel]
             single = rgb[:, :, idx]
@@ -2352,6 +3045,7 @@ class ISPApplication:
 
     def _stage_rgb(self, index: int) -> np.ndarray:
         result = self.results[index]
+        self.display_is_encoded_rgb = result.domain == "yuv_rgb"
         key = self.render_cache.stage_key(
             self.result_revision,
             index,
@@ -2462,6 +3156,7 @@ class ISPApplication:
         )
         if schedule_analysis:
             self.schedule_analysis_refresh()
+        self._refresh_histogram_window(180 if schedule_analysis else 0)
         self._update_performance_status()
 
     def _set_preview_brightness(self, exposure_ev: float) -> None:
@@ -2578,7 +3273,9 @@ class ISPApplication:
                         self.display_is_pure_bayer_mosaic,
                     )
                 array8 = encode_display_uint8(
-                    resized, self.preview_exposure_ev
+                    resized,
+                    self.preview_exposure_ev,
+                    self.display_is_encoded_rgb,
                 )
                 pil = Image.fromarray(array8)
             else:
@@ -2589,6 +3286,7 @@ class ISPApplication:
                 array8 = encode_display_uint8(
                     visible_source,
                     self.preview_exposure_ev,
+                    self.display_is_encoded_rgb,
                 )
                 pil = Image.fromarray(array8)
                 visible_target_w = max(
@@ -2907,6 +3605,13 @@ class ISPApplication:
         x, y = point
         if self.roi_process_var.get() and self.roi is not None:
             return x + self.roi.x, y + self.roi.y
+        if self.loaded.domain == "yuv" and self.loaded.yuv_metadata is not None:
+            metadata = self.loaded.yuv_metadata
+            display_h, display_w = self.display_linear_array.shape[:2]
+            return (
+                min(metadata.width - 1, int(x * metadata.width / display_w)),
+                min(metadata.height - 1, int(y * metadata.height / display_h)),
+            )
         return x, y
 
     def _roi_index_at(self, point: Tuple[int, int]) -> int:
@@ -3263,6 +3968,17 @@ class ISPApplication:
             self._roi_editor_changed,
         )
 
+    def _handle_arrow_key(self, event, dx: int, dy: int):
+        if (
+            self.loaded.domain == "yuv"
+            and dx
+            and not self.roi_mode_var.get()
+            and not self._is_text_input(event.widget)
+        ):
+            self._step_yuv_frame(dx)
+            return "break"
+        return self._nudge_active_roi(event, dx, dy)
+
     def _nudge_active_roi(self, event, dx: int, dy: int):
         if (
             self._is_text_input(event.widget)
@@ -3365,6 +4081,35 @@ class ISPApplication:
         )
         code_max = (1 << bit_depth) - 1
         if (
+            self.loaded.domain == "yuv"
+            and self.loaded.yuv_frame is not None
+            and self.loaded.yuv_conversion is not None
+        ):
+            y_code, u_code, v_code = self.loaded.yuv_frame.sample(
+                source_x, source_y
+            )
+            rgb = np.asarray(
+                self.loaded.yuv_conversion.rgb[y, x],
+                dtype=np.float32,
+            )
+            absolute = tuple(
+                int(round(float(value) * code_max)) for value in rgb
+            )
+            display_absolute = tuple(
+                int(round(float(value) * code_max))
+                for value in np.clip(rgb, 0.0, 1.0)
+            )
+            metadata = self.loaded.yuv_metadata
+            self.status_var.set(
+                f"x={source_x}, y={source_y} · "
+                f"YUV=({y_code}, {u_code}, {v_code}) · "
+                f"RGB裁剪前≈{absolute} · "
+                f"显示RGB={display_absolute}/{code_max} · "
+                f"{metadata.pixel_format} · {metadata.color_matrix} · "
+                f"{metadata.color_range}"
+            )
+            return
+        if (
             result.domain == "bayer"
             and self.artifact_var.get() == "Main Output"
             and result.image.ndim == 2
@@ -3384,36 +4129,17 @@ class ISPApplication:
                 result_index
             )
             if is_normalized:
-                normalized_value = raw_value
                 absolute_value = int(round(
-                    normalized_value * code_max
+                    raw_value * code_max
                 ))
+                display_value = int(np.clip(absolute_value, 0, code_max))
                 value_text = (
-                    f"Linear={normalized_value:.6f} · "
-                    f"{bit_depth}-bit绝对值≈"
-                    f"{absolute_value}/{code_max}"
+                    f"{bit_depth}-bit计算值≈{absolute_value} · "
+                    f"显示值={display_value}/{code_max}"
                 )
             else:
-                black_by_channel = dict(zip(
-                    ("R", "Gr", "Gb", "B"),
-                    self.loaded.metadata.black_level,
-                ))
-                black = float(black_by_channel[channel])
-                normalized_value = raw_value / max(
-                    float(self.loaded.metadata.white_level),
-                    1.0,
-                )
-                blc_reference_value = (
-                    raw_value - black
-                ) / max(
-                    float(self.loaded.metadata.white_level)
-                    - black,
-                    1.0,
-                )
                 value_text = (
                     f"DN={raw_value:.2f} · "
-                    f"Normalized={normalized_value:.6f} · "
-                    f"BLC参考={blc_reference_value:.6f} · "
                     f"{bit_depth}-bit范围=0…{code_max}"
                 )
             self.status_var.set(
@@ -3439,15 +4165,22 @@ class ISPApplication:
         else:
             value = self.display_linear_array[y, x]
         absolute = np.rint(value * code_max).astype(np.int64)
+        display_absolute = np.rint(
+            np.clip(value, 0.0, 1.0) * code_max
+        ).astype(np.int64)
         self.status_var.set(
             f"x={source_x}, y={source_y} · "
-            f"Linear RGB=({value[0]:.6f}, {value[1]:.6f}, {value[2]:.6f}) · "
-            f"{bit_depth}-bit绝对值≈"
-            f"({absolute[0]}, {absolute[1]}, {absolute[2]})/{code_max}"
+            f"RGB裁剪前≈"
+            f"({absolute[0]}, {absolute[1]}, {absolute[2]}) · "
+            f"显示RGB=({display_absolute[0]}, {display_absolute[1]}, "
+            f"{display_absolute[2]})/{code_max}"
             + (" · 点击此处估算白平衡" if self.gray_pick_mode else "")
         )
 
     def arm_gray_picker(self) -> None:
+        if self.loaded.domain == "yuv":
+            self.toast.show("YUV 预览不使用 Bayer 灰点白平衡", "warning")
+            return
         if self.loaded.domain != "bayer":
             self.toast.show("灰点拾取目前只用于 Bayer RAW", "warning")
             return
@@ -3532,7 +4265,7 @@ class ISPApplication:
 
     def _active_analysis_type(self) -> str:
         if not hasattr(self, "analysis_notebook"):
-            return "Histogram"
+            return "Waveform"
         selected = self.analysis_notebook.select()
         return str(self.analysis_notebook.tab(selected, "text"))
 
@@ -3592,7 +4325,7 @@ class ISPApplication:
         ):
             return
         analysis_type = self._active_analysis_type()
-        index = self._current_result_index()
+        index = self._analysis_result_index(analysis_type)
         result = self.results[index]
         roi_key = self._analysis_roi_key(result)
         width = 0
@@ -3632,7 +4365,7 @@ class ISPApplication:
                 self.performance.increment("dropped_analysis_requests")
         metadata = copy.deepcopy(self.loaded.metadata)
         if (
-            analysis_type in {"Histogram", "Waveform", "Vectorscope"}
+            analysis_type in {"Waveform", "Vectorscope"}
             or (
                 analysis_type == "Statistics"
                 and result.domain != "bayer"
@@ -3681,10 +4414,18 @@ class ISPApplication:
         scale: float,
         width: int,
         height: int,
+        histogram_mode: str = "RGB Overlay",
+        bayer_normalized: bool = False,
     ):
         started = time.perf_counter()
         if analysis_type == "Histogram":
-            value = compute_histogram(image, domain, metadata)
+            value = compute_histogram_details(
+                image,
+                domain,
+                metadata,
+                mode=histogram_mode,
+                bayer_normalized=bayer_normalized,
+            )
         elif analysis_type == "Waveform":
             value = compute_waveform(
                 image,
@@ -3762,7 +4503,7 @@ class ISPApplication:
             generation != self.analysis_generation
             or self.analysis_collapsed
             or analysis_type != self._active_analysis_type()
-            or index != self._current_result_index()
+            or index != self._analysis_result_index(analysis_type)
         ):
             return
         self._last_analysis_payload = (key, analysis_type, payload)
@@ -3792,20 +4533,169 @@ class ISPApplication:
         colors = {
             "R": COLORS["channel_r"], "G": COLORS["channel_g"],
             "B": COLORS["channel_b"], "Y": COLORS["channel_y"],
+            "Gr": "#66d17a", "Gb": "#20a85a",
+            "U": "#42d4f4", "V": "#e879f9",
         }
-        for key in ("Y", "R", "G", "B"):
-            values = np.log1p(hist[key].astype(np.float64))
-            values /= max(values.max(initial=1.0), 1e-9)
+        if "curves" in hist:
+            curves = hist["curves"]
+            edges = np.asarray(hist["bin_edges"], dtype=np.float32)
+            code_max = int(hist["code_max"])
+            curve_sizes = dict(hist.get("curve_sizes", {}))
+        else:
+            curves = hist
+            first = next(iter(curves.values()), np.zeros(256))
+            edges = np.linspace(0.0, 255.0, len(first) + 1)
+            code_max = 255
+            curve_sizes = {
+                key: int(np.asarray(values).sum())
+                for key, values in curves.items()
+            }
+            hist = {
+                "curves": curves,
+                "curve_sizes": curve_sizes,
+                "bin_edges": edges,
+                "code_max": code_max,
+                "stats": {},
+                "legal_ranges": {},
+                "mode": "Legacy",
+            }
+        keys = tuple(
+            key
+            for key in ("Y", "U", "V", "R", "Gr", "Gb", "G", "B")
+            if key in curves
+        )
+        left, right = 42, max(43, width - 10)
+        top, bottom = 20, max(21, height - 22)
+        plot_width = max(1, right - left)
+        plot_height = max(1, bottom - top)
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            x = left + fraction * plot_width
+            self.hist_canvas.create_line(
+                x, top, x, bottom, fill=COLORS["scope_grid"]
+            )
+            self.hist_canvas.create_text(
+                x,
+                bottom + 4,
+                text=str(int(round(code_max * fraction))),
+                anchor="n",
+                fill=MUTED,
+                font=FONTS["small"],
+            )
+        self.hist_canvas.create_line(
+            left, bottom, right, bottom, fill=COLORS["border"]
+        )
+
+        legal_ranges = hist.get("legal_ranges", {})
+        legal_markers = sorted({
+            int(value)
+            for limits in legal_ranges.values()
+            for value in limits
+        })
+        for value in legal_markers:
+            x = left + np.clip(value / max(code_max, 1), 0, 1) * plot_width
+            self.hist_canvas.create_line(
+                x, top, x, bottom,
+                fill=COLORS["warning"], dash=(3, 3),
+            )
+
+        transformed = {}
+        for key in keys:
+            values = np.asarray(curves[key], dtype=np.float64)
+            transformed[key] = (
+                np.log1p(values)
+                if self.histogram_scale_var.get() == "Log"
+                else values
+            )
+        global_max = max(
+            (
+                float(values.max(initial=0.0))
+                for values in transformed.values()
+            ),
+            default=1.0,
+        )
+        global_max = max(global_max, 1.0)
+        for key in keys:
+            values = transformed[key] / global_max
             points = []
             for index, value in enumerate(values):
-                points.extend((index / 255 * (width - 1), height - 2 - value * (height - 8)))
-            self.hist_canvas.create_line(
-                *points, fill=colors[key], width=2 if key == "Y" else 1
-            )
+                x = left + (index + 0.5) / max(len(values), 1) * plot_width
+                y = bottom - float(value) * plot_height
+                points.extend((x, y))
+            if len(points) >= 4:
+                self.hist_canvas.create_line(
+                    *points,
+                    fill=colors.get(key, FG),
+                    width=2 if key in {"Y", "Gr", "Gb"} else 1,
+                )
         self.hist_canvas.create_text(
-            8, 7, text="HISTOGRAM  Y / R / G / B", anchor="nw",
+            left,
+            4,
+            text="  ".join(keys) + f"  ·  {self.histogram_scale_var.get()}",
+            anchor="nw",
             fill=MUTED, font=FONTS["small"],
         )
+        legend_x = right
+        for key in reversed(keys):
+            self.hist_canvas.create_text(
+                legend_x, 4, text=key, anchor="ne",
+                fill=colors.get(key, FG), font=FONTS["small"],
+            )
+            legend_x -= 24
+        stats = hist.get("stats", {})
+        if stats:
+            summary = (
+                f"暗部 {stats['dark_ratio'] * 100:.2f}% · "
+                f"高光 {stats['highlight_ratio'] * 100:.2f}% · "
+                f"Min {stats['minimum']:.0f} · Max {stats['maximum']:.0f}"
+            )
+            if stats["underflow_ratio"] or stats["overflow_ratio"]:
+                summary += (
+                    f" · <0 {stats['underflow_ratio'] * 100:.2f}%"
+                    f" · >{code_max} {stats['overflow_ratio'] * 100:.2f}%"
+                )
+            if legal_ranges:
+                summary += " · 虚线=Limited 合法范围"
+            self.histogram_summary_var.set(summary)
+        else:
+            self.histogram_summary_var.set("")
+        self._histogram_render_payload = hist
+        self._histogram_plot_bounds = (left, top, right, bottom)
+
+    def _on_histogram_motion(self, event) -> None:
+        payload = getattr(self, "_histogram_render_payload", None)
+        bounds = getattr(self, "_histogram_plot_bounds", None)
+        if not payload or bounds is None:
+            return
+        left, top, right, bottom = bounds
+        if not (left <= event.x <= right and top <= event.y <= bottom):
+            self._on_histogram_leave()
+            return
+        edges = np.asarray(payload["bin_edges"], dtype=np.float32)
+        bins = max(1, len(edges) - 1)
+        index = min(
+            bins - 1,
+            max(0, int((event.x - left) / max(right - left, 1) * bins)),
+        )
+        parts = []
+        for key, values in payload["curves"].items():
+            count = int(values[index])
+            total = max(1, int(payload["curve_sizes"].get(key, 0)))
+            parts.append(f"{key} {count:,} ({count / total * 100:.2f}%)")
+        low, high = edges[index], edges[index + 1]
+        self.histogram_hover_var.set(
+            f"码值 {low:.0f}…{high:.0f} · " + " · ".join(parts)
+        )
+        self.hist_canvas.delete("histogram_cursor")
+        self.hist_canvas.create_line(
+            event.x, top, event.x, bottom,
+            fill=FG, dash=(2, 2), tags="histogram_cursor",
+        )
+
+    def _on_histogram_leave(self, _event=None) -> None:
+        if hasattr(self, "hist_canvas"):
+            self.hist_canvas.delete("histogram_cursor")
+        if hasattr(self, "histogram_hover_var"):
+            self.histogram_hover_var.set("")
 
     def _draw_waveform(self) -> None:
         self.schedule_analysis_refresh(0)
@@ -3966,6 +4856,9 @@ class ISPApplication:
         )
 
     def open_calibration_workspace(self) -> None:
+        if self.loaded.domain == "yuv":
+            self.toast.show("YUV 输入不会进入 RAW 自动矫正流程", "warning")
+            return
         self._set_adjustment_mode("auto")
         self._refresh_auto_summary()
 
@@ -3981,9 +4874,7 @@ class ISPApplication:
             )
         except StopIteration:
             return
-        self.pipeline_list.selection_clear(0, "end")
-        self.pipeline_list.selection_set(index)
-        self.pipeline_list.see(index)
+        self._restore_pipeline_selection(index)
         self._on_module_select()
         self.stage_combo.current(index + 1)
         self.compare_var.set(True)
@@ -3993,6 +4884,12 @@ class ISPApplication:
         )
 
     def open_final_preview(self) -> None:
+        if self.loaded.domain == "yuv":
+            self.toast.show(
+                "YUV 已是独立预览路径，不参与 RAW 模块影响分析",
+                "warning",
+            )
+            return
         if (
             self.final_preview_window is not None
             and self.final_preview_window.winfo_exists()
@@ -4010,6 +4907,24 @@ class ISPApplication:
         return [
             (
                 "所有支持格式",
+                "*.raw *.bin *.dat *.yuv *.dng *.nef *.cr2 *.cr3 *.arw "
+                "*.raf *.rw2 *.orf *.png *.jpg *.jpeg *.tif *.tiff",
+            ),
+            ("裸 RAW", "*.raw *.bin *.dat"),
+            ("裸 YUV", "*.yuv"),
+            (
+                "相机 RAW",
+                "*.dng *.nef *.cr2 *.cr3 *.arw *.raf *.rw2 *.orf",
+            ),
+            ("图像", "*.png *.jpg *.jpeg *.tif *.tiff"),
+            ("所有文件", "*.*"),
+        ]
+
+    @staticmethod
+    def _isp_filetypes():
+        return [
+            (
+                "RAW / 图像",
                 "*.raw *.bin *.dat *.dng *.nef *.cr2 *.cr3 *.arw "
                 "*.raf *.rw2 *.orf *.png *.jpg *.jpeg *.tif *.tiff",
             ),
@@ -4022,6 +4937,10 @@ class ISPApplication:
             ("所有文件", "*.*"),
         ]
 
+    @staticmethod
+    def _yuv_filetypes():
+        return [("裸 YUV", "*.yuv"), ("所有文件", "*.*")]
+
     def _refresh_image_selector(self) -> None:
         if not hasattr(self, "image_combo"):
             return
@@ -4031,10 +4950,43 @@ class ISPApplication:
         ]
         self.image_combo["values"] = labels
         if labels:
+            longest = max(len(label) for label in labels)
+            self.image_combo.configure(width=min(52, max(32, longest + 2)))
+        if labels:
             index = min(
                 max(self.current_image_index, 0), len(labels) - 1
             )
             self.image_combo.current(index)
+        self._update_workspace_switch()
+
+    def _update_workspace_switch(self) -> None:
+        if not hasattr(self, "isp_workspace_button"):
+            return
+        is_yuv = self.loaded.domain == "yuv"
+        self.isp_workspace_button.configure(
+            style="Secondary.TButton" if is_yuv else "Primary.TButton"
+        )
+        self.yuv_workspace_button.configure(
+            style="Primary.TButton" if is_yuv else "Secondary.TButton"
+        )
+
+    def _switch_workspace(self, workspace: str) -> None:
+        """Activate the most recent image in a visible RAW ISP/YUV workspace."""
+
+        wants_yuv = workspace == "yuv"
+        current_matches = (self.loaded.domain == "yuv") == wants_yuv
+        if current_matches:
+            self._update_workspace_switch()
+            return
+        for index in range(len(self.work_items) - 1, -1, -1):
+            item_is_yuv = self.work_items[index].loaded.domain == "yuv"
+            if item_is_yuv == wants_yuv:
+                self._activate_work_item(index)
+                return
+        if wants_yuv:
+            self.open_yuv_files()
+        else:
+            self.open_isp_files()
 
     def _runtime_cache_entries(self):
         return [
@@ -4165,12 +5117,15 @@ class ISPApplication:
             if item.runtime_preview is not None:
                 item.runtime_preview = None
                 count += 1
+        yuv_count = len(self.yuv_request_cache)
+        self.yuv_request_cache.clear()
         self.performance.increment(
             "workspace_cache_manual_clears"
         )
         self._update_runtime_cache_metrics()
         self.toast.show(
-            f"已清除 {count} 张图像的多图预览缓存", "info"
+            f"已清除 {count} 张图像缓存和 {yuv_count} 个 YUV 帧缓存",
+            "info",
         )
 
     def _sync_active_roi_to_list(self) -> None:
@@ -4284,9 +5239,18 @@ class ISPApplication:
             self._reset_manual_parameter_snapshots()
         self._refresh_image_selector()
         self._refresh_pipeline_list()
-        self._build_parameter_editor(
-            self.pipeline.modules[self.selected_module_index]
+        self.auto_calibration_button.configure(
+            state="disabled" if self.loaded.domain == "yuv" else "normal"
         )
+        if self.loaded.domain == "yuv":
+            self._build_yuv_parameter_panel()
+        else:
+            self.parameters_label.configure(text="PARAMETERS")
+            self._set_adjustment_mode(self.adjustment_mode)
+            self._update_adjustment_mode_availability()
+            self._build_parameter_editor(
+                self.pipeline.modules[self.selected_module_index]
+            )
         self._update_roi_label()
         self._set_loaded_status()
         if restored_from_cache:
@@ -4311,6 +5275,43 @@ class ISPApplication:
         index = self.image_combo.current()
         if index >= 0:
             self._activate_work_item(index)
+
+    def remove_current_image(self) -> None:
+        """Remove the current item from memory without touching its source."""
+
+        if not (
+            0 <= self.current_image_index < len(self.work_items)
+        ):
+            return
+        self._cancel_pipeline_refresh()
+        self._cancel_analysis_refresh()
+        self._store_current_work_item()
+        removed = self.work_items[self.current_image_index]
+        removed_label = removed.label
+        remove_index = self.current_image_index
+        if len(self.work_items) > 1:
+            self.work_items.pop(remove_index)
+            target_index = min(remove_index, len(self.work_items) - 1)
+        else:
+            loaded = synthetic_bayer()
+            session = CalibrationSession(
+                name="Untitled Calibration",
+                raw_metadata=copy.deepcopy(loaded.metadata),
+            )
+            self.work_items = [
+                ImageWorkItem(
+                    loaded,
+                    snapshot_for_image(self.pipeline.snapshot(), loaded),
+                    session,
+                )
+            ]
+            target_index = 0
+        self.current_image_index = -1
+        self._activate_work_item(target_index)
+        self.toast.show(
+            f"已从工作区移除 {removed_label}（源文件未删除）",
+            "info",
+        )
 
     def _load_paths(self, paths) -> None:
         paths = [str(path) for path in paths if path]
@@ -4339,8 +5340,23 @@ class ISPApplication:
             )
             if metadata is None:
                 return
+        yuv_paths = [
+            path
+            for path in paths
+            if Path(path).suffix.lower() in YUV_EXTENSIONS
+        ]
+        yuv_metadata = None
+        if yuv_paths:
+            yuv_metadata = ask_yuv_metadata(
+                self.root,
+                yuv_paths[0],
+                copy.deepcopy(self.last_yuv_metadata),
+            )
+            if yuv_metadata is None:
+                return
+            self.last_yuv_metadata = copy.deepcopy(yuv_metadata)
         base_snapshot = copy.deepcopy(self.pipeline.snapshot())
-        if len(paths) > 1:
+        if len(paths) > 1 or yuv_paths:
             self.import_generation += 1
             generation = self.import_generation
             self.status_var.set(
@@ -4351,28 +5367,46 @@ class ISPApplication:
                 paths,
                 metadata,
                 base_snapshot,
+                yuv_metadata,
+                self.preview_max_side,
             )
             self._poll_image_import(
                 self.import_future, generation, paths
             )
             return
         new_items, failures = self._read_work_items(
-            paths, metadata, base_snapshot
+            paths,
+            metadata,
+            base_snapshot,
+            yuv_metadata,
+            self.preview_max_side,
         )
         self._finish_image_import(paths, new_items, failures)
 
     @staticmethod
-    def _read_work_items(paths, metadata, base_snapshot):
+    def _read_work_items(
+        paths,
+        metadata,
+        base_snapshot,
+        yuv_metadata=None,
+        preview_max_side=None,
+    ):
         new_items: List[ImageWorkItem] = []
         failures = []
         for path in paths:
             try:
-                item_metadata = (
-                    copy.deepcopy(metadata)
-                    if Path(path).suffix.lower() in PLAIN_EXTENSIONS
-                    else None
+                suffix = Path(path).suffix.lower()
+                if suffix in PLAIN_EXTENSIONS:
+                    item_metadata = copy.deepcopy(metadata)
+                elif suffix in YUV_EXTENSIONS:
+                    item_metadata = copy.deepcopy(yuv_metadata)
+                else:
+                    item_metadata = None
+                loaded = load_image(
+                    path,
+                    item_metadata,
+                    preview_max_side=preview_max_side,
                 )
-                loaded = load_image(path, item_metadata)
                 session = CalibrationSession(
                     name=f"{Path(path).stem} Calibration",
                     raw_metadata=copy.deepcopy(loaded.metadata),
@@ -4451,9 +5485,27 @@ class ISPApplication:
     def open_files(self) -> None:
         paths = filedialog.askopenfilenames(
             parent=self.root,
-            title="导入一张或多张 RAW / 图像",
+            title="导入一张或多张 RAW / YUV / 图像",
             initialdir=self.last_directory or None,
             filetypes=self._image_filetypes(),
+        )
+        self._load_paths(paths)
+
+    def open_isp_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="导入 RAW ISP 图像",
+            initialdir=self.last_directory or None,
+            filetypes=self._isp_filetypes(),
+        )
+        self._load_paths(paths)
+
+    def open_yuv_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="导入一张或多张裸 YUV",
+            initialdir=self.last_directory or None,
+            filetypes=self._yuv_filetypes(),
         )
         self._load_paths(paths)
 
@@ -4462,13 +5514,16 @@ class ISPApplication:
 
         path = filedialog.askopenfilename(
             parent=self.root,
-            title="打开 RAW 或图像",
+            title="打开 RAW、YUV 或图像",
             initialdir=self.last_directory or None,
             filetypes=self._image_filetypes(),
         )
         self._load_paths((path,) if path else ())
 
     def edit_raw_metadata(self) -> None:
+        if self.loaded.domain == "yuv":
+            self.edit_yuv_metadata()
+            return
         metadata = ask_raw_metadata(
             self.root, copy.deepcopy(self.loaded.metadata), "查看 / 编辑 RAW 元数据"
         )
@@ -4498,7 +5553,40 @@ class ISPApplication:
         self._build_parameter_editor(self.pipeline.modules[self.selected_module_index])
         self.schedule_process(immediate=True)
 
+    def edit_yuv_metadata(self) -> None:
+        if (
+            self.loaded.domain != "yuv"
+            or self.loaded.source_path is None
+        ):
+            self.toast.show("当前图像不是裸 YUV", "warning")
+            return
+        metadata = ask_yuv_metadata(
+            self.root,
+            self.loaded.source_path,
+            copy.deepcopy(self.loaded.yuv_metadata),
+        )
+        if metadata is None:
+            return
+        self.last_yuv_metadata = copy.deepcopy(metadata)
+        self.loaded.yuv_metadata = metadata
+        self.loaded.yuv_original_metadata = copy.deepcopy(metadata)
+        self.input_revision += 1
+        self.pipeline_cache = {}
+        self.render_cache.clear()
+        self._build_yuv_parameter_panel()
+        self.schedule_process(immediate=True)
+
     def _set_loaded_status(self) -> None:
+        if self.loaded.domain == "yuv":
+            metadata = self.loaded.yuv_metadata
+            self.status_var.set(
+                f"Image {self.current_image_index + 1}/{len(self.work_items)} · "
+                f"YUV {metadata.pixel_format} · {metadata.width}×{metadata.height} · "
+                f"{metadata.bit_depth} bit · {metadata.color_matrix} · "
+                f"{metadata.color_range} · Frame "
+                f"{metadata.frame_index + 1}/{metadata.frame_count}"
+            )
+            return
         meta = self.loaded.metadata
         self.status_var.set(
             f"Image {self.current_image_index + 1}/{len(self.work_items)} · "
@@ -4538,6 +5626,24 @@ class ISPApplication:
                 },
                 "process_roi": self.roi_process_var.get(),
                 "analyze_roi": self.analysis_roi_var.get(),
+                "histogram_window_geometry": (
+                    self.histogram_window.geometry()
+                    if self.histogram_window is not None
+                    and self.histogram_window.winfo_exists()
+                    else self.histogram_window_geometry
+                ),
+                "histogram_scale": (
+                    self.histogram_window.scale_var.get()
+                    if self.histogram_window is not None
+                    and self.histogram_window.winfo_exists()
+                    else self.histogram_scale
+                ),
+                "histogram_use_roi": (
+                    bool(self.histogram_window.roi_var.get())
+                    if self.histogram_window is not None
+                    and self.histogram_window.winfo_exists()
+                    else self.histogram_use_roi
+                ),
                 "waveform_mode": self.waveform_mode_var.get(),
                 "vectorscope_mode": self.vectorscope_mode_var.get(),
                 "vectorscope_scale": self.vectorscope_scale_var.get(),
@@ -4545,14 +5651,12 @@ class ISPApplication:
                 "window_geometry": self.root.geometry(),
                 "analysis_collapsed": self.analysis_collapsed,
                 "analysis_selected_tab": self._active_analysis_type(),
-                "expert_mode": self.expert_mode,
+                # 保留键以便旧版读取，V0.4.19 起不再启用专家模式。
+                "expert_mode": False,
                 "advanced_parameters": dict(
                     self.advanced_param_state
                 ),
-                "performance_details_visible": (
-                    self.performance_window is not None
-                    and self.performance_window.winfo_exists()
-                ),
+                "performance_details_visible": False,
                 "ui_scale": self.ui_scale,
                 "ui_scale_mode": self.ui_scale_var.get(),
                 "preview_quality": self.preview_quality_var.get(),
@@ -4735,6 +5839,34 @@ class ISPApplication:
                 self.roi_grid_bounds = None
             self.roi_process_var.set(bool(ui_state.get("process_roi", False) and self.roi))
             self.analysis_roi_var.set(bool(ui_state.get("analyze_roi", True)))
+            histogram_geometry = str(
+                ui_state.get("histogram_window_geometry", "")
+            )
+            if not histogram_geometry or re.fullmatch(
+                r"\d+x\d+(?:[+-]\d+){2}", histogram_geometry
+            ):
+                self.histogram_window_geometry = histogram_geometry
+            histogram_scale = str(
+                ui_state.get("histogram_scale", "Log")
+            )
+            self.histogram_scale = (
+                histogram_scale
+                if histogram_scale in {"Log", "Linear"} else "Log"
+            )
+            self.histogram_use_roi = bool(
+                ui_state.get("histogram_use_roi", True)
+            )
+            if (
+                self.histogram_window is not None
+                and self.histogram_window.winfo_exists()
+            ):
+                self.histogram_window.scale_var.set(self.histogram_scale)
+                self.histogram_window.roi_var.set(self.histogram_use_roi)
+                if self.histogram_window_geometry:
+                    self.histogram_window.geometry(
+                        self.histogram_window_geometry
+                    )
+                self.histogram_window.refresh(0)
             self.channel_var.set(ui_state.get("channel", "RGB"))
             self.compare_var.set(bool(ui_state.get("compare", False)))
             self.compare_position = float(
@@ -4760,10 +5892,9 @@ class ISPApplication:
             self.artifact_overlay_var.set(
                 bool(ui_state.get("artifact_overlay", False))
             )
-            self.expert_mode = bool(
-                ui_state.get("expert_mode", False)
-            )
-            self.expert_mode_var.set(self.expert_mode)
+            # 旧配置可能记录了专家模式，新工作区统一忽略。
+            self.expert_mode = False
+            self.expert_mode_var.set(False)
             advanced_state = ui_state.get(
                 "advanced_parameters", {}
             )
@@ -4815,15 +5946,14 @@ class ISPApplication:
             analysis_tab = str(
                 ui_state.get(
                     "analysis_selected_tab",
-                    ui_state.get("analysis_tab", "Histogram"),
+                    ui_state.get("analysis_tab", "Waveform"),
                 )
             )
             for tab_id in self.analysis_notebook.tabs():
                 if self.analysis_notebook.tab(tab_id, "text") == analysis_tab:
                     self.analysis_notebook.select(tab_id)
                     break
-            if bool(ui_state.get("performance_details_visible", False)):
-                self.root.after_idle(self.show_performance_details)
+            self._analysis_tab_changed()
             sashes = ui_state.get("main_sashes", [])
             if isinstance(sashes, list):
                 self.root.after_idle(
@@ -4871,6 +6001,98 @@ class ISPApplication:
             self.export_current()
         finally:
             self.artifact_var.set(previous)
+
+    def export_yuv_metadata(self) -> None:
+        if self.loaded.domain != "yuv":
+            self.toast.show("当前图像不是 YUV", "warning")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出 YUV 元数据",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        payload = self.loaded.yuv_metadata.to_dict()
+        payload.update({
+            "file_name": (
+                self.loaded.source_path.name
+                if self.loaded.source_path else ""
+            ),
+            "file_size": int(
+                self.loaded.yuv_frame.source_size
+                if self.loaded.yuv_frame else 0
+            ),
+        })
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.toast.show("YUV 元数据已导出", "success")
+
+    def export_yuv_planes(self) -> None:
+        if self.loaded.domain != "yuv" or self.loaded.yuv_frame is None:
+            self.toast.show("当前图像不是 YUV", "warning")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出 Y/U/V 原始与上采样平面",
+            defaultextension=".npz",
+            filetypes=[("NumPy Plane Archive", "*.npz")],
+        )
+        if not path:
+            return
+        try:
+            y_full, u_full, v_full = upsample_planes(
+                self.loaded.yuv_frame
+            )
+            np.savez_compressed(
+                path,
+                y=self.loaded.yuv_frame.y,
+                u=self.loaded.yuv_frame.u,
+                v=self.loaded.yuv_frame.v,
+                y_upsampled=y_full,
+                u_upsampled=u_full,
+                v_upsampled=v_full,
+                metadata=json.dumps(
+                    self.loaded.yuv_metadata.to_dict(),
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("导出 YUV 平面失败", str(exc), parent=self.root)
+            return
+        self.toast.show("Y/U/V 平面已导出", "success")
+
+    def export_yuv_rgb_frame(self) -> None:
+        if self.loaded.domain != "yuv" or self.loaded.yuv_frame is None:
+            self.toast.show("当前图像不是 YUV", "warning")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出 YUV 当前帧全分辨率 RGB",
+            defaultextension=".png",
+            filetypes=[("PNG 8-bit", "*.png"), ("TIFF 16-bit", "*.tif *.tiff")],
+        )
+        if not path:
+            return
+        try:
+            conversion = yuv_to_rgb(
+                self.loaded.yuv_frame,
+                target_size=None,
+                clip=True,
+            )
+            export_image(
+                path,
+                conversion.rgb,
+                "yuv_rgb",
+                self.loaded.metadata,
+            )
+        except Exception as exc:
+            messagebox.showerror("导出 YUV RGB 失败", str(exc), parent=self.root)
+            return
+        self.toast.show("YUV 当前帧 RGB 已导出", "success")
 
     def export_current(self) -> None:
         if not self.results:
@@ -4933,8 +6155,8 @@ class ISPApplication:
     def show_about(self) -> None:
         messagebox.showinfo(
             "关于",
-            "ISP RAW Visual Simulator 0.4.15\n\n"
-            "用于 RAW ISP 模块的离线视觉效果快速仿真。\n"
+            "ISP RAW Visual Simulator 0.4.23\n\n"
+            "用于 RAW ISP 模块仿真和裸 YUV 逐帧预览。\n"
             f"当前计算后端：{self.pipeline.backend.name}\n"
             "内部使用 float32；当前不保证与硬件 ISP 逐位一致。",
             parent=self.root,
@@ -4988,6 +6210,11 @@ class ISPApplication:
             and self.final_preview_window.winfo_exists()
         ):
             self.final_preview_window.close()
+        if (
+            self.histogram_window is not None
+            and self.histogram_window.winfo_exists()
+        ):
+            self.histogram_window.close()
         self.toast.close()
         self.wheel_router.close()
         self.executor.shutdown(wait=False, cancel_futures=True)

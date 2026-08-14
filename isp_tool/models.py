@@ -62,6 +62,13 @@ class LoadedImage:
     metadata: RawMetadata
     source_path: Optional[Path] = None
     description: str = ""
+    # YUV state is intentionally separate from RawMetadata.  ``metadata`` is
+    # retained as a small compatibility shell for shared image-size/display
+    # code; no pixel-format or colour-range setting is stored in it.
+    yuv_metadata: Any = None
+    yuv_frame: Any = None
+    yuv_conversion: Any = None
+    yuv_original_metadata: Any = None
 
 
 @dataclass(frozen=True)

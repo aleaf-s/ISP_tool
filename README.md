@@ -1,8 +1,48 @@
-# ISP RAW Visual Simulator V0.4.17
+# ISP RAW Visual Simulator V0.4.23
 
-桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.17 将产品范围收敛为
-`BLC → LSC → WB → Demosaic → CCM`，重点是用尽量少的界面操作快速看到
-矫正效果。
+桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.23 同时提供相互隔离的
+RAW ISP 流程 `BLC → LSC → WB → Demosaic → CCM` 与裸 YUV 预览流程。
+
+## V0.4.23 独立 Histogram 窗口
+
+- `Histogram` 现在打开单例、非模态的独立窗口，不再占用主窗口底部空间；重复点击只会激活已有窗口。
+- 移除数据源选择，始终分析左侧当前选中模块的输出；切换图像、模块、参数或 ROI 后自动延迟刷新，不会重新执行 ISP 流水线。
+- 通道严格跟随当前数据域：Bayer RAW 仅显示 R/Gr/Gb/B，RGB 仅显示 R/G/B，YUV 仅显示原生 Y/U/V。
+- 通道可多选并保证至少保留一个；保留 ROI、Log/Linear、绝对码值横轴、Limited Range 标记、统计摘要与鼠标悬停读数。
+- 窗口位置、大小、纵轴模式和 ROI 开关会随配置保存；Waveform、Vectorscope、Statistics 继续位于“更多分析”。
+
+## V0.4.22 Histogram 分析工具
+
+- 主预览工具栏新增明确的 `Histogram` 按钮，在当前窗口底部展开/收起，不打开额外弹窗。
+- 数据源支持当前显示、当前模块输入、当前模块输出和最终输出；可切换全图/ROI 与 Log/Linear 纵轴。
+- Bayer RAW 直接统计 R/Gr/Gb/B 四个 CFA 平面，横轴按实际位深显示 DN，不再将 Gr/Gb 合并为单一 G。
+- RGB 支持 RGB Overlay、Luma 和 R/G/B 单通道；保留裁剪前数据，可统计负值与超范围像素。
+- YUV 支持原生 Y/U/V 和转换后 RGB/Luma；Limited Range 使用虚线标出法定 Y/UV 范围。
+- 底部显示暗部、高光、Min/Max 及上下越界占比；鼠标悬停曲线时显示码值区间、样本数和占比。
+- Waveform、Vectorscope 和 Statistics 收纳到“更多分析”，不再用常驻标签干扰常用 Histogram。
+- 面板隐藏时不计算；参数调整使用延迟刷新、后台线程、请求取消与结果缓存。
+
+## V0.4.21 YUV 快速格式切换与绝对码值
+
+- Display Preview 的 Pixel Format 可直接切换所有已实现格式：I420、YV12、NV12、NV21、YUYV、UYVY、YUV444P、YUV422P、GRAY、P010 和 YUV420P10LE。
+- 快速参数区增加 Bit Depth 和 Endianness；选择 P010/YUV420P10LE 时自动切换为 10-bit little-endian，YUYV/UYVY 自动切换为 8-bit。
+- 格式切换前检查尺寸、stride、位深与文件字节数；不合法组合会提示并恢复上次有效值。
+- 底部像素栏不再显示 0～1 归一化 RGB，改为源 YUV/DN、裁剪前绝对 RGB 和最终显示 RGB 码值。
+- 移除预览工具栏的 Gray 和 1:1 按钮，并移除视图菜单中的 1:1 可见入口；鼠标滚轮缩放和适合窗口保留。
+
+## V0.4.20 YUV 文件名参数识别
+
+- 导入 YUV 时会从文件名提取分辨率、位深、像素格式、Color Matrix、Range、大小端和 Linear Layout 标记。
+- 例如 `YUV_1280x720_8bits_420sp_linear_20260810105249.yuv` 会自动填入 `1280×720`、`8-bit`、`NV12` 和 Linear Layout。
+- `420sp` 只能说明色度交错存储，不能判断 UV/VU 顺序；工具暂按 NV12 并显示待确认提示，若颜色异常可直接切换 NV21。
+- 明确写有 `NV12`、`NV21`、`I420`、`YV12`、`P010` 等标记时，明确格式优先于通用 `420sp/420p` 推测。
+
+## V0.4.19 简洁双工作区
+
+- 主工具栏显示 `RAW ISP` / `YUV 预览` 双入口，高亮当前工作区；若工作区已有图像则直接切换，否则打开对应类型的导入窗口。
+- 图像名下拉框加宽并按文件名动态调整，旁边增加“移除”；移除只影响内存工作区，不删除源文件。
+- 取消专家模式及其状态恢复，阶段选择、专家诊断和常驻性能状态不再占用主界面。
+- 计算后端、性能详情和清缓存收纳到 `视图 → 高级工具`，常用的预览菜单只保留最终效果、Scopes 和预览质量。
 
 ## 启动
 
@@ -16,6 +56,27 @@ python run.py
 启动后可在支持自动校正的模块中，于右侧检查器顶部直接切换 `手动 / 自动`；
 两种模式共用当前图像预览，不再打开额外的校正窗口。Demosaic 直接显示算法
 选项，不显示无意义的模式切换。
+
+## V0.4.18 YUV 图像预览与分析
+
+- `.yuv` 作为独立输入域，使用 `YUV Input → Chroma Upsampling → YUV to RGB → Display Preview`，不会执行任何 Bayer RAW ISP 模块
+- 支持 I420/YUV420P、YV12、NV12、NV21、YUYV/YUY2、UYVY、YUV444P、YUV422P、Gray、P010 和 YUV420P10LE
+- YUV 元数据对话框提供文件名参数推测、常用预设、stride/offset、帧数和文件大小一致性检查
+- 支持 BT.601、BT.709、BT.2020，以及 Full/Limited Range；10-bit Limited Range 保持 10-bit 码值计算
+- 420/422 色度上采样支持 Bilinear 与 Nearest，并区分 Center、Left 和 Top-left Chroma Siting
+- 多帧 YUV 使用 `numpy.memmap` 按帧读取，左右方向键或右侧 Frame 控件切换；最近两种转换结果使用独立缓存
+- Display 菜单可查看 Y/U/V 与 R/G/B 单通道；Histogram 同时显示原始 Y/U/V 和转换后 R/G/B
+- 悬停显示原始 Y/U/V 绝对码值、归一化值、RGB' 和当前位深等效码值
+- 支持当前帧全分辨率 RGB PNG/TIFF、YUV 元数据 JSON，以及原始/上采样 Y/U/V `.npz` 导出
+
+YUV Limited Range 的归一化不会直接除以 255。以 8-bit 为例，Y 使用
+16～235，Cb/Cr 使用以 128 为中心的 16～240 范围；更高位深按相应倍数扩展。
+YUV 转换结果为显示参考的 RGB'，预览阶段不会再次执行 sRGB Gamma。
+
+示例元数据见 `examples/yuv_nv12_1080p.json`。
+
+当前限制：本版本提供逐帧浏览而不是按 FPS 连续播放；一次多选的裸 YUV 文件
+共用导入对话框中确认的元数据；高位深打包格式目前仅包含 P010 和 10-bit planar。
 
 ## V0.4.17 BLC 零校正预览一致性
 

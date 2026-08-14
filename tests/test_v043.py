@@ -28,7 +28,7 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
         root.withdraw()
         return root
 
-    def test_default_workspace_is_simple_and_expert_mode_is_reversible(self):
+    def test_workspace_stays_simple_when_old_code_requests_expert_mode(self):
         root = self._root()
         app = ISPApplication(root)
         try:
@@ -44,16 +44,36 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             app.expert_mode_var.set(True)
             app._apply_expert_mode()
             root.update_idletasks()
-            self.assertTrue(app.stage_selector.winfo_manager())
-            self.assertTrue(app.expert_diagnostics_label.winfo_manager())
-            self.assertTrue(app.performance_status_label.winfo_manager())
-            self.assertTrue(app.advanced_params_frame.winfo_manager())
-
-            app.expert_mode_var.set(False)
-            app._apply_expert_mode()
+            self.assertFalse(app.expert_mode)
+            self.assertFalse(app.expert_mode_var.get())
             self.assertFalse(app.stage_selector.winfo_manager())
             self.assertFalse(app.expert_diagnostics_label.winfo_manager())
             self.assertFalse(app.performance_status_label.winfo_manager())
+        finally:
+            if root.winfo_exists():
+                app.close()
+
+    def test_pipeline_selection_stays_highlighted_after_focus_and_refresh(self):
+        root = self._root()
+        app = ISPApplication(root)
+        try:
+            root.update()
+            self.assertEqual(
+                str(app.pipeline_list.cget("exportselection")), "0"
+            )
+            target = min(3, len(app.pipeline.modules) - 1)
+            app.pipeline_list.selection_clear(0, "end")
+            app.pipeline_list.selection_set(target)
+            app._on_module_select()
+
+            app._refresh_pipeline_list()
+            root.update_idletasks()
+            self.assertEqual(app.pipeline_list.curselection(), (target,))
+            self.assertEqual(app.pipeline_list.index("active"), target)
+
+            app.pipeline_list.selection_clear(0, "end")
+            app._on_module_select()
+            self.assertEqual(app.pipeline_list.curselection(), (target,))
         finally:
             if root.winfo_exists():
                 app.close()

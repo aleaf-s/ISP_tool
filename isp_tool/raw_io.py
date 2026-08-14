@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover
 
 
 PLAIN_EXTENSIONS = {".raw", ".bin", ".dat"}
+YUV_EXTENSIONS = {".yuv"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 CAMERA_RAW_EXTENSIONS = {
     ".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".rw2", ".orf",
@@ -196,9 +197,59 @@ def read_standard_image(path: Path, bayer_metadata: Optional[RawMetadata] = None
     return LoadedImage(normalized, "rgb", meta, path, "RGB 测试图")
 
 
-def load_image(path: str, metadata: Optional[RawMetadata] = None) -> LoadedImage:
+def read_yuv_image(
+    path: Path,
+    metadata,
+    preview_max_side: Optional[int] = None,
+) -> LoadedImage:
+    from .yuv import YUVMetadata, read_yuv_frame, yuv_to_rgb
+
+    if not isinstance(metadata, YUVMetadata):
+        raise ISPError("裸 YUV 需要提供 YUV 元数据")
+    frame = read_yuv_frame(path, metadata, metadata.frame_index)
+    target_size = None
+    if preview_max_side:
+        height, width = frame.shape
+        if max(width, height) > int(preview_max_side):
+            scale = int(preview_max_side) / max(width, height)
+            target_size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+    conversion = yuv_to_rgb(frame, target_size=target_size, clip=False)
+    compatibility = RawMetadata(
+        width=metadata.width,
+        height=metadata.height,
+        bit_depth=metadata.bit_depth,
+        black_level=[0.0] * 4,
+        white_level=float((1 << metadata.bit_depth) - 1),
+    )
+    return LoadedImage(
+        conversion.rgb,
+        "yuv",
+        compatibility,
+        path,
+        (
+            f"YUV · {metadata.pixel_format} · {metadata.color_matrix} · "
+            f"{metadata.color_range} · Frame {metadata.frame_index + 1}/"
+            f"{metadata.frame_count}"
+        ),
+        frame.metadata,
+        frame,
+        conversion,
+        YUVMetadata.from_dict(frame.metadata.to_dict()),
+    )
+
+
+def load_image(
+    path: str,
+    metadata: Optional[Any] = None,
+    preview_max_side: Optional[int] = None,
+) -> LoadedImage:
     source = Path(path)
     suffix = source.suffix.lower()
+    if suffix in YUV_EXTENSIONS:
+        return read_yuv_image(source, metadata, preview_max_side)
     if suffix in PLAIN_EXTENSIONS:
         if metadata is None:
             raise ISPError("裸 RAW 需要提供宽高、位深和存储格式")

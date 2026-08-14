@@ -62,7 +62,7 @@ class HiddenTkV0415Tests(unittest.TestCase):
             if root.winfo_exists():
                 app.close()
 
-    def test_pixel_hover_shows_normalized_and_bit_depth_values(self):
+    def test_pixel_hover_shows_only_absolute_pixel_values(self):
         root = self._root()
         app = ISPApplication(root)
         try:
@@ -74,8 +74,8 @@ class HiddenTkV0415Tests(unittest.TestCase):
             app._on_canvas_motion(self._event_for_pixel(app))
             input_status = app.status_var.get()
             self.assertIn("DN=", input_status)
-            self.assertIn("Normalized=", input_status)
-            self.assertIn("BLC参考=", input_status)
+            self.assertNotIn("Normalized=", input_status)
+            self.assertNotIn("BLC参考=", input_status)
             self.assertIn(
                 f"{app.loaded.metadata.bit_depth}-bit范围",
                 input_status,
@@ -91,8 +91,9 @@ class HiddenTkV0415Tests(unittest.TestCase):
             app._last_mouse_status_at = 0.0
             app._on_canvas_motion(self._event_for_pixel(app))
             wb_status = app.status_var.get()
-            self.assertIn("Linear=", wb_status)
-            self.assertIn("bit绝对值≈", wb_status)
+            self.assertNotIn("Linear=", wb_status)
+            self.assertIn("bit计算值≈", wb_status)
+            self.assertIn("显示值=", wb_status)
 
             demosaic_index = next(
                 index
@@ -104,8 +105,9 @@ class HiddenTkV0415Tests(unittest.TestCase):
             app._last_mouse_status_at = 0.0
             app._on_canvas_motion(self._event_for_pixel(app))
             rgb_status = app.status_var.get()
-            self.assertIn("Linear RGB=", rgb_status)
-            self.assertIn("bit绝对值≈(", rgb_status)
+            self.assertNotIn("Linear RGB=", rgb_status)
+            self.assertIn("RGB裁剪前≈(", rgb_status)
+            self.assertIn("显示RGB=(", rgb_status)
         finally:
             if root.winfo_exists():
                 app.close()
