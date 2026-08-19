@@ -48,6 +48,7 @@ class AWBAnalyzerAdapter(ModuleAnalyzer):
             )),
             shades_p=float(options.get("shades_p", 6.0)),
             neutral_tolerance=float(options.get("neutral_tolerance", 0.18)),
+            data_state=options.get("data_state"),
         )
         warnings = []
         if result.diagnostics.get("gain_limited"):
@@ -117,6 +118,7 @@ class AEAnalyzerAdapter(ModuleAnalyzer):
                 options.get("maximum_allowed_clipping", 0.01)
             ),
             roi=roi,
+            data_state=options.get("data_state"),
         )
         warnings = []
         if result.diagnostics.get("highlight_limited"):

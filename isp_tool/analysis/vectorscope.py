@@ -5,7 +5,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from ..models import ISPError, RawMetadata
+from ..models import ISPError, RawMetadata, StageDataState
 from ..preview import bayer_cell_rgb, display_rgb
 
 
@@ -49,12 +49,18 @@ def compute_vectorscope(
     size: int = 256,
     saturation_scale: float = 1.0,
     max_samples: int = 200000,
+    data_state: StageDataState | None = None,
 ) -> np.ndarray:
     size = max(96, int(size))
     rgb = (
-        bayer_cell_rgb(image, metadata)
+        bayer_cell_rgb(
+            image, metadata,
+            already_normalized=(
+                data_state.normalized if data_state is not None else None
+            ),
+        )
         if domain == "bayer"
-        else display_rgb(image, domain, metadata)
+        else display_rgb(image, domain, metadata, data_state=data_state)
     )
     flat = rgb.reshape(-1, 3)
     if len(flat) > max_samples:

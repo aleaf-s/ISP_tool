@@ -14,7 +14,13 @@ from .backends import (
     ProcessingBackend,
     select_backend,
 )
-from .models import ISPError, ImageROI, RawMetadata, StageResult
+from .models import (
+    ISPError,
+    ImageROI,
+    RawMetadata,
+    StageDataState,
+    StageResult,
+)
 from .modules import (
     BlackLevelCorrection,
     ColorCorrectionMatrix,
@@ -128,7 +134,40 @@ class ISPPipeline:
                 name: self._crop_array(artifact, core, result.image.shape)
                 for name, artifact in result.artifacts.items()
             },
+            result.data_state,
         )
+
+    @staticmethod
+    def _module_output_state(
+        module,
+        current_state: StageDataState,
+        output_domain: str,
+        parameters: Dict[str, Any],
+    ) -> StageDataState:
+        if module.module_id == "black_level_correction":
+            return StageDataState(
+                "bayer",
+                "Bayer Linear Normalized",
+                float(parameters.get("output_min", 0.0)),
+                float(parameters.get("output_max", 1.0)),
+                True,
+                True,
+                current_state.bit_depth,
+                current_state.black_level,
+                current_state.white_level,
+            )
+        return current_state.with_domain(output_domain)
+
+    @staticmethod
+    def _state_diagnostics(state: StageDataState) -> Dict[str, Any]:
+        return {
+            "数值域": state.encoding,
+            "标称范围": f"{state.value_min:g}…{state.value_max:g}",
+            "BLC Applied": bool(state.black_level_applied),
+            "Normalized": bool(state.normalized),
+            "Bit Depth": int(state.bit_depth),
+            "White Level": float(state.white_level),
+        }
 
     def _run_module(
         self,
@@ -136,6 +175,7 @@ class ISPPipeline:
         config: Dict[str, Any],
         current: np.ndarray,
         current_domain: str,
+        current_state: StageDataState,
         metadata: RawMetadata,
         backend: ProcessingBackend,
     ) -> StageResult:
@@ -148,8 +188,12 @@ class ISPPipeline:
                 current,
                 current_domain,
                 0.0,
-                {"状态": reason},
+                {
+                    "状态": reason,
+                    **self._state_diagnostics(current_state),
+                },
                 {},
+                current_state,
             )
         # A full deepcopy duplicates DPC maps and other calibration state for
         # every refresh. The detached snapshot below is the worker's source of
@@ -159,6 +203,7 @@ class ISPPipeline:
         worker_module.processing_backend = backend
         worker_module.parameters = dict(config["parameters"])
         worker_module.load_state(config.get("state", {}))
+        metadata._stage_data_state = current_state
         try:
             started = time.perf_counter()
             raw_output = worker_module.process(current, current_domain, metadata)
@@ -177,6 +222,13 @@ class ISPPipeline:
                 f"{module.name} 意外改变了图像尺寸："
                 f"{current.shape[:2]} → {image.shape[:2]}"
             )
+        output_state = self._module_output_state(
+            worker_module, current_state, domain, worker_module.parameters
+        )
+        diagnostics = {
+            **diagnostics,
+            **self._state_diagnostics(output_state),
+        }
         return StageResult(
             module.module_id,
             module.name,
@@ -185,6 +237,7 @@ class ISPPipeline:
             elapsed,
             diagnostics,
             artifacts,
+            output_state,
         )
 
     def process(
@@ -298,19 +351,24 @@ class ISPPipeline:
             previous = new_working[-1]
             current = previous.image
             current_domain = previous.domain
+            current_state = previous.data_state or StageDataState.for_input(
+                current_domain, process_metadata
+            )
         else:
             dirty_index = 0
             ys, xs = outer.slices()
             current = np.ascontiguousarray(source[ys, xs])
             current_domain = domain
+            current_state = StageDataState.for_input(domain, process_metadata)
             input_working = StageResult(
                 "input",
                 "RAW Input" if domain == "bayer" else "RGB Input",
                 current,
                 current_domain,
                 0.0,
+                self._state_diagnostics(current_state),
                 {},
-                {},
+                current_state,
             )
             new_working = [input_working]
             new_public = [self._public_result(input_working, core)]
@@ -323,10 +381,14 @@ class ISPPipeline:
                 config,
                 current,
                 current_domain,
+                current_state,
                 process_metadata,
                 processing_backend,
             )
             current, current_domain = result.image, result.domain
+            current_state = result.data_state or current_state.with_domain(
+                current_domain
+            )
             new_working.append(result)
             new_public.append(self._public_result(result, core))
 

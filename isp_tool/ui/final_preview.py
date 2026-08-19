@@ -123,7 +123,7 @@ class FinalImpactWindow(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.title("最终效果与模块影响")
+        self.title(self.app.tr("final.title"))
         self.geometry("1260x760")
         self.minsize(940, 620)
         self.transient(parent)
@@ -145,8 +145,19 @@ class FinalImpactWindow(tk.Toplevel):
             value="选择一个模块，查看它对最终输出的影响。"
         )
         self._build()
+        self.refresh_language()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_from_app()
+
+    def refresh_language(self) -> None:
+        self.title(self.app.tr("final.title"))
+        self.refresh_button.configure(text=self.app.tr("final.refresh"))
+        self.select_label.configure(text=self.app.tr("final.select"))
+        self.explanation_label.configure(
+            text=self.app.tr("final.explanation")
+        )
+        self.notebook.tab(0, text=self.app.tr("final.compare"))
+        self.notebook.tab(1, text=self.app.tr("final.heatmap"))
 
     def _build(self) -> None:
         toolbar = ttk.Frame(self, padding=(10, 8))
@@ -156,11 +167,12 @@ class FinalImpactWindow(tk.Toplevel):
             text="FINAL OUTPUT IMPACT",
             style="Title.TLabel",
         ).pack(side="left")
-        ttk.Button(
+        self.refresh_button = ttk.Button(
             toolbar,
             text="刷新当前图像和参数",
             command=self.refresh_from_app,
-        ).pack(side="right")
+        )
+        self.refresh_button.pack(side="right")
         ttk.Label(
             toolbar, textvariable=self.status_var,
             style="Muted.TLabel",
@@ -173,10 +185,11 @@ class FinalImpactWindow(tk.Toplevel):
         body.add(left, weight=0)
         body.add(center, weight=1)
 
-        ttk.Label(
+        self.select_label = ttk.Label(
             left, text="选择临时旁路模块",
             style="Title.TLabel",
-        ).pack(anchor="w", pady=(0, 6))
+        )
+        self.select_label.pack(anchor="w", pady=(0, 6))
         self.module_list = tk.Listbox(
             left,
             bg=COLORS["panel_alt"],
@@ -193,7 +206,7 @@ class FinalImpactWindow(tk.Toplevel):
         self.module_list.bind(
             "<<ListboxSelect>>", self._module_selected
         )
-        ttk.Label(
+        self.explanation_label = ttk.Label(
             left,
             text=(
                 "这里采用临时旁路（ablation）比较。结果表示该模块"
@@ -201,7 +214,8 @@ class FinalImpactWindow(tk.Toplevel):
             ),
             style="Muted.TLabel",
             wraplength=220,
-        ).pack(fill="x", pady=(8, 0))
+        )
+        self.explanation_label.pack(fill="x", pady=(8, 0))
 
         self.notebook = ttk.Notebook(center)
         self.notebook.pack(fill="both", expand=True)
@@ -284,6 +298,7 @@ class FinalImpactWindow(tk.Toplevel):
                     self.baseline_stage.image,
                     self.baseline_stage.domain,
                     self.metadata,
+                    data_state=self.baseline_stage.data_state,
                 ),
                 "FINAL · 全部启用",
             )
@@ -347,10 +362,12 @@ class FinalImpactWindow(tk.Toplevel):
                 snapshot=bypass_snapshot,
             )[-1]
             final_rgb = display_rgb(
-                baseline.image, baseline.domain, metadata
+                baseline.image, baseline.domain, metadata,
+                data_state=baseline.data_state,
             )
             bypass_rgb = display_rgb(
-                bypass.image, bypass.domain, metadata
+                bypass.image, bypass.domain, metadata,
+                data_state=bypass.data_state,
             )
             return {
                 "module_id": module_id,

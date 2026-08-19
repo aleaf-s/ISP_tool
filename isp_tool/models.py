@@ -297,6 +297,72 @@ class ParameterRecommendation:
 
 
 @dataclass
+class StageDataState:
+    """Explicit numeric representation carried beside every stage image."""
+
+    color_domain: str
+    encoding: str
+    value_min: float
+    value_max: float
+    normalized: bool
+    black_level_applied: bool
+    bit_depth: int
+    black_level: Tuple[float, float, float, float]
+    white_level: float
+
+    @classmethod
+    def for_input(
+        cls, domain: str, metadata: RawMetadata
+    ) -> "StageDataState":
+        black = tuple(float(value) for value in metadata.black_level)
+        if domain == "bayer":
+            return cls(
+                "bayer", "Bayer RAW DN", 0.0,
+                float(metadata.white_level), False, False,
+                int(metadata.bit_depth), black,
+                float(metadata.white_level),
+            )
+        return cls(
+            "rgb", "RGB Linear Normalized", 0.0, 1.0,
+            True, False, int(metadata.bit_depth), black,
+            float(metadata.white_level),
+        )
+
+    def with_domain(self, domain: str) -> "StageDataState":
+        domain = str(domain)
+        if domain == self.color_domain:
+            return self
+        if domain == "rgb":
+            encoding = (
+                "RGB Linear Normalized" if self.normalized else "RGB DN"
+            )
+        elif domain == "bayer":
+            encoding = (
+                "Bayer Linear Normalized"
+                if self.normalized else "Bayer RAW DN"
+            )
+        else:
+            encoding = self.encoding
+        return StageDataState(
+            domain, encoding, self.value_min, self.value_max,
+            self.normalized, self.black_level_applied, self.bit_depth,
+            self.black_level, self.white_level,
+        )
+
+    @property
+    def code_max(self) -> int:
+        return (1 << max(1, min(int(self.bit_depth), 30))) - 1
+
+    @property
+    def absolute_scale(self) -> float:
+        return float(self.code_max) if self.normalized else 1.0
+
+    @property
+    def display_divisor(self) -> float:
+        return 1.0 if self.normalized else max(float(self.white_level), 1.0)
+
+
+@dataclass
 class StageResult:
     module_id: str
     name: str
@@ -305,6 +371,7 @@ class StageResult:
     elapsed_ms: float
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     artifacts: Dict[str, np.ndarray] = field(default_factory=dict)
+    data_state: Optional[StageDataState] = None
 
 
 @dataclass

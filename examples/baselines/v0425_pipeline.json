@@ -1,0 +1,526 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.4.25",
+  "backend": "OpenCV / NumPy",
+  "fixture": {
+    "generator": "synthetic_bayer",
+    "width": 160,
+    "height": 120,
+    "patterns": [
+      "RGGB",
+      "GRBG",
+      "GBRG",
+      "BGGR"
+    ]
+  },
+  "cases": {
+    "RGGB": {
+      "metadata": {
+        "width": 160,
+        "height": 120,
+        "bit_depth": 12,
+        "storage": "uint16_le",
+        "bayer_pattern": "RGGB",
+        "byte_order": "little",
+        "row_stride_bytes": 0,
+        "offset_bytes": 0,
+        "black_level": [
+          64.0,
+          64.0,
+          64.0,
+          64.0
+        ],
+        "white_level": 4095.0,
+        "flip_horizontal": false,
+        "flip_vertical": false
+      },
+      "stages": {
+        "input": {
+          "domain": "bayer",
+          "encoding": "Bayer RAW DN",
+          "normalized": false,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 312.57952881,
+          "maximum": 3696.59790039,
+          "mean": 1689.51672363,
+          "stddev": 818.35620117,
+          "p01": 359.20474335,
+          "p50": 1735.37145996,
+          "p99": 3612.65111816,
+          "quantized_sha256": "91a1ee28a4b8a1bc3b3c06937c9ae11ea5d7df0dd6df81661825aa98dae1e8db"
+        },
+        "black_level_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 0.90116543,
+          "mean": 0.40325394,
+          "stddev": 0.20301567,
+          "p01": 0.07323363,
+          "p50": 0.41462947,
+          "p99": 0.88034016,
+          "quantized_sha256": "74903c7d02adab4c1e1fc72a487ab07e0018ec4a0fbf5da45a92574a7681ca2d"
+        },
+        "lens_shading_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 0.90116543,
+          "mean": 0.40325394,
+          "stddev": 0.20301567,
+          "p01": 0.07323363,
+          "p50": 0.41462947,
+          "p99": 0.88034016,
+          "quantized_sha256": "74903c7d02adab4c1e1fc72a487ab07e0018ec4a0fbf5da45a92574a7681ca2d"
+        },
+        "white_balance": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.80187404,
+          "mean": 0.57135546,
+          "stddev": 0.34639674,
+          "p01": 0.07757885,
+          "p50": 0.52343214,
+          "p99": 1.60066689,
+          "quantized_sha256": "b8a756725669fd59d0d1e2a313b29fba5d7d1a3d5fd985fa3661a215a6b00bf8"
+        },
+        "demosaic": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.80187404,
+          "mean": 0.62695903,
+          "stddev": 0.36394775,
+          "p01": 0.0844583,
+          "p50": 0.58399794,
+          "p99": 1.69969739,
+          "quantized_sha256": "240817f82f63ad8c4ccc11b08ae107fca9d3714cd4f1cab7d649501295306c89"
+        },
+        "color_correction_matrix": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.80187404,
+          "mean": 0.62695903,
+          "stddev": 0.36394775,
+          "p01": 0.0844583,
+          "p50": 0.58399794,
+          "p99": 1.69969739,
+          "quantized_sha256": "240817f82f63ad8c4ccc11b08ae107fca9d3714cd4f1cab7d649501295306c89"
+        }
+      }
+    },
+    "GRBG": {
+      "metadata": {
+        "width": 160,
+        "height": 120,
+        "bit_depth": 12,
+        "storage": "uint16_le",
+        "bayer_pattern": "GRBG",
+        "byte_order": "little",
+        "row_stride_bytes": 0,
+        "offset_bytes": 0,
+        "black_level": [
+          64.0,
+          64.0,
+          64.0,
+          64.0
+        ],
+        "white_level": 4095.0,
+        "flip_horizontal": false,
+        "flip_vertical": false
+      },
+      "stages": {
+        "input": {
+          "domain": "bayer",
+          "encoding": "Bayer RAW DN",
+          "normalized": false,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 313.85119629,
+          "maximum": 3697.54418945,
+          "mean": 1695.54077148,
+          "stddev": 816.72900391,
+          "p01": 365.12935394,
+          "p50": 1746.29522705,
+          "p99": 3612.65111816,
+          "quantized_sha256": "4bd93662694c6e6b1f265d50fbc65907a2f4d760e4bc2a87c32c36be333e5517"
+        },
+        "black_level_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06198243,
+          "maximum": 0.90140021,
+          "mean": 0.40474838,
+          "stddev": 0.20261201,
+          "p01": 0.07470339,
+          "p50": 0.41733943,
+          "p99": 0.88034016,
+          "quantized_sha256": "149fcac968653ac70aafd78a5514e9302eb5ff4da1c036ffd9cfd67a6909d3c7"
+        },
+        "lens_shading_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06198243,
+          "maximum": 0.90140021,
+          "mean": 0.40474838,
+          "stddev": 0.20261201,
+          "p01": 0.07470339,
+          "p50": 0.41733943,
+          "p99": 0.88034016,
+          "quantized_sha256": "149fcac968653ac70aafd78a5514e9302eb5ff4da1c036ffd9cfd67a6909d3c7"
+        },
+        "white_balance": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80280042,
+          "mean": 0.5741365,
+          "stddev": 0.34704417,
+          "p01": 0.07769229,
+          "p50": 0.52583694,
+          "p99": 1.60089691,
+          "quantized_sha256": "4a89bd8983d5a6c4d0e430304bd816b800c3a53ced56ee654410d91dc6cc2aff"
+        },
+        "demosaic": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80280042,
+          "mean": 0.62645847,
+          "stddev": 0.36367223,
+          "p01": 0.08464653,
+          "p50": 0.58295771,
+          "p99": 1.69914993,
+          "quantized_sha256": "015990b42dbf780f705cf680cfb7a0fb640c1aafd1e1f7295cb2e47b95eb614e"
+        },
+        "color_correction_matrix": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80280042,
+          "mean": 0.62645847,
+          "stddev": 0.36367223,
+          "p01": 0.08464653,
+          "p50": 0.58295771,
+          "p99": 1.69914993,
+          "quantized_sha256": "015990b42dbf780f705cf680cfb7a0fb640c1aafd1e1f7295cb2e47b95eb614e"
+        }
+      }
+    },
+    "GBRG": {
+      "metadata": {
+        "width": 160,
+        "height": 120,
+        "bit_depth": 12,
+        "storage": "uint16_le",
+        "bayer_pattern": "GBRG",
+        "byte_order": "little",
+        "row_stride_bytes": 0,
+        "offset_bytes": 0,
+        "black_level": [
+          64.0,
+          64.0,
+          64.0,
+          64.0
+        ],
+        "white_level": 4095.0,
+        "flip_horizontal": false,
+        "flip_vertical": false
+      },
+      "stages": {
+        "input": {
+          "domain": "bayer",
+          "encoding": "Bayer RAW DN",
+          "normalized": false,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 313.02301025,
+          "maximum": 3698.19628906,
+          "mean": 1688.33349609,
+          "stddev": 817.78546143,
+          "p01": 359.77362701,
+          "p50": 1733.9821167,
+          "p99": 3612.42826416,
+          "quantized_sha256": "d1b65198fe947f19506cb164af6b0588deacbe4f32a255f73f9cd8e05f0048a3"
+        },
+        "black_level_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06177698,
+          "maximum": 0.90156198,
+          "mean": 0.40296045,
+          "stddev": 0.20287411,
+          "p01": 0.07337475,
+          "p50": 0.41428483,
+          "p99": 0.88028486,
+          "quantized_sha256": "1bfe4dcfe2d9f2c070e006d0538cd7c50381b2355338443230993e6645e46c39"
+        },
+        "lens_shading_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06177698,
+          "maximum": 0.90156198,
+          "mean": 0.40296045,
+          "stddev": 0.20287411,
+          "p01": 0.07337475,
+          "p50": 0.41428483,
+          "p99": 0.88028486,
+          "quantized_sha256": "1bfe4dcfe2d9f2c070e006d0538cd7c50381b2355338443230993e6645e46c39"
+        },
+        "white_balance": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80148196,
+          "mean": 0.57078624,
+          "stddev": 0.34587595,
+          "p01": 0.07769229,
+          "p50": 0.52276096,
+          "p99": 1.60116517,
+          "quantized_sha256": "46ab420a68f622a125145c06d11969cbc0a852e2939aa70655304ada0ccfe01b"
+        },
+        "demosaic": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80148196,
+          "mean": 0.62619382,
+          "stddev": 0.36342391,
+          "p01": 0.08464653,
+          "p50": 0.58303192,
+          "p99": 1.6998926,
+          "quantized_sha256": "abcdad0a96a8fb461685c1318e99fb6843da4d6145f79648b40cd60cfd0623da"
+        },
+        "color_correction_matrix": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06198243,
+          "maximum": 1.80148196,
+          "mean": 0.62619382,
+          "stddev": 0.36342391,
+          "p01": 0.08464653,
+          "p50": 0.58303192,
+          "p99": 1.6998926,
+          "quantized_sha256": "abcdad0a96a8fb461685c1318e99fb6843da4d6145f79648b40cd60cfd0623da"
+        }
+      }
+    },
+    "BGGR": {
+      "metadata": {
+        "width": 160,
+        "height": 120,
+        "bit_depth": 12,
+        "storage": "uint16_le",
+        "bayer_pattern": "BGGR",
+        "byte_order": "little",
+        "row_stride_bytes": 0,
+        "offset_bytes": 0,
+        "black_level": [
+          64.0,
+          64.0,
+          64.0,
+          64.0
+        ],
+        "white_level": 4095.0,
+        "flip_horizontal": false,
+        "flip_vertical": false
+      },
+      "stages": {
+        "input": {
+          "domain": "bayer",
+          "encoding": "Bayer RAW DN",
+          "normalized": false,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 312.57952881,
+          "maximum": 3696.85107422,
+          "mean": 1694.35498047,
+          "stddev": 816.13580322,
+          "p01": 364.99911346,
+          "p50": 1741.58679199,
+          "p99": 3612.42826416,
+          "quantized_sha256": "b32f959edbb95f972ad00b93d8b1613dad06e79fbd4a8b8906512895b4562438"
+        },
+        "black_level_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 0.90122825,
+          "mean": 0.4044542,
+          "stddev": 0.20246483,
+          "p01": 0.07467107,
+          "p50": 0.41617137,
+          "p99": 0.88028486,
+          "quantized_sha256": "d26e348afe41473a74387082ec6f836dd85c81cb47793dc4b0dc81ac39f5c8bc"
+        },
+        "lens_shading_correction": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 0.90122825,
+          "mean": 0.4044542,
+          "stddev": 0.20246483,
+          "p01": 0.07467107,
+          "p50": 0.41617137,
+          "p99": 0.88028486,
+          "quantized_sha256": "d26e348afe41473a74387082ec6f836dd85c81cb47793dc4b0dc81ac39f5c8bc"
+        },
+        "white_balance": {
+          "domain": "bayer",
+          "encoding": "Bayer Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.8024565,
+          "mean": 0.57358104,
+          "stddev": 0.34654257,
+          "p01": 0.07757885,
+          "p50": 0.52541491,
+          "p99": 1.60118002,
+          "quantized_sha256": "2bbe7b0355df5c18eee628eeee14e25450019422350f4c5cfd5b87955d3084c9"
+        },
+        "demosaic": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.8024565,
+          "mean": 0.62572396,
+          "stddev": 0.36315364,
+          "p01": 0.0844583,
+          "p50": 0.58204639,
+          "p99": 1.69964579,
+          "quantized_sha256": "0fb88157ce3e3bd010dbc737dc27f40947a00a95e311fae1dd6079ac9536debd"
+        },
+        "color_correction_matrix": {
+          "domain": "rgb",
+          "encoding": "RGB Linear Normalized",
+          "normalized": true,
+          "shape": [
+            120,
+            160,
+            3
+          ],
+          "minimum": 0.06166696,
+          "maximum": 1.8024565,
+          "mean": 0.62572396,
+          "stddev": 0.36315364,
+          "p01": 0.0844583,
+          "p50": 0.58204639,
+          "p99": 1.69964579,
+          "quantized_sha256": "0fb88157ce3e3bd010dbc737dc27f40947a00a95e311fae1dd6079ac9536debd"
+        }
+      }
+    }
+  }
+}

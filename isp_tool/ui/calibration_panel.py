@@ -863,6 +863,9 @@ class InlineCalibrationWorkspace(ttk.Frame):
         self.notes_var.set(session.notes)
         self.auto_panel.refresh_session()
 
+    def refresh_language(self) -> None:
+        self.auto_panel.refresh_language()
+
     def get_ui_state(self) -> dict:
         return self.auto_panel.get_ui_state()
 

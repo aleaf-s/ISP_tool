@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import json
 from pathlib import Path
+import platform
 import statistics
 import sys
 import time
@@ -59,6 +61,11 @@ def main():
         choices=("auto", "opencv", "native"),
         default="auto",
         help="requested processing backend; native falls back when unavailable",
+    )
+    parser.add_argument(
+        "--json-out",
+        type=Path,
+        help="write a machine-readable performance baseline",
     )
     args = parser.parse_args()
     if args.width < 32 or args.height < 32 or args.iterations < 1:
@@ -121,10 +128,16 @@ def main():
         )
         cached_wall.append(measured)
 
+    module_medians = {
+        name: median(values)
+        for name, values in cold_modules.items()
+    }
+    cold_median = median(cold_wall)
+    cached_median = median(cached_wall)
     print(
         f"ISP benchmark · {args.width}x{args.height} · "
         f"{args.iterations} iterations · "
-        f"{'fast' if args.fast_demosaic else 'exact'} demosaic · "
+        f"{args.demosaic} demosaic · "
         f"{pipeline.backend.name}"
     )
     if pipeline.backend_selection.fallback_reason:
@@ -132,8 +145,8 @@ def main():
             "backend fallback          "
             f"{pipeline.backend_selection.fallback_reason}"
         )
-    print(f"cold pipeline median     {median(cold_wall):8.2f} ms")
-    print(f"cached CCM edit median   {median(cached_wall):8.2f} ms")
+    print(f"cold pipeline median     {cold_median:8.2f} ms")
+    print(f"cached CCM edit median   {cached_median:8.2f} ms")
     print("")
     print("cold module medians")
     for name, values in sorted(
@@ -142,6 +155,31 @@ def main():
         reverse=True,
     ):
         print(f"  {name:<32} {median(values):8.2f} ms")
+    if args.json_out is not None:
+        payload = {
+            "schema_version": 1,
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "width": args.width,
+            "height": args.height,
+            "iterations": args.iterations,
+            "demosaic": args.demosaic,
+            "backend_preference": backend_preferences[args.backend],
+            "backend_active": pipeline.backend.name,
+            "backend_cache_key": pipeline.backend_cache_key,
+            "fallback_reason": (
+                pipeline.backend_selection.fallback_reason or ""
+            ),
+            "cold_pipeline_median_ms": cold_median,
+            "cached_ccm_edit_median_ms": cached_median,
+            "cold_module_medians_ms": module_medians,
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"\nJSON baseline written: {args.json_out}")
 
 
 if __name__ == "__main__":

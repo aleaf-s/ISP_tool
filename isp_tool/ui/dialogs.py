@@ -21,9 +21,18 @@ class RawMetadataDialog(tk.Toplevel):
         "mipi_raw10", "mipi_raw12", "mipi_raw14",
     )
 
-    def __init__(self, parent, metadata: RawMetadata, title: str = "裸 RAW 元数据"):
+    def __init__(
+        self, parent, metadata: RawMetadata,
+        title: str = "裸 RAW 元数据", tr=None,
+    ):
         super().__init__(parent)
-        self.title(title)
+        self.tr = tr or (lambda key, **_values: {
+            "dialog.raw_metadata": title,
+            "dialog.cancel": "取消",
+            "dialog.ok": "确定",
+            "dialog.parameter_error": "参数错误",
+        }.get(key, key))
+        self.title(self.tr("dialog.raw_metadata"))
         self.transient(parent)
         self.resizable(False, False)
         self.result: Optional[RawMetadata] = None
@@ -104,8 +113,12 @@ class RawMetadataDialog(tk.Toplevel):
         note.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(8, 12))
         buttons = ttk.Frame(body)
         buttons.grid(row=row + 2, column=0, columnspan=2, sticky="e")
-        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text="确定", command=self._accept).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            buttons, text=self.tr("dialog.cancel"), command=self.destroy
+        ).pack(side="right")
+        ttk.Button(
+            buttons, text=self.tr("dialog.ok"), command=self._accept
+        ).pack(side="right", padx=(0, 8))
 
     def _accept(self) -> None:
         try:
@@ -129,14 +142,19 @@ class RawMetadataDialog(tk.Toplevel):
             )
             metadata.validate()
         except Exception as exc:
-            messagebox.showerror("参数错误", str(exc), parent=self)
+            messagebox.showerror(
+                self.tr("dialog.parameter_error"), str(exc), parent=self
+            )
             return
         self.result = metadata
         self.destroy()
 
 
-def ask_raw_metadata(parent, metadata: RawMetadata, title: str = "裸 RAW 元数据") -> Optional[RawMetadata]:
-    dialog = RawMetadataDialog(parent, metadata, title)
+def ask_raw_metadata(
+    parent, metadata: RawMetadata, title: str = "裸 RAW 元数据",
+    tr=None,
+) -> Optional[RawMetadata]:
+    dialog = RawMetadataDialog(parent, metadata, title, tr=tr)
     parent.wait_window(dialog)
     return dialog.result
 
@@ -149,14 +167,23 @@ class YUVMetadataDialog(tk.Toplevel):
         "4K P010 · BT.2020 Limited": (3840, 2160, "P010", 10, "BT.2020", "Limited"),
     }
 
-    def __init__(self, parent, path, metadata: Optional[YUVMetadata] = None):
+    def __init__(
+        self, parent, path, metadata: Optional[YUVMetadata] = None,
+        tr=None,
+    ):
         super().__init__(parent)
+        self.tr = tr or (lambda key, **_values: {
+            "dialog.yuv_metadata": "YUV 元数据",
+            "dialog.cancel": "取消",
+            "dialog.import": "导入",
+            "dialog.parameter_error": "参数错误",
+        }.get(key, key))
         self.path = Path(path)
         self.result: Optional[YUVMetadata] = None
         inference = infer_yuv_filename(path, metadata)
         inferred = inference.metadata
         self.filename_inference_summary = inference.summary
-        self.title("裸 YUV 元数据")
+        self.title(self.tr("dialog.yuv_metadata"))
         self.transient(parent)
         self.resizable(False, False)
         self.vars = {
@@ -237,10 +264,12 @@ class YUVMetadataDialog(tk.Toplevel):
         ).grid(row=info_row, column=0, columnspan=2, sticky="w", pady=(8, 10))
         actions = ttk.Frame(body)
         actions.grid(row=info_row + 1, column=0, columnspan=2, sticky="e")
-        ttk.Button(actions, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(
+            actions, text=self.tr("dialog.cancel"), command=self.destroy
+        ).pack(side="right")
         self.accept_button = ttk.Button(
             actions,
-            text="导入",
+            text=self.tr("dialog.import"),
             style="Primary.TButton",
             command=self._accept,
         )
@@ -303,7 +332,10 @@ class YUVMetadataDialog(tk.Toplevel):
             metadata = self._metadata()
             validate_yuv_file(self.path, metadata)
         except Exception as exc:
-            messagebox.showerror("YUV 参数错误", str(exc), parent=self)
+            messagebox.showerror(
+                "YUV " + self.tr("dialog.parameter_error"),
+                str(exc), parent=self,
+            )
             return
         self.result = metadata
         self.destroy()
@@ -313,7 +345,8 @@ def ask_yuv_metadata(
     parent,
     path,
     metadata: Optional[YUVMetadata] = None,
+    tr=None,
 ) -> Optional[YUVMetadata]:
-    dialog = YUVMetadataDialog(parent, path, metadata)
+    dialog = YUVMetadataDialog(parent, path, metadata, tr=tr)
     parent.wait_window(dialog)
     return dialog.result

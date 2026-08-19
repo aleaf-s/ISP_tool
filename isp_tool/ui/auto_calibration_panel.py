@@ -135,9 +135,10 @@ class AutoCalibrationPanel(ttk.Frame):
         )
         self.module_list.bind("<<ListboxSelect>>", self._navigation_changed)
         self.module_list.selection_set(0)
-        ttk.Label(
+        self.settings_label = ttk.Label(
             middle, text="矫正设置", style="Title.TLabel"
-        ).pack(anchor="w", pady=(0, 4))
+        )
+        self.settings_label.pack(anchor="w", pady=(0, 4))
         self.source_var = tk.StringVar(value="Stage: — · Domain: — · ROI: Full")
         ttk.Label(
             middle, textvariable=self.source_var, style="Muted.TLabel",
@@ -220,24 +221,27 @@ class AutoCalibrationPanel(ttk.Frame):
         self.awb_region_frame = ttk.LabelFrame(
             basic, text="AWB 分析区域", padding=(8, 5)
         )
+        self.awb_region_buttons = []
         for text, value in (
-            ("全图：自动寻找中性区域", "Full Image"),
-            ("当前 ROI：使用框选的中性灰/白区域", "Current ROI"),
+            ("Full Image", "Full Image"),
+            ("Current ROI", "Current ROI"),
         ):
-            ttk.Radiobutton(
+            button = ttk.Radiobutton(
                 self.awb_region_frame,
                 text=text,
                 variable=self.awb_region_var,
                 value=value,
                 command=self._awb_region_changed,
-            ).pack(anchor="w", pady=1)
+            )
+            button.pack(anchor="w", pady=1)
+            self.awb_region_buttons.append(button)
         self.awb_roi_status_var = tk.StringVar()
-        ttk.Label(
+        self.awb_roi_status_label = ttk.Label(
             self.awb_region_frame,
             textvariable=self.awb_roi_status_var,
             style="Muted.TLabel",
             wraplength=340,
-        ).pack(fill="x", pady=(4, 0))
+        )
         self.awb_region_frame.pack(fill="x", pady=(2, 0))
 
         self.data_section = CollapsibleSection(
@@ -311,6 +315,27 @@ class AutoCalibrationPanel(ttk.Frame):
                 router.register(widget, widget)
         self._module_changed()
         self._refresh_navigation()
+        self._update_action_states()
+        self.refresh_language()
+
+    def tr(self, key: str, **values) -> str:
+        return self.app.tr(key, **values)
+
+    def refresh_language(self) -> None:
+        """Refresh compact calibration labels without rebuilding controls."""
+        self.settings_label.configure(text=self.tr("awb.settings"))
+        self.basic_section.title = self.tr("cal.method_region")
+        self.basic_section._sync()
+        if self.module_var.get() == "AWB":
+            self.method_label.configure(text=self.tr("awb.method"))
+            self.awb_region_frame.configure(text=self.tr("awb.region"))
+        if len(self.awb_region_buttons) == 2:
+            self.awb_region_buttons[0].configure(
+                text=self.tr("awb.full_image")
+            )
+            self.awb_region_buttons[1].configure(
+                text=self.tr("awb.current_roi")
+            )
         self._update_action_states()
 
     def _build_ccm_result_panel(self, parent) -> None:
@@ -749,14 +774,12 @@ class AutoCalibrationPanel(ttk.Frame):
             self.use_roi_var.set(
                 self.awb_region_var.get() == "Current ROI"
             )
-            self.method_label.configure(text="AWB 方法")
+            self.method_label.configure(text=self.tr("awb.method"))
             self.use_roi_check.pack_forget()
-            self.method_help_label.pack(
-                fill="x", pady=(0, 5), after=self.method_combo
-            )
+            self.method_help_label.pack_forget()
             self.awb_region_frame.pack(
                 fill="x", pady=(2, 0),
-                after=self.method_help_label,
+                after=self.method_combo,
             )
             self.data_section.pack_forget()
             self._refresh_awb_quick_options()
@@ -800,33 +823,10 @@ class AutoCalibrationPanel(ttk.Frame):
         self._options_changed()
 
     def _refresh_awb_quick_options(self) -> None:
-        descriptions = {
-            "Robust Neutral": "稳健中性区域（推荐）：自动排除彩色物体、纹理和过曝像素。",
-            "ROI Neutral": "ROI 中性区域：假定框选内容本身应为中性灰或白，适合灰卡。",
-            "Gray World": "灰度世界：假定整幅场景的平均颜色接近中性。",
-            "Shades of Gray": "Shades of Gray：比灰度世界更强调较亮像素。",
-            "White Patch": "白点法：根据未过曝的高亮像素估算照明颜色。",
-        }
-        self.method_help_var.set(
-            descriptions.get(self.method_var.get(), "")
-        )
-        roi = getattr(self.app, "roi", None)
-        if self.awb_region_var.get() == "Full Image":
-            self.awb_roi_status_var.set(
-                "当前使用完整 LSC 输出；算法会排除暗部、过曝和高纹理样本。"
-                "去马赛克前的 RAW 马赛克整体偏绿属于正常 CFA 排列，"
-                "请以 Demosaic 输出判断最终白平衡。"
-            )
-        elif roi is None:
-            self.awb_roi_status_var.set(
-                "尚未框选 ROI。请回到主预览框选中性灰/白区域。"
-            )
-        else:
-            self.awb_roi_status_var.set(
-                f"当前 ROI：x={roi.x}, y={roi.y}, "
-                f"{roi.width}×{roi.height}。RAW 马赛克偏绿是正常的，"
-                "请以 Demosaic 输出判断最终白平衡。"
-            )
+        # Keep the AWB inspector task-oriented. Algorithm theory and Bayer
+        # explanations no longer occupy permanent space in the right panel.
+        self.method_help_var.set("")
+        self.awb_roi_status_var.set("")
 
     def _options_changed(self) -> None:
         if self.method_var.get():
@@ -949,11 +949,11 @@ class AutoCalibrationPanel(ttk.Frame):
         state = machine.state
         self.analyze_button.configure(
             text=(
-                "正在矫正…"
+                self.tr("awb.correcting")
                 if state == CalibrationUIState.RUNNING
-                else "重新矫正并应用"
+                else self.tr("awb.recorrect_apply")
                 if state == CalibrationUIState.APPLIED
-                else "矫正并应用"
+                else self.tr("awb.correct_apply")
             ),
             command=self.correct_and_apply_current,
             style="Primary.TButton",
@@ -965,14 +965,14 @@ class AutoCalibrationPanel(ttk.Frame):
         )
         self.state_var.set(
             {
-                CalibrationUIState.NOT_ANALYZED: "待矫正",
-                CalibrationUIState.RUNNING: "处理中",
-                CalibrationUIState.SUGGESTED: "已计算",
-                CalibrationUIState.PREVIEWING: "应用中",
-                CalibrationUIState.APPLIED: "已应用",
-                CalibrationUIState.STALE: "需重新矫正",
-                CalibrationUIState.FAILED: "失败",
-                CalibrationUIState.CANCELLED: "已取消",
+                CalibrationUIState.NOT_ANALYZED: self.tr("awb.state.not_analyzed"),
+                CalibrationUIState.RUNNING: self.tr("awb.state.running"),
+                CalibrationUIState.SUGGESTED: self.tr("awb.state.suggested"),
+                CalibrationUIState.PREVIEWING: self.tr("awb.state.previewing"),
+                CalibrationUIState.APPLIED: self.tr("awb.state.applied"),
+                CalibrationUIState.STALE: self.tr("awb.state.stale"),
+                CalibrationUIState.FAILED: self.tr("awb.state.failed"),
+                CalibrationUIState.CANCELLED: self.tr("awb.state.cancelled"),
             }[state]
         )
 
@@ -1403,10 +1403,10 @@ class AutoCalibrationPanel(ttk.Frame):
             self.use_roi_var.set(use_roi)
             if use_roi and self.app.roi is None:
                 self.message.show(
-                    "请先在主预览框选中性灰或白色 ROI，再点击“矫正并应用”。",
+                    self.tr("awb.roi_required"),
                     "warning",
                 )
-                self.toast.show("AWB ROI 尚未框选", "warning")
+                self.toast.show(self.tr("awb.roi_missing"), "warning")
                 return
         machine = self.states[module_name]
         if machine.state == CalibrationUIState.RUNNING:
@@ -1451,6 +1451,7 @@ class AutoCalibrationPanel(ttk.Frame):
                 np.asarray(override_image, np.float32).copy()
                 if override_image is not None else stage.image.copy()
             )
+            options.setdefault("data_state", stage.data_state)
             metadata = copy.deepcopy(self.app.loaded.metadata)
             roi = (
                 None if force_full
@@ -1547,7 +1548,7 @@ class AutoCalibrationPanel(ttk.Frame):
             )
             if use_roi and self.app.roi is None:
                 raise ISPError(
-                    "当前 AWB 模式需要 ROI。请先在主预览框选中性灰或白色区域。"
+                    self.tr("awb.roi_required")
                 )
             self.use_roi_var.set(use_roi)
             source = (
@@ -1704,11 +1705,12 @@ class AutoCalibrationPanel(ttk.Frame):
             if module_name == "AWB":
                 gains = result.suggested_parameters
                 region = (
-                    "当前 ROI"
-                    if result.roi is not None else "全图"
+                    self.tr("awb.current_roi")
+                    if result.roi is not None
+                    else self.tr("awb.full_image")
                 )
                 summary = (
-                    f"AWB 已矫正并应用 · {region} · "
+                    self.tr("awb.applied", region=region) + " · "
                     f"R {gains.get('r_gain', 1.0):.3f} / "
                     f"Gr {gains.get('gr_gain', 1.0):.3f} / "
                     f"Gb {gains.get('gb_gain', 1.0):.3f} / "

@@ -1,7 +1,98 @@
-# ISP RAW Visual Simulator V0.4.23
+# ISP RAW Visual Simulator V0.4.33
 
-桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.23 同时提供相互隔离的
+桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.33 同时提供相互隔离的
 RAW ISP 流程 `BLC → LSC → WB → Demosaic → CCM` 与裸 YUV 预览流程。
+
+## V0.4.33 预览结果应用决策抽离
+
+- 新增 UI 无关的 `PreviewResultApplicationController`，统一产生 `wait/stale/cancelled/apply` Future 决策。
+- 过期 Generation 在读取 Payload 前直接丢弃；当前 Future 正常取消时不再弹出“ISP 处理失败”。
+- RAW Payload 必须包含非空 StageResult 序列；YUV Payload 必须包含 Frame、Conversion、Results 和 Metrics。
+- YUV 新计算结果与缓存命中结果明确区分，只有新结果携带缓存写入授权。
+- 标准化 Payload 的 Metrics 使用独立副本，后台结果应用与性能统计边界更加清晰。
+- Tk 轮询、状态赋值、错误弹窗和界面刷新仍保留在主窗口，不让控制器依赖 UI。
+
+## V0.4.32 工作图状态编排抽离
+
+- 新增 UI 无关的 `WorkspaceItemStateController`，统一封装工作图可编辑状态的捕获、保存和激活。
+- Pipeline Snapshot、Calibration Session、ROI/分块、手动参数基线、Dirty Module、预览尺寸与 Input Revision 使用一致的复制边界。
+- 可编辑字典和配置深拷贝，避免切换图片后互相污染；大型 `LoadedImage` 保持身份引用，不重复复制像素。
+- 保存编辑状态时明确保留 `RuntimePreviewState`，避免普通参数同步意外清除可复用预览缓存。
+- 非法 Active ROI Index 在状态边界归一化为未选中，Grid 行列和 Revision 同时执行基础约束。
+- 主窗口继续负责控件刷新、缓存恢复与任务提交，状态控制器不依赖 Tk 或 ISP 算法。
+
+## V0.4.31 多图预览缓存策略抽离
+
+- 新增无 UI 依赖的 `WorkspacePreviewCachePolicy`，统一负责缓存有效性、访问时钟、LRU 顺序、数量与内存预算。
+- 保持默认最多3张预览、总计384 MiB；当前正在使用的 protected entry 不会因单张图超过预算而被错误清空。
+- 缓存查询明确返回 `hit`、`miss` 或 `invalid`，主窗口据此更新性能计数，不再重复推断失效原因。
+- 数量与内存同时超限时持续淘汰最久未使用的非当前图；访问时间相同时按工作区顺序确定性淘汰。
+- 切换计算后端和手动清缓存统一经过策略层释放 Runtime Preview；YUV 帧级请求缓存仍保持独立。
+- 保留原有缓存上限属性与性能面板文本，多图切换、参数失效和快速恢复的用户行为不变。
+
+## V0.4.30 统一画布手势协调
+
+- 新增无 Tk 依赖的 `CanvasGestureCoordinator`，统一维护主画布的待执行工具、活动拖动、起点和当前位置。
+- 固定手势优先级为 `Gray Picker → Compare Divider → Armed Measurement → ROI → Compare Body`，不再依赖散落的 if 顺序。
+- Compare 分割线拖动结束后保留尚未使用的 Line Profile 待绘制状态；Line Profile 成功绘制后自动退出，保持一次性工具语义。
+- ROI 的新建、移动和缩放由同一个活动手势标识管理，释放、失败、切图和退出时均统一清理。
+- 原有 `gray_pick_mode`、`compare_dragging`、`line_profile_mode` 和 `line_profile_dragging` 保留为兼容属性，不破坏现有窗口与测试。
+- 手势协调器只改变交互状态，不提交 ISP 请求，也不修改 RAW/YUV 数值、模块参数或算法输出。
+
+## V0.4.29 Line Profile 剖面分析
+
+- `预览` 与 `更多分析` 下拉菜单新增单例、非模态 `Line Profile`，不增加主工具栏常驻按钮。
+- 点击“绘制线段”后在主预览拖动，窗口按沿线距离显示当前模块 Output 的绝对码值曲线，并可用虚线叠加模块 Input。
+- Bayer 按真实源坐标拆分 R/Gr/Gb/B CFA 曲线；RGB 保留负值和超位深计算值；YUV 使用原生 Y/U/V Code。
+- 图表通道随数据域自动精简，支持通道开关和鼠标悬停读数；超长线段绘图自动抽稀，但采样数据保持完整。
+- Line Profile 使用独占的一次性测量手势：进入时退出 ROI 绘制，Compare 分割线仍拥有最高拖动优先级。
+- 参数、阶段或模块状态变化后自动重新采样；缩放、平移、绘线及图表刷新均不提交 ISP 处理请求。
+- 切换工作图像或关闭窗口会清除旧测量线，避免跨图像坐标误用。
+
+## V0.4.28 Pixel Inspector 与统一采样
+
+- `预览` 和 `更多分析` 下拉菜单新增单例、非模态 `Pixel Inspector`，不占用主工具栏常驻空间。
+- Inspector 默认以约30 FPS 跟随主预览鼠标，支持暂停跟随、5×5/7×7邻域和最多16个固定测量点。
+- Bayer 显示每个邻域像素的 R/Gr/Gb/B 相位与绝对码值，并按四个 CFA 通道分别统计 Min/Mean/Median/Max/Std。
+- RGB 保留负值和超位深的计算码值，显示码值单独裁剪；YUV 直接读取原始 Y/U/V Code，并附带转换前后 RGB 码值。
+- 坐标服务统一处理 Canvas→Preview、YUV 缩小预览→原帧及 Process ROI 偏移；固定点在参数或阶段变化后自动重新采样。
+- 底部鼠标状态栏复用相同采样服务，不再维护另一套 RAW/RGB/YUV 数值解释逻辑。
+- 打开、悬停、缩放、切换 Inspector 邻域均不执行 ISP；切换工作图像时清除固定点，避免跨图误读。
+
+## V0.4.27 最新预览任务生命周期
+
+- 新增无 RAW/YUV/UI 算法依赖的 `PreviewRequestCoordinator`，集中管理90 ms 参数节流、立即刷新、Generation、协作取消、Future 绑定和15 ms 轮询。
+- 快速连续调参只保留最后一个待提交请求；新任务开始时通知旧任务停止，并尝试取消仍在队列中的 Future。
+- 轮询发现 Generation 已过期时立即停止继续轮询，不再等待旧任务完成后才丢弃结果。
+- 应用关闭时由控制器统一取消延迟提交、轮询回调和活动任务，减少关闭后 Tk 回调访问已销毁窗口的机会。
+- `ISPApplication` 保留 `generation`、`pending_after`、`current_future` 等兼容属性，历史窗口和测试无需同时迁移。
+- 新增纯调度器测试，覆盖请求合并、取消、过期结果、轮询注销与关闭清理；ISP/YUV 算法输出没有变化。
+
+## V0.4.26 工程基线与第一批控制器拆分
+
+- 新增四种 Bayer Pattern 的确定性 Golden Output，覆盖 RAW Input、BLC、LSC、WB、Demosaic 和 CCM 各阶段；算法变化可通过 `python tools/pipeline_baseline.py` 验证。
+- 性能基准工具修复 Demosaic 名称输出错误，并支持 `--json-out` 保存本机冷流水线、CCM 增量刷新和模块耗时基线。
+- 从大型 `app.py` 抽离无 Tk 依赖的 `YUVPreviewController`，统一负责 YUV 缓存键、读取、转换和阶段结果构造。
+- 新增 `LanguageController`，集中管理语言状态、配置恢复与全局偏好持久化；主窗口只负责刷新控件文字。
+- 新增 Controller 隔离、YUV 阶段、取消请求和 Golden Output 回归测试；本版本不改变界面布局和算法参数。
+
+## V0.4.25 简洁 AWB 与中英文切换
+
+- AWB 右侧面板移除方法原理、RAW Bayer 偏绿解释和 ROI 长说明，只保留 `AWB Method`、`Region`、校正操作、简短状态和必要错误。
+- 顶部菜单新增 `语言 / Language`，支持简体中文和 English 运行时切换，不重建图像工作状态，也不重新执行 ISP。
+- 语言偏好保存到独立 UI preferences，同时写入 ISP 配置的 `ui_state.language`；下次启动或加载配置后恢复。
+- 主菜单、常用工具栏、模块检查器、AWB 自动页、状态栏和 Histogram 窗口已接入集中式翻译资源。
+- RAW、YUV、BLC、LSC、AWB、Demosaic、CCM、ROI、Histogram、Gain 与 Pixel Format 等专业术语保持英文。
+- 新增翻译回退、动态占位符、偏好持久化、AWB 精简、语言同步及切换时工作状态不变的回归测试。
+
+## V0.4.24 流水线旁路稳定性与参数交互
+
+- 每个 `StageResult` 明确携带颜色域、数值编码、标称范围、位深、Black/White Level、BLC 与归一化状态，不再靠像素最大值判断主流水线数值域。
+- 关闭 BLC、LSC、WB、Demosaic 或 CCM 时严格旁路：不修改像素，不丢失数值域，后续模块按当前 DN/线性尺度安全执行或明确跳过。
+- Demosaic 保留输入数值尺度；CCM Offset 在 DN 数据上按 White Level 换算；预览、Histogram 和像素读数分别使用显示映射与真实绝对值。
+- 数值参数统一使用 `ParameterControl`：加大手柄与点击区，支持精确输入、step 对齐、方向键/修饰键微调、双击或按钮复位，并以约 40 FPS 节流拖动预览。
+- 深色主题统一增强 Combobox 输入区、焦点边框、下拉列表与高对比度箭头，并适配 Windows 高 DPI。
+- 新增 32 种五模块 Enable/Disable 组合、DN 预览/直方图、CCM Offset、AWB 数值域契约、参数控件与主题样式回归测试。
 
 ## V0.4.23 独立 Histogram 窗口
 

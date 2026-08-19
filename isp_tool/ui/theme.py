@@ -206,6 +206,10 @@ def configure_theme(
     )
     style.map("TButton", background=[("active", "#2C3745"), ("disabled", c["panel"])])
     style.configure(
+        "Compact.TButton",
+        padding=(round(5 * scale), round(3 * scale)),
+    )
+    style.configure(
         "Primary.TButton", background=c["accent_dark"], foreground="white",
     )
     style.map("Primary.TButton", background=[("active", c["accent"])])
@@ -222,13 +226,83 @@ def configure_theme(
         "TEntry", fieldbackground=c["panel_alt"], foreground=c["foreground"],
         insertcolor=c["foreground"],
     )
-    style.configure("TCombobox", fieldbackground=c["panel_alt"], foreground=c["foreground"])
+    combo_arrow = "#3A4859"
+    style.configure(
+        "TCombobox",
+        fieldbackground=c["panel_alt"],
+        background=combo_arrow,
+        foreground=c["foreground"],
+        arrowcolor=c["foreground"],
+        bordercolor=c["border"],
+        lightcolor=c["border"],
+        darkcolor=c["border"],
+        arrowsize=round(16 * scale),
+        padding=(round(7 * scale), round(5 * scale)),
+    )
     style.map(
         "TCombobox",
-        fieldbackground=[("readonly", c["panel_alt"])],
-        foreground=[("readonly", c["foreground"])],
+        fieldbackground=[
+            ("readonly", c["panel_alt"]),
+            ("focus", c["panel_alt"]),
+            ("disabled", c["panel"]),
+        ],
+        background=[
+            ("pressed", c["accent_dark"]),
+            ("active", "#4A5D72"),
+            ("disabled", c["border"]),
+            ("readonly", combo_arrow),
+        ],
+        arrowcolor=[
+            ("disabled", c["muted"]),
+            ("pressed", "white"),
+            ("active", "white"),
+            ("readonly", c["foreground"]),
+        ],
+        bordercolor=[
+            ("focus", c["accent"]),
+            ("active", "#526379"),
+            ("readonly", c["border"]),
+        ],
+        foreground=[
+            ("disabled", c["muted"]),
+            ("readonly", c["foreground"]),
+        ],
     )
-    style.configure("Horizontal.TScale", background=c["panel"], troughcolor=c["border"])
+    root.option_add("*TCombobox*Listbox.background", c["panel_alt"])
+    root.option_add("*TCombobox*Listbox.foreground", c["foreground"])
+    root.option_add("*TCombobox*Listbox.selectBackground", c["selection"])
+    root.option_add("*TCombobox*Listbox.selectForeground", "white")
+    root.option_add("*TCombobox*Listbox.font", FONTS["body"])
+    style.configure(
+        "Horizontal.TScale",
+        background=c["panel"], troughcolor=c["border"],
+    )
+    style.configure(
+        "Parameter.Horizontal.TScale",
+        background=c["panel"],
+        troughcolor="#354252",
+        bordercolor=c["border"],
+        lightcolor=c["accent"],
+        darkcolor=c["accent_dark"],
+        sliderlength=round(18 * scale),
+        borderwidth=1,
+    )
+    style.map(
+        "Parameter.Horizontal.TScale",
+        background=[("active", c["accent"]), ("focus", c["accent_dark"])],
+        troughcolor=[("focus", "#405166")],
+    )
+    style.configure(
+        "Parameter.TEntry",
+        fieldbackground=c["panel_alt"],
+        foreground=c["foreground"],
+        bordercolor=c["border"],
+        padding=(round(5 * scale), round(4 * scale)),
+    )
+    style.map(
+        "Parameter.TEntry",
+        bordercolor=[("focus", c["accent"])],
+    )
     style.configure("TNotebook", background=c["background"], borderwidth=0)
     style.configure(
         "TNotebook.Tab", background=c["panel_alt"], foreground=c["muted"],

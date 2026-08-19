@@ -5,7 +5,13 @@ from typing import Optional
 import numpy as np
 
 from ..bayer import split_planes
-from ..models import AEResult, ISPError, ImageROI, RawMetadata
+from ..models import (
+    AEResult,
+    ISPError,
+    ImageROI,
+    RawMetadata,
+    StageDataState,
+)
 
 
 def _luminance(
@@ -13,6 +19,7 @@ def _luminance(
     domain: str,
     metadata: RawMetadata,
     roi: Optional[ImageROI],
+    data_state: Optional[StageDataState] = None,
 ) -> np.ndarray:
     src = np.asarray(image, dtype=np.float32)
     if roi is not None:
@@ -22,7 +29,12 @@ def _luminance(
         ys, xs = roi.slices()
         src = src[ys, xs]
     if domain == "bayer":
-        if src.max(initial=0.0) > 2.0:
+        is_dn = (
+            not data_state.normalized
+            if data_state is not None
+            else src.max(initial=0.0) > 2.0
+        )
+        if is_dn:
             black = float(np.mean(metadata.black_level))
             src = (src - black) / max(metadata.white_level - black, 1.0)
         planes = split_planes(src, metadata.bayer_pattern)
@@ -43,8 +55,11 @@ def estimate_exposure(
     maximum_gain: float = 8.0,
     maximum_allowed_clipping: float = 0.01,
     roi: Optional[ImageROI] = None,
+    data_state: Optional[StageDataState] = None,
 ) -> AEResult:
-    values = np.asarray(_luminance(image, domain, metadata, roi), np.float32)
+    values = np.asarray(
+        _luminance(image, domain, metadata, roi, data_state), np.float32
+    )
     values = values[np.isfinite(values)]
     if values.size < 16:
         raise ISPError("AE 有效亮度样本不足")

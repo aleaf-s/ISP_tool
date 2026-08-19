@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from .bayer import channel_positions
-from .models import RawMetadata
+from .models import RawMetadata, StageDataState
 
 try:
     import tifffile
@@ -164,6 +164,7 @@ def display_rgb(
     domain: str,
     metadata: RawMetadata,
     bayer_normalized: Optional[bool] = None,
+    data_state: Optional[StageDataState] = None,
 ) -> np.ndarray:
     """Return normalized RGB without a display transfer function.
 
@@ -172,13 +173,21 @@ def display_rgb(
     calibration samples never depend on how bright the monitor preview looks.
     """
     src = np.asarray(image, dtype=np.float32)
+    if data_state is not None:
+        bayer_normalized = bool(data_state.normalized)
     if domain == "bayer":
         return bayer_mosaic_rgb(
             src, metadata, bayer_normalized
         )
     if src.ndim == 2:
-        return np.repeat(np.clip(src, 0, 1)[..., None], 3, axis=2)
-    return np.clip(src[:, :, :3], 0.0, 1.0)
+        values = src
+        if data_state is not None and not data_state.normalized:
+            values = values / data_state.display_divisor
+        return np.repeat(np.clip(values, 0, 1)[..., None], 3, axis=2)
+    values = src[:, :, :3]
+    if data_state is not None and not data_state.normalized:
+        values = values / data_state.display_divisor
+    return np.clip(values, 0.0, 1.0)
 
 
 def encode_display_rgb(
@@ -255,8 +264,16 @@ def artifact_to_rgb(name: str, artifact: np.ndarray) -> np.ndarray:
     return np.repeat(np.clip(scalar, 0, 1)[:, :, None], 3, axis=2)
 
 
-def export_image(path: str, image: np.ndarray, domain: str, metadata: RawMetadata) -> None:
-    rgb = display_rgb(image, domain, metadata)
+def export_image(
+    path: str,
+    image: np.ndarray,
+    domain: str,
+    metadata: RawMetadata,
+    data_state: Optional[StageDataState] = None,
+) -> None:
+    rgb = display_rgb(
+        image, domain, metadata, data_state=data_state
+    )
     suffix = Path(path).suffix.lower()
     if suffix in {".tif", ".tiff"} and tifffile is not None:
         tifffile.imwrite(path, np.round(rgb * 65535.0).astype(np.uint16), photometric="rgb")

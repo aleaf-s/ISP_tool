@@ -4,7 +4,7 @@ from typing import Dict, Mapping, Optional
 
 import numpy as np
 
-from ..models import RawMetadata
+from ..models import RawMetadata, StageDataState
 from ..preview import bayer_cell_rgb, display_rgb
 
 
@@ -103,11 +103,14 @@ def compute_histogram_details(
     mode: str = "RGB Overlay",
     bins: int = 256,
     bayer_normalized: bool = False,
+    data_state: Optional[StageDataState] = None,
 ) -> Dict[str, object]:
     """Compute domain-aware histograms using the image bit-depth code scale."""
 
     code_max = (1 << max(1, min(int(metadata.bit_depth), 30))) - 1
     values = np.asarray(image, dtype=np.float32)
+    if data_state is not None:
+        bayer_normalized = bool(data_state.normalized)
     if domain == "bayer":
         from ..bayer import channel_positions
 
@@ -134,7 +137,11 @@ def compute_histogram_details(
         if values.ndim == 3 and domain in {"rgb", "yuv_rgb"}
         else display_rgb(values, domain, metadata)
     )
-    rgb_codes = np.asarray(rgb, dtype=np.float32) * float(code_max)
+    rgb_scale = (
+        data_state.absolute_scale
+        if data_state is not None else float(code_max)
+    )
+    rgb_codes = np.asarray(rgb, dtype=np.float32) * float(rgb_scale)
     luminance = np.sum(
         rgb_codes
         * np.array([0.2126, 0.7152, 0.0722], np.float32),

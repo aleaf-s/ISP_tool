@@ -5,6 +5,7 @@ from .collapsible_section import CollapsibleSection
 from .file_list import CalibrationFileItem, FileList, validate_file_metadata
 from .inline_message import InlineMessage
 from .parameter_diff import ParameterDiff
+from .parameter_control import ParameterControl
 from .roi_list import ROIItem, ROIList
 from .status_badge import StatusBadge
 from .toast import ToastManager
@@ -18,6 +19,7 @@ __all__ = [
     "FileList",
     "InlineMessage",
     "ParameterDiff",
+    "ParameterControl",
     "ROIItem",
     "ROIList",
     "StatusBadge",

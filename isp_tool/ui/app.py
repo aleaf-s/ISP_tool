@@ -4,11 +4,10 @@ import copy
 import json
 import math
 import re
-import threading
 import time
 import traceback
 import tkinter as tk
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
@@ -22,7 +21,7 @@ from ..backends import (
     DEFAULT_BACKEND_PREFERENCE,
     normalize_backend_preference,
 )
-from ..bayer import channel_positions, resize_bayer_preview
+from ..bayer import resize_bayer_preview
 from ..calibration.awb import estimate_awb
 from ..analysis import (
     compute_histogram_details,
@@ -37,6 +36,7 @@ from ..models import (
     ImageROI,
     LoadedImage,
     RawMetadata,
+    StageDataState,
     StageResult,
 )
 from ..pipeline import ISPPipeline
@@ -53,12 +53,15 @@ from ..raw_io import (
     load_image,
     synthetic_bayer,
 )
+from ..sampling import (
+    ImageCoordinateMapper,
+    PixelSamplingService,
+    format_pixel_status,
+)
 from ..yuv import (
     PIXEL_FORMATS,
-    YUVFrame,
     YUVMetadata,
     compute_yuv_histogram_details,
-    read_yuv_frame,
     upsample_planes,
     validate_yuv_file,
     yuv_to_rgb,
@@ -71,20 +74,45 @@ from ..workspace import (
     snapshot_for_image,
     transfer_module_settings,
 )
+from ..workspace_cache import (
+    CACHE_HIT,
+    CACHE_INVALID,
+    PreviewCacheContext,
+    WorkspacePreviewCachePolicy,
+)
+from ..workspace_state import WorkspaceItemStateController
 from .calibration_panel import InlineCalibrationWorkspace
+from .controllers import (
+    ACTION_APPLY,
+    ACTION_CANCELLED,
+    ACTION_STALE,
+    ACTION_WAIT,
+    CanvasGestureCoordinator,
+    GESTURE_COMPARE,
+    GESTURE_GRAY_PICK,
+    GESTURE_LINE_PROFILE,
+    GESTURE_NONE,
+    GESTURE_ROI,
+    LanguageController,
+    PreviewRequestCoordinator,
+    PreviewResultApplicationController,
+    YUVPreviewController,
+)
 from .dialogs import ask_raw_metadata, ask_yuv_metadata
 from .dpi import enable_process_dpi_awareness
 from .final_preview import FinalImpactWindow
 from .histogram_window import HistogramWindow
+from .line_profile_window import LineProfileWindow
 from .performance_metrics import PerformanceMetrics
+from .pixel_inspector import PixelInspectorWindow
 from .render_cache import RenderCache
 from .roi_editor import MAX_ROI_COUNT, ROIEditor, ask_roi_grid
 from .scrolling import MouseWheelRouter
 from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
-from .widgets import ActionMenu, ToastManager
+from .widgets import ActionMenu, ParameterControl, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.23 · 独立 Histogram"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.33 · Preview Result Application"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,
@@ -130,10 +158,18 @@ BASIC_PARAMETER_KEYS = {
 class ISPApplication:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_TITLE)
+        self.language_controller = LanguageController()
+        # Compatibility alias for subwindows and older tests.  Ownership now
+        # belongs to LanguageController rather than the main application.
+        self.translator = self.language_controller.translator
+        self.language_var = tk.StringVar(
+            value=self.language_controller.language
+        )
+        self.root.title(self.tr("app.title"))
         self.root.geometry("1320x740")
         self.root.minsize(1040, 650)
         self.root.configure(bg=BG)
+        self._closing = False
         self.ui_scale = 1.0
         self.ui_scale_var = tk.StringVar(value="100%")
         self.preview_quality_var = tk.StringVar(
@@ -164,19 +200,21 @@ class ISPApplication:
             )
         ]
         self.current_image_index = 0
-        self.runtime_cache_clock = 0
-        self.runtime_cache_max_items = (
-            RUNTIME_PREVIEW_CACHE_MAX_ITEMS
+        self.runtime_preview_cache_policy = WorkspacePreviewCachePolicy(
+            RUNTIME_PREVIEW_CACHE_MAX_ITEMS,
+            RUNTIME_PREVIEW_CACHE_BUDGET_BYTES,
         )
-        self.runtime_cache_budget_bytes = (
-            RUNTIME_PREVIEW_CACHE_BUDGET_BYTES
-        )
+        self.workspace_state_controller = WorkspaceItemStateController()
         self.calibration_workspace: Optional[
             InlineCalibrationWorkspace
         ] = None
         self.adjustment_mode = "manual"
         self.final_preview_window: Optional[FinalImpactWindow] = None
         self.histogram_window: Optional[HistogramWindow] = None
+        self.pixel_inspector_window: Optional[
+            PixelInspectorWindow
+        ] = None
+        self.line_profile_window: Optional[LineProfileWindow] = None
         self.histogram_window_geometry = ""
         self.histogram_scale = "Log"
         self.histogram_use_roi = True
@@ -190,27 +228,36 @@ class ISPApplication:
         self.io_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="isp-import"
         )
-        self.current_future: Optional[Future] = None
-        self.pipeline_cancel_event: Optional[threading.Event] = None
         self.analysis_future: Optional[Future] = None
         self.import_future: Optional[Future] = None
         self.import_generation = 0
         self.import_poll_after: Optional[str] = None
         self.pipeline_cache: Dict[str, object] = {}
         self.yuv_request_cache: Dict[tuple, dict] = {}
+        self.yuv_preview_controller = YUVPreviewController()
+        self.pixel_sampling_service = PixelSamplingService()
         self.render_cache = RenderCache()
         self.performance = PerformanceMetrics()
+        self.preview_requests = PreviewRequestCoordinator(
+            self.root,
+            on_request_dropped=lambda: self.performance.increment(
+                "dropped_pipeline_requests"
+            ),
+            on_result_dropped=lambda: self.performance.increment(
+                "dropped_pipeline_results"
+            ),
+        )
+        self.preview_result_application = (
+            PreviewResultApplicationController()
+        )
         self._update_backend_performance_state()
         self.input_revision = 0
         self.result_revision = 0
-        self.generation = 0
         self.analysis_generation = 0
-        self.pending_after: Optional[str] = None
         self.analysis_pending_after: Optional[str] = None
         self.canvas_resize_after: Optional[str] = None
         self.canvas_overlay_after: Optional[str] = None
         self.view_render_after: Optional[str] = None
-        self.poll_after_ids: set[str] = set()
         self.analysis_poll_after_ids: set[str] = set()
         self.photo: Optional[ImageTk.PhotoImage] = None
         self.waveform_photo: Optional[ImageTk.PhotoImage] = None
@@ -232,6 +279,7 @@ class ISPApplication:
         self.fit_mode = True
         self.pan_start: Optional[Tuple[int, int]] = None
         self.canvas_origin = [0.0, 0.0]
+        self.canvas_gestures = CanvasGestureCoordinator()
         self.gray_pick_mode = False
         self.rois: List[ImageROI] = []
         self.roi: Optional[ImageROI] = None
@@ -247,8 +295,13 @@ class ISPApplication:
         self.roi_editor: Optional[ROIEditor] = None
         self.compare_position = 0.5
         self.compare_dragging = False
+        self.line_profile_mode = False
+        self.line_profile_dragging = False
+        self.line_profile_start: Optional[Tuple[int, int]] = None
+        self.line_profile_end: Optional[Tuple[int, int]] = None
         self.temporary_input = False
         self.param_vars: Dict[str, tk.Variable] = {}
+        self.parameter_controls: Dict[str, ParameterControl] = {}
         self.manual_parameter_snapshots: Dict[str, Dict[str, object]] = {}
         self.manual_dirty_modules: set[str] = set()
         self.advanced_param_state: Dict[str, bool] = {}
@@ -269,6 +322,7 @@ class ISPApplication:
         self.toast = ToastManager(self.root)
         self._build_menu()
         self._build_layout()
+        self._refresh_language()
         self.wheel_router.register(self.pipeline_list, self.pipeline_list)
         self.wheel_router.register(self.param_canvas, self.param_canvas)
         self._sync_blc_to_metadata()
@@ -281,8 +335,235 @@ class ISPApplication:
         self.schedule_process(immediate=True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
+    # Compatibility properties keep existing subwindows/tests stable while
+    # PreviewRequestCoordinator owns the actual lifecycle state.
+    @property
+    def runtime_cache_clock(self) -> int:
+        return self.runtime_preview_cache_policy.clock
+
+    @runtime_cache_clock.setter
+    def runtime_cache_clock(self, value: int) -> None:
+        self.runtime_preview_cache_policy.clock = max(0, int(value))
+
+    @property
+    def runtime_cache_max_items(self) -> int:
+        return self.runtime_preview_cache_policy.max_items
+
+    @runtime_cache_max_items.setter
+    def runtime_cache_max_items(self, value: int) -> None:
+        self.runtime_preview_cache_policy.max_items = max(1, int(value))
+
+    @property
+    def runtime_cache_budget_bytes(self) -> int:
+        return self.runtime_preview_cache_policy.budget_bytes
+
+    @runtime_cache_budget_bytes.setter
+    def runtime_cache_budget_bytes(self, value: int) -> None:
+        self.runtime_preview_cache_policy.budget_bytes = max(0, int(value))
+
+    @property
+    def gray_pick_mode(self) -> bool:
+        return (
+            self.canvas_gestures.armed == GESTURE_GRAY_PICK
+            or self.canvas_gestures.active == GESTURE_GRAY_PICK
+        )
+
+    @gray_pick_mode.setter
+    def gray_pick_mode(self, enabled: bool) -> None:
+        if enabled:
+            self.canvas_gestures.arm(GESTURE_GRAY_PICK)
+        else:
+            self.canvas_gestures.disarm(GESTURE_GRAY_PICK)
+            self.canvas_gestures.cancel_active(GESTURE_GRAY_PICK)
+
+    @property
+    def compare_dragging(self) -> bool:
+        return self.canvas_gestures.active == GESTURE_COMPARE
+
+    @compare_dragging.setter
+    def compare_dragging(self, enabled: bool) -> None:
+        self.canvas_gestures.force_active(
+            GESTURE_COMPARE, bool(enabled)
+        )
+
+    @property
+    def line_profile_mode(self) -> bool:
+        return self.canvas_gestures.armed == GESTURE_LINE_PROFILE
+
+    @line_profile_mode.setter
+    def line_profile_mode(self, enabled: bool) -> None:
+        self.canvas_gestures.set_armed(
+            GESTURE_LINE_PROFILE, bool(enabled)
+        )
+
+    @property
+    def line_profile_dragging(self) -> bool:
+        return self.canvas_gestures.active == GESTURE_LINE_PROFILE
+
+    @line_profile_dragging.setter
+    def line_profile_dragging(self, enabled: bool) -> None:
+        self.canvas_gestures.force_active(
+            GESTURE_LINE_PROFILE, bool(enabled)
+        )
+
+    @property
+    def generation(self) -> int:
+        return self.preview_requests.generation
+
+    @generation.setter
+    def generation(self, value: int) -> None:
+        self.preview_requests.generation = int(value)
+
+    @property
+    def pending_after(self):
+        return self.preview_requests.pending_after
+
+    @pending_after.setter
+    def pending_after(self, value) -> None:
+        self.preview_requests.pending_after = value
+
+    @property
+    def current_future(self):
+        return self.preview_requests.current_future
+
+    @current_future.setter
+    def current_future(self, value) -> None:
+        self.preview_requests.current_future = value
+
+    @property
+    def pipeline_cancel_event(self):
+        return self.preview_requests.cancel_event
+
+    @pipeline_cancel_event.setter
+    def pipeline_cancel_event(self, value) -> None:
+        self.preview_requests.cancel_event = value
+
+    @property
+    def poll_after_ids(self):
+        return self.preview_requests.poll_after_ids
+
     def _configure_style(self) -> None:
         configure_theme(self.root, self.ui_scale)
+
+    def tr(self, key: str, **values) -> str:
+        return self.language_controller.tr(key, **values)
+
+    def _change_language(self) -> None:
+        changed = self.language_controller.set_language(
+            self.language_var.get(), persist=True
+        )
+        self.language_var.set(self.language_controller.language)
+        if not changed:
+            return
+        self.loaded_ui_state["language"] = (
+            self.language_controller.language
+        )
+        self._build_menu()
+        self._refresh_language()
+
+    def _refresh_language(self) -> None:
+        """Refresh visible text without touching image or pipeline state."""
+        t = self.tr
+        self.root.title(t("app.title"))
+        mappings = (
+            (getattr(self, "import_image_button", None), "toolbar.import"),
+            (getattr(self, "yuv_workspace_button", None), "toolbar.yuv_preview"),
+            (getattr(self, "remove_image_button", None), "toolbar.remove"),
+            (getattr(self, "auto_calibration_button", None), "toolbar.auto"),
+            (getattr(self, "fit_button", None), "toolbar.fit"),
+            (getattr(self, "preview_default_button", None), "toolbar.default"),
+            (getattr(self, "stage_label", None), "toolbar.stage"),
+            (getattr(self, "pipeline_heading", None), "panel.pipeline"),
+            (getattr(self, "current_module_label", None), "panel.current_module"),
+            (getattr(self, "parameters_label", None), "panel.parameters"),
+            (getattr(self, "manual_mode_button", None), "panel.manual"),
+            (getattr(self, "auto_mode_button", None), "panel.auto"),
+            (getattr(self, "manual_apply_button", None), "panel.apply"),
+            (getattr(self, "manual_revert_button", None), "panel.revert"),
+            (getattr(self, "analysis_toggle_button", None), "toolbar.close"),
+        )
+        for widget, key in mappings:
+            if widget is not None and widget.winfo_exists():
+                widget.configure(text=t(key))
+        if hasattr(self, "preview_brightness_label"):
+            self.preview_brightness_label.configure(
+                text=t("toolbar.preview_ev", ev=self.preview_exposure_ev)
+            )
+        if hasattr(self, "auto_empty_var"):
+            self.auto_empty_var.set(t("panel.no_auto"))
+        for menu, key in (
+            (getattr(self, "export_menu", None), "toolbar.export"),
+            (getattr(self, "preview_menu", None), "toolbar.preview"),
+            (getattr(self, "more_analysis_menu", None), "toolbar.more_analysis"),
+        ):
+            if menu is not None:
+                menu.set_text(t(key))
+        export_menu = getattr(self, "export_menu", None)
+        if export_menu is not None:
+            for index, key in enumerate((
+                "toolbar.export_current", "toolbar.export_roi",
+                "menu.export_yuv_metadata", "menu.export_yuv_planes",
+                "menu.export_yuv_rgb",
+            )):
+                export_menu.set_item_label(index, t(key))
+        preview_menu = getattr(self, "preview_menu", None)
+        if preview_menu is not None:
+            for index, key in enumerate((
+                "toolbar.final_effect", "toolbar.histogram",
+                "toolbar.pixel_inspector", "toolbar.line_profile",
+                "toolbar.more_analysis", "toolbar.preview_quality",
+            )):
+                preview_menu.set_item_label(index, t(key))
+        more_analysis_menu = getattr(
+            self, "more_analysis_menu", None
+        )
+        if more_analysis_menu is not None:
+            more_analysis_menu.set_item_label(
+                4, t("toolbar.pixel_inspector")
+            )
+            more_analysis_menu.set_item_label(
+                5, t("toolbar.line_profile")
+            )
+        roi_menu = getattr(self, "roi_menu", None)
+        if roi_menu is not None:
+            for index, key in (
+                (0, "roi.select"), (1, "roi.process_only"),
+                (2, "roi.grid"), (3, "roi.manage"),
+                (5, "roi.delete"), (6, "roi.clear"),
+                (7, "roi.export"),
+            ):
+                roi_menu.set_item_label(index, t(key))
+        display_menu = getattr(self, "display_menu", None)
+        if display_menu is not None:
+            display_menu.set_item_label(9, t("display.clipping"))
+            display_menu.set_item_label(10, t("display.artifact"))
+        workspace = getattr(self, "calibration_workspace", None)
+        if workspace is not None and workspace.winfo_exists():
+            workspace.refresh_language()
+        histogram = getattr(self, "histogram_window", None)
+        if histogram is not None and histogram.winfo_exists():
+            histogram.refresh_language()
+        final_preview = getattr(self, "final_preview_window", None)
+        if final_preview is not None and final_preview.winfo_exists():
+            final_preview.refresh_language()
+        pixel_inspector = getattr(
+            self, "pixel_inspector_window", None
+        )
+        if pixel_inspector is not None and pixel_inspector.winfo_exists():
+            pixel_inspector.refresh_language()
+        line_profile = getattr(self, "line_profile_window", None)
+        if line_profile is not None and line_profile.winfo_exists():
+            line_profile.refresh_language()
+        if hasattr(self, "status_var"):
+            if (
+                self.current_future is not None
+                and not self.current_future.done()
+            ):
+                self.status_var.set(t("status.processing"))
+            else:
+                self._set_loaded_status()
+        if hasattr(self, "module_state_var"):
+            self._refresh_module_state()
 
     def _create_backend_menu(self, parent) -> tk.Menu:
         backend_menu = tk.Menu(
@@ -307,6 +588,9 @@ class ISPApplication:
         backend_menu.add_separator()
         backend_menu.add_command(
             label="后端状态…", command=self.show_backend_status
+        )
+        backend_menu.entryconfigure(
+            "end", label=self.tr("menu.performance")
         )
         return backend_menu
 
@@ -376,6 +660,42 @@ class ISPApplication:
         help_menu = tk.Menu(menu, tearoff=False, bg=PANEL_2, fg=FG)
         help_menu.add_command(label="关于", command=self.show_about)
         menu.add_cascade(label="帮助", menu=help_menu)
+        file_keys = (
+            "menu.open", "menu.remove_image", "menu.raw_metadata",
+            "menu.yuv_metadata", None, "menu.export_result",
+            "menu.export_roi", "menu.export_yuv_metadata",
+            "menu.export_yuv_planes", "menu.export_yuv_rgb", "menu.exit",
+        )
+        for index, key in enumerate(file_keys):
+            if key is not None:
+                file_menu.entryconfigure(index, label=self.tr(key))
+        view_menu.entryconfigure(0, label=self.tr("menu.fit"))
+        view_menu.entryconfigure(1, label=self.tr("menu.ui_scale"))
+        view_menu.entryconfigure(2, label=self.tr("menu.preview_quality"))
+        view_menu.entryconfigure(4, label=self.tr("menu.advanced"))
+        advanced_menu.entryconfigure(
+            0, label=self.tr("menu.processing_backend")
+        )
+        advanced_menu.entryconfigure(1, label=self.tr("menu.performance"))
+        advanced_menu.entryconfigure(2, label=self.tr("menu.clear_cache"))
+        help_menu.entryconfigure(0, label=self.tr("menu.about"))
+        menu.entryconfigure(0, label=self.tr("menu.file"))
+        menu.entryconfigure(1, label=self.tr("menu.view"))
+        menu.entryconfigure(2, label=self.tr("menu.help"))
+        language_menu = tk.Menu(
+            menu, tearoff=False, bg=PANEL_2, fg=FG
+        )
+        for code in ("zh_CN", "en_US"):
+            language_menu.add_radiobutton(
+                label=self.tr(f"language.{code}"),
+                variable=self.language_var,
+                value=code,
+                command=self._change_language,
+            )
+        menu.add_cascade(
+            label=self.tr("menu.language"), menu=language_menu
+        )
+        self.main_menu = menu
         self.root.config(menu=menu)
         self.root.bind(
             "<Control-o>",
@@ -435,10 +755,11 @@ class ISPApplication:
 
         toolbar = ttk.Frame(self.root, padding=(8, 7))
         toolbar.pack(fill="x")
-        ttk.Button(
+        self.import_image_button = ttk.Button(
             toolbar, text="导入图像", style="Accent.TButton",
             command=self.open_files,
-        ).pack(side="left")
+        )
+        self.import_image_button.pack(side="left")
         self.workspace_switch = ttk.Frame(toolbar)
         self.workspace_switch.pack(side="left", padx=(7, 5))
         self.isp_workspace_button = ttk.Button(
@@ -475,6 +796,7 @@ class ISPApplication:
         self.remove_image_button.pack(side="left", padx=(0, 8))
         self._refresh_image_selector()
         export_menu = ActionMenu(toolbar, "导出")
+        self.export_menu = export_menu
         export_menu.add_command(
             "当前模块输出…", self.export_main_output,
             enabled=lambda: bool(self.results),
@@ -511,6 +833,12 @@ class ISPApplication:
             "Histogram…", self.open_histogram_window
         )
         preview_menu.add_command(
+            "Pixel Inspector…", self.open_pixel_inspector
+        )
+        preview_menu.add_command(
+            "Line Profile…", self.open_line_profile
+        )
+        preview_menu.add_command(
             "更多分析…", self._toggle_analysis_panel
         )
         quality_menu = tk.Menu(
@@ -530,7 +858,10 @@ class ISPApplication:
         ttk.Separator(
             self.stage_selector, orient="vertical"
         ).pack(side="left", fill="y", padx=10)
-        ttk.Label(self.stage_selector, text="查看阶段：").pack(side="left")
+        self.stage_label = ttk.Label(
+            self.stage_selector, text="查看阶段："
+        )
+        self.stage_label.pack(side="left")
         self.stage_var = tk.StringVar()
         self.stage_combo = ttk.Combobox(
             self.stage_selector,
@@ -560,7 +891,10 @@ class ISPApplication:
         main.add(center, weight=1)
         main.add(right, weight=0)
 
-        ttk.Label(left, text="ISP PIPELINE", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        self.pipeline_heading = ttk.Label(
+            left, text="ISP PIPELINE", style="Title.TLabel"
+        )
+        self.pipeline_heading.pack(anchor="w", pady=(0, 8))
         self.pipeline_list = tk.Listbox(
             left, bg=PANEL_2, fg=FG,
             selectbackground=COLORS["selection"], selectforeground="white",
@@ -593,7 +927,10 @@ class ISPApplication:
         canvas_toolbar = ttk.Frame(center, padding=(8, 5))
         self.canvas_toolbar = canvas_toolbar
         canvas_toolbar.pack(fill="x")
-        ttk.Button(canvas_toolbar, text="适合窗口", command=self.fit_image).pack(side="left")
+        self.fit_button = ttk.Button(
+            canvas_toolbar, text="适合窗口", command=self.fit_image
+        )
+        self.fit_button.pack(side="left")
         self.zoom_label = ttk.Label(canvas_toolbar, text="100%", style="Muted.TLabel")
         self.zoom_label.pack(side="left", padx=(5, 0))
         ttk.Separator(
@@ -611,11 +948,12 @@ class ISPApplication:
             style="Muted.TLabel",
         )
         self.preview_brightness_label.pack(side="left", padx=4)
-        ttk.Button(
+        self.preview_default_button = ttk.Button(
             canvas_toolbar,
             text="默认",
             command=self._reset_preview_brightness,
-        ).pack(side="left")
+        )
+        self.preview_default_button.pack(side="left")
         ttk.Button(
             canvas_toolbar,
             text="+",
@@ -626,6 +964,7 @@ class ISPApplication:
             canvas_toolbar, orient="vertical"
         ).pack(side="left", fill="y", padx=6)
         roi_menu = ActionMenu(canvas_toolbar, "ROI")
+        self.roi_menu = roi_menu
         roi_menu.add_checkbutton(
             "选择 ROI", self.roi_mode_var, command=self._roi_mode_changed
         )
@@ -690,9 +1029,10 @@ class ISPApplication:
         self.roi_label.pack(side="right", padx=(8, 2))
         self.image_canvas.pack(fill="both", expand=True)
 
-        ttk.Label(right, text="CURRENT MODULE", style="Muted.TLabel").pack(
-            anchor="w"
+        self.current_module_label = ttk.Label(
+            right, text="CURRENT MODULE", style="Muted.TLabel"
         )
+        self.current_module_label.pack(anchor="w")
         self.module_title = ttk.Label(right, text="", style="Title.TLabel")
         self.module_title.pack(anchor="w", pady=(2, 2))
         self.module_state_var = tk.StringVar(value="Enabled")
@@ -817,6 +1157,13 @@ class ISPApplication:
                 analysis_name,
                 lambda name=analysis_name: self._select_analysis_tool(name),
             )
+        more_analysis.add_separator()
+        more_analysis.add_command(
+            "Pixel Inspector…", self.open_pixel_inspector
+        )
+        more_analysis.add_command(
+            "Line Profile…", self.open_line_profile
+        )
         more_analysis.pack(side="right", padx=(0, 5))
         self.more_analysis_menu = more_analysis
         self.analysis_title_var = tk.StringVar(value="WAVEFORM")
@@ -1020,6 +1367,62 @@ class ISPApplication:
             return
         self.histogram_window = HistogramWindow(self)
         self.histogram_button.configure(style="Primary.TButton")
+
+    def open_pixel_inspector(self) -> None:
+        if (
+            self.pixel_inspector_window is not None
+            and self.pixel_inspector_window.winfo_exists()
+        ):
+            self.pixel_inspector_window.deiconify()
+            self.pixel_inspector_window.lift()
+            self.pixel_inspector_window.focus_force()
+            return
+        self.pixel_inspector_window = PixelInspectorWindow(self)
+        self.pixel_inspector_window.header_var.set(
+            self.tr("pixel.move_cursor")
+        )
+
+    def open_line_profile(self) -> None:
+        if (
+            self.line_profile_window is not None
+            and self.line_profile_window.winfo_exists()
+        ):
+            self.line_profile_window.deiconify()
+            self.line_profile_window.lift()
+            self.line_profile_window.focus_force()
+            self.line_profile_window.refresh_from_app(0)
+            return
+        self.line_profile_window = LineProfileWindow(self)
+
+    def arm_line_profile(self) -> None:
+        self.gray_pick_mode = False
+        self.roi_mode_var.set(False)
+        self.roi_drag_start = None
+        self.roi_drag_original = None
+        self.roi_drag_mode = ""
+        self.roi_resize_handle = ""
+        self.line_profile_mode = True
+        self.line_profile_dragging = False
+        self.image_canvas.configure(cursor="crosshair")
+        self.status_var.set(self.tr("line.draw_hint"))
+
+    def cancel_line_profile(self, clear_line: bool = False) -> None:
+        self.line_profile_mode = False
+        self.line_profile_dragging = False
+        if clear_line:
+            self.line_profile_start = None
+            self.line_profile_end = None
+        self.image_canvas.configure(
+            cursor="crosshair" if self.roi_mode_var.get() else "arrow"
+        )
+        if self.results and not self._closing:
+            self._schedule_canvas_render()
+
+    def clear_line_profile(self) -> None:
+        self.cancel_line_profile(clear_line=True)
+        window = self.line_profile_window
+        if window is not None and window.winfo_exists():
+            window.refresh_from_app(0)
 
     def _toggle_histogram_panel(self) -> None:
         """Compatibility entry point; Histogram now uses its own window."""
@@ -1446,7 +1849,7 @@ class ISPApplication:
                 else None
             )
             self.module_state_var.set(
-                "YUV 专用路径 · RAW ISP 未执行"
+                self.tr("panel.yuv_path")
                 + (f" · {elapsed:.2f} ms" if elapsed is not None else "")
             )
             diagnostics = (
@@ -1470,9 +1873,12 @@ class ISPApplication:
             if self.selected_module_index < len(self.results) else None
         )
         state_text = "Enabled" if module.enabled else "Bypassed"
-        timing_text = f"{elapsed:.2f} ms" if elapsed is not None else "waiting"
+        timing_text = (
+            f"{elapsed:.2f} ms"
+            if elapsed is not None else self.tr("panel.waiting")
+        )
         dirty_text = (
-            " · 参数预览待应用"
+            " · " + self.tr("panel.pending_apply")
             if module.module_id in self.manual_dirty_modules
             else ""
         )
@@ -1974,6 +2380,7 @@ class ISPApplication:
         for child in self.param_frame.winfo_children():
             child.destroy()
         self.param_vars.clear()
+        self.parameter_controls.clear()
         self.tone_curve_canvas = None
         self.ccm_info_label = None
         basic_params = ttk.Frame(self.param_frame)
@@ -2063,38 +2470,16 @@ class ISPApplication:
                     lambda _event, k=spec.key: self._parameter_changed(k),
                 )
             else:
-                inner = ttk.Frame(row)
-                inner.pack(fill="x", pady=(2, 0))
-                var = tk.DoubleVar(value=float(module.parameters[spec.key]))
-                self.param_vars[spec.key] = var
-                scale = ttk.Scale(
-                    inner, from_=float(spec.minimum), to=float(spec.maximum), variable=var,
-                    command=lambda _value, k=spec.key: self._parameter_changed(k),
+                control = ParameterControl(
+                    row,
+                    spec,
+                    float(module.parameters[spec.key]),
+                    command=lambda immediate, k=spec.key:
+                    self._parameter_changed(k, immediate=immediate),
                 )
-                scale.pack(side="left", fill="x", expand=True)
-                text_var = tk.StringVar(value=self._format_value(module.parameters[spec.key]))
-                entry = ttk.Entry(inner, textvariable=text_var, width=8)
-                entry.pack(side="right", padx=(8, 0))
-
-                def sync_entry(*_args, variable=var, text=text_var, parameter=spec):
-                    value = variable.get()
-                    if parameter.kind == "int":
-                        value = int(round(value))
-                    text.set(self._format_value(value))
-
-                var.trace_add("write", sync_entry)
-
-                def commit_entry(_event=None, variable=var, text=text_var, parameter=spec):
-                    try:
-                        value = float(text.get())
-                        value = max(float(parameter.minimum), min(float(parameter.maximum), value))
-                        variable.set(int(round(value)) if parameter.kind == "int" else value)
-                    except (ValueError, tk.TclError):
-                        text.set(self._format_value(variable.get()))
-                    self._parameter_changed(parameter.key)
-
-                entry.bind("<Return>", commit_entry)
-                entry.bind("<FocusOut>", commit_entry)
+                control.pack(fill="x", pady=(2, 0))
+                self.param_vars[spec.key] = control.variable
+                self.parameter_controls[spec.key] = control
         if module.module_id == "tone_mapping":
             ttk.Label(
                 advanced_params, text="Transfer Curve", style="Title.TLabel"
@@ -2158,7 +2543,9 @@ class ISPApplication:
     def _entry_commit(self, key: str) -> None:
         self._parameter_changed(key)
 
-    def _parameter_changed(self, key: str) -> None:
+    def _parameter_changed(
+        self, key: str, immediate: bool = False
+    ) -> None:
         module = self.pipeline.modules[self.selected_module_index]
         variable = self.param_vars.get(key)
         if variable is None:
@@ -2166,7 +2553,10 @@ class ISPApplication:
         try:
             value = variable.get()
             spec = module.specs[key]
-            if spec.kind == "int":
+            control = self.parameter_controls.get(key)
+            if control is not None:
+                value = control.value()
+            elif spec.kind == "int":
                 value = int(round(float(value)))
             elif spec.kind == "float":
                 value = float(value)
@@ -2206,7 +2596,10 @@ class ISPApplication:
         self._mark_manual_parameter_state(module)
         self._refresh_auto_summary()
         self._refresh_module_state()
-        self.schedule_process()
+        # ParameterControl already emits at most one drag update every 25 ms.
+        # Submit those sampled values immediately; applying the generic 90 ms
+        # debounce here would postpone every update until the drag stopped.
+        self.schedule_process(immediate=(immediate or control is not None))
 
     def _draw_tone_curve(self) -> None:
         canvas = self.tone_curve_canvas
@@ -2472,11 +2865,9 @@ class ISPApplication:
             return
         self._cancel_pipeline_refresh()
         self._cancel_analysis_refresh()
-        invalidated = 0
-        for item in self.work_items:
-            if item.runtime_preview is not None:
-                item.runtime_preview = None
-                invalidated += 1
+        invalidated = self.runtime_preview_cache_policy.clear(
+            self.work_items
+        )
         if invalidated:
             self.performance.increment(
                 "backend_cache_invalidations", invalidated
@@ -2585,48 +2976,24 @@ class ISPApplication:
             self.preview_image = np.asarray(image, dtype=np.float32)
 
     def schedule_process(self, immediate: bool = False) -> None:
-        if self.pending_after:
-            self.root.after_cancel(self.pending_after)
-            self.pending_after = None
-        delay = 1 if immediate else 90
-        self.pending_after = self.root.after(delay, self._start_process)
+        self.preview_requests.schedule(
+            self._start_process,
+            immediate=immediate,
+            delay_ms=90,
+            immediate_delay_ms=1,
+        )
 
     def _cancel_pipeline_refresh(self) -> None:
-        self.generation += 1
-        if self.pending_after is not None:
-            try:
-                self.root.after_cancel(self.pending_after)
-            except tk.TclError:
-                pass
-            self.pending_after = None
-            self.performance.increment(
-                "dropped_pipeline_requests"
-            )
-        if self.pipeline_cancel_event is not None:
-            self.pipeline_cancel_event.set()
-        if (
-            self.current_future is not None
-            and not self.current_future.done()
-            and self.current_future.cancel()
-        ):
-            self.performance.increment(
-                "dropped_pipeline_requests"
-            )
+        self.preview_requests.cancel(count_drops=True)
 
     def _start_process(self) -> None:
-        self.pending_after = None
-        self.generation += 1
-        generation = self.generation
+        token = self.preview_requests.begin()
+        generation = token.generation
+        cancel_event = token.cancel_event
         if self.loaded.domain == "yuv":
-            self.status_var.set("正在读取并转换 YUV…")
-            if self.pipeline_cancel_event is not None:
-                self.pipeline_cancel_event.set()
-            cancel_event = threading.Event()
-            self.pipeline_cancel_event = cancel_event
-            if self.current_future is not None and not self.current_future.done():
-                self.current_future.cancel()
+            self.status_var.set(self.tr("status.yuv_processing"))
             submitted_at = time.perf_counter()
-            cache_key = self._yuv_request_cache_key(
+            cache_key = self.yuv_preview_controller.cache_key(
                 self.loaded.source_path,
                 self.loaded.yuv_metadata,
                 self.preview_max_side,
@@ -2669,7 +3036,7 @@ class ISPApplication:
                 ):
                     existing_frame = None
                 future = self.executor.submit(
-                    self._process_yuv_request,
+                    self.yuv_preview_controller.process,
                     self.loaded.source_path,
                     copy.deepcopy(self.loaded.yuv_metadata),
                     self.preview_max_side,
@@ -2680,7 +3047,7 @@ class ISPApplication:
                 future.yuv_cache_key = cache_key
             future.isp_submitted_at = submitted_at
             future.is_yuv_request = True
-            self.current_future = future
+            self.preview_requests.bind_future(future)
             self._schedule_future_poll(future, generation)
             return
         snapshot = self.pipeline.snapshot()
@@ -2689,15 +3056,7 @@ class ISPApplication:
         domain = self.loaded.domain
         input_revision = self.input_revision
         roi = self.roi if self.roi_process_var.get() else None
-        self.status_var.set("处理中…")
-        if self.pipeline_cancel_event is not None:
-            self.pipeline_cancel_event.set()
-        cancel_event = threading.Event()
-        self.pipeline_cancel_event = cancel_event
-        if self.current_future is not None and not self.current_future.done():
-            # Cancels a queued stale preview. A running NumPy/OpenCV call cannot
-            # be interrupted safely, but generation checks discard its result.
-            self.current_future.cancel()
+        self.status_var.set(self.tr("status.processing"))
         submitted_at = time.perf_counter()
         future = self.executor.submit(
             self.pipeline.process_cached,
@@ -2712,205 +3071,57 @@ class ISPApplication:
             cancel_event.is_set,
         )
         future.isp_submitted_at = submitted_at
-        self.current_future = future
+        self.preview_requests.bind_future(future)
         self._schedule_future_poll(future, generation)
-
-    @staticmethod
-    def _yuv_request_cache_key(path, metadata, preview_max_side):
-        source = Path(path)
-        stat = source.stat()
-        return (
-            str(source.resolve()),
-            int(stat.st_mtime_ns),
-            int(stat.st_size),
-            int(metadata.frame_index),
-            metadata.pixel_format,
-            int(metadata.bit_depth),
-            metadata.color_matrix,
-            metadata.color_range,
-            metadata.chroma_siting,
-            metadata.chroma_upsampling,
-            metadata.endianness,
-            int(metadata.y_stride),
-            int(metadata.uv_stride),
-            int(metadata.data_offset),
-            int(preview_max_side),
-        )
-
-    @staticmethod
-    def _process_yuv_request(
-        path,
-        metadata: YUVMetadata,
-        preview_max_side: int,
-        cancelled,
-        existing_frame=None,
-    ):
-        started = time.perf_counter()
-        read_started = started
-        if existing_frame is None:
-            frame = read_yuv_frame(path, metadata, metadata.frame_index)
-            read_ms = (time.perf_counter() - read_started) * 1000.0
-        else:
-            metadata.frame_count = existing_frame.metadata.frame_count
-            frame = YUVFrame(
-                existing_frame.y,
-                existing_frame.u,
-                existing_frame.v,
-                metadata,
-                metadata.frame_index,
-                existing_frame.source_size,
-                {**existing_frame.diagnostics, "reused_planes": True},
-            )
-            read_ms = 0.0
-        if cancelled():
-            raise RuntimeError("YUV request cancelled")
-        height, width = frame.shape
-        target_size = None
-        if max(width, height) > preview_max_side:
-            scale = preview_max_side / max(width, height)
-            target_size = (
-                max(1, int(round(width * scale))),
-                max(1, int(round(height * scale))),
-            )
-        conversion_started = time.perf_counter()
-        conversion = yuv_to_rgb(
-            frame, target_size=target_size, clip=False
-        )
-        conversion_ms = (
-            time.perf_counter() - conversion_started
-        ) * 1000.0
-        if cancelled():
-            raise RuntimeError("YUV request cancelled")
-        y_view = np.clip(conversion.y_normalized, 0.0, 1.0)
-        u_view = np.clip(conversion.u_normalized + 0.5, 0.0, 1.0)
-        v_view = np.clip(conversion.v_normalized + 0.5, 0.0, 1.0)
-        y_rgb = np.repeat(y_view[..., None], 3, axis=2)
-        channel_view = np.stack((y_view, u_view, v_view), axis=-1)
-        artifacts = {
-            "Y Plane": y_view,
-            "U Plane": u_view,
-            "V Plane": v_view,
-            "RGB Preview": np.clip(conversion.rgb, 0.0, 1.0),
-        }
-        common = {
-            "Pixel Format": metadata.pixel_format,
-            "Color Matrix": metadata.color_matrix,
-            "Range": metadata.color_range,
-            "Chroma Siting": metadata.chroma_siting,
-            "Frame": f"{metadata.frame_index + 1}/{metadata.frame_count}",
-            **conversion.diagnostics,
-        }
-        results = [
-            StageResult(
-                "yuv_input", "YUV Input", y_rgb, "yuv_rgb",
-                read_ms, dict(common), artifacts,
-            ),
-            StageResult(
-                "chroma_upsampling", "Chroma Upsampling", channel_view,
-                "yuv_rgb", conversion_ms * 0.4,
-                {**common, "Method": metadata.chroma_upsampling}, artifacts,
-            ),
-            StageResult(
-                "yuv_to_rgb", "YUV to RGB", conversion.rgb, "yuv_rgb",
-                conversion_ms * 0.6, dict(common), artifacts,
-            ),
-            StageResult(
-                "display_preview", "Display Preview",
-                np.clip(conversion.rgb, 0.0, 1.0), "yuv_rgb", 0.0,
-                dict(common), artifacts,
-            ),
-        ]
-        wall_ms = (time.perf_counter() - started) * 1000.0
-        return {
-            "frame": frame,
-            "conversion": conversion,
-            "results": results,
-            "metrics": {
-                "cache_hits": 0,
-                "recomputed": 3,
-                "elapsed_ms": read_ms + conversion_ms,
-                "wall_elapsed_ms": wall_ms,
-                "overhead_ms": max(0.0, wall_ms - read_ms - conversion_ms),
-                "module_timings": {
-                    "yuv_input": read_ms,
-                    "chroma_upsampling": conversion_ms * 0.4,
-                    "yuv_to_rgb": conversion_ms * 0.6,
-                },
-                "yuv_cache_key": (
-                    str(path), metadata.frame_index, metadata.pixel_format,
-                    metadata.color_matrix, metadata.color_range,
-                    metadata.chroma_siting, metadata.chroma_upsampling,
-                    preview_max_side,
-                ),
-            },
-        }
 
     def _schedule_future_poll(
         self, future: Future, generation: int
     ) -> None:
-        after_id: Optional[str] = None
-
-        def poll() -> None:
-            if after_id is not None:
-                self.poll_after_ids.discard(after_id)
-            self._poll_future(future, generation)
-
-        after_id = self.root.after(15, poll)
-        self.poll_after_ids.add(after_id)
+        self.preview_requests.schedule_poll(
+            lambda: self._poll_future(future, generation)
+        )
 
     def _poll_future(self, future: Future, generation: int) -> None:
-        if not future.done():
+        decision = self.preview_result_application.decide(
+            is_current=self.preview_requests.is_current(generation),
+            done=future.done(),
+            cancelled=(future.cancelled() if future.done() else False),
+        )
+        if decision == ACTION_STALE:
+            self.preview_requests.reject_stale_result()
+            return
+        if decision == ACTION_WAIT:
             self._schedule_future_poll(future, generation)
             return
-        if generation != self.generation:
-            self.performance.increment("dropped_pipeline_results")
+        if decision == ACTION_CANCELLED:
+            self.status_var.set(self.tr("status.ready"))
+            return
+        if decision != ACTION_APPLY:
             return
         try:
             payload = future.result()
             if getattr(future, "is_yuv_request", False):
-                frame = payload["frame"]
-                conversion = payload["conversion"]
-                old_preview_shape = tuple(self.preview_image.shape[:2])
-                self.loaded.yuv_frame = frame
-                self.loaded.yuv_metadata = frame.metadata
-                self.loaded.yuv_conversion = conversion
-                self.loaded.image = conversion.rgb
-                self.loaded.metadata.width = frame.metadata.width
-                self.loaded.metadata.height = frame.metadata.height
-                self.loaded.metadata.bit_depth = frame.metadata.bit_depth
-                self.loaded.metadata.white_level = float(
-                    (1 << frame.metadata.bit_depth) - 1
+                prepared = self.preview_result_application.prepare_yuv(
+                    payload,
+                    cached=bool(getattr(future, "is_yuv_cached", False)),
+                    cache_key=getattr(future, "yuv_cache_key", None),
                 )
-                self.loaded.description = (
-                    f"YUV · {frame.metadata.pixel_format} · "
-                    f"{frame.metadata.color_matrix} · {frame.metadata.color_range} · "
-                    f"Frame {frame.frame_index + 1}/{frame.metadata.frame_count}"
-                )
-                self._update_yuv_panel_info()
-                self.preview_image = conversion.rgb
-                if old_preview_shape != tuple(conversion.rgb.shape[:2]):
-                    self._rescale_current_rois(
-                        old_preview_shape,
-                        conversion.rgb.shape,
-                    )
-                self.results = payload["results"]
-                self.pipeline_cache["last_metrics"] = payload["metrics"]
-                if not getattr(future, "is_yuv_cached", False):
-                    cache_key = getattr(future, "yuv_cache_key", None)
-                    if cache_key is not None:
-                        self.yuv_request_cache[cache_key] = payload
-                        while len(self.yuv_request_cache) > 2:
-                            oldest = next(iter(self.yuv_request_cache))
-                            self.yuv_request_cache.pop(oldest, None)
             else:
-                self.results = payload
+                prepared = self.preview_result_application.prepare_raw(
+                    payload,
+                    self.pipeline_cache.get("last_metrics", {}),
+                )
+            self._apply_prepared_preview_payload(prepared)
+        except CancelledError:
+            self.status_var.set(self.tr("status.ready"))
+            return
         except Exception as exc:
             self.status_var.set(f"处理失败：{exc}")
             messagebox.showerror(
                 "ISP 处理失败", f"{exc}\n\n{traceback.format_exc(limit=4)}", parent=self.root
             )
             return
-        run_metrics = self.pipeline_cache.get("last_metrics", {})
+        run_metrics = prepared.metrics
         cache_hits = run_metrics.get("cache_hits", 0)
         recomputed = run_metrics.get("recomputed", len(self.pipeline.modules))
         module_total = run_metrics.get(
@@ -3002,6 +3213,43 @@ class ISPApplication:
         self._refresh_module_state()
         self._refresh_auto_summary()
 
+    def _apply_prepared_preview_payload(self, prepared) -> None:
+        if prepared.kind == "raw":
+            self.results = prepared.results
+            return
+        frame = prepared.frame
+        conversion = prepared.conversion
+        old_preview_shape = tuple(self.preview_image.shape[:2])
+        self.loaded.yuv_frame = frame
+        self.loaded.yuv_metadata = frame.metadata
+        self.loaded.yuv_conversion = conversion
+        self.loaded.image = conversion.rgb
+        self.loaded.metadata.width = frame.metadata.width
+        self.loaded.metadata.height = frame.metadata.height
+        self.loaded.metadata.bit_depth = frame.metadata.bit_depth
+        self.loaded.metadata.white_level = float(
+            (1 << frame.metadata.bit_depth) - 1
+        )
+        self.loaded.description = (
+            f"YUV · {frame.metadata.pixel_format} · "
+            f"{frame.metadata.color_matrix} · {frame.metadata.color_range} · "
+            f"Frame {frame.frame_index + 1}/{frame.metadata.frame_count}"
+        )
+        self._update_yuv_panel_info()
+        self.preview_image = conversion.rgb
+        if old_preview_shape != tuple(conversion.rgb.shape[:2]):
+            self._rescale_current_rois(
+                old_preview_shape, conversion.rgb.shape
+            )
+        self.results = prepared.results
+        self.pipeline_cache["last_metrics"] = prepared.metrics
+        cache_key = prepared.cache_key_to_store
+        if cache_key is not None:
+            self.yuv_request_cache[cache_key] = prepared.original_payload
+            while len(self.yuv_request_cache) > 2:
+                oldest = next(iter(self.yuv_request_cache))
+                self.yuv_request_cache.pop(oldest, None)
+
     def _current_result_index(self) -> int:
         index = self.stage_combo.current()
         if not self.results:
@@ -3063,6 +3311,7 @@ class ISPApplication:
                     self._bayer_stage_is_normalized(index)
                     if result.domain == "bayer" else None
                 ),
+                data_state=result.data_state,
             )
             main = np.asarray(main, dtype=np.float32)
             main.setflags(write=False)
@@ -3074,6 +3323,10 @@ class ISPApplication:
 
     def _bayer_stage_is_normalized(self, index: int) -> bool:
         """Whether an enabled BLC has normalized this Bayer stage to linear."""
+        if self.results and 0 <= index < len(self.results):
+            state = self.results[index].data_state
+            if state is not None:
+                return bool(state.normalized)
         return any(
             stage.module_id == "black_level_correction"
             and stage.domain == "bayer"
@@ -3157,6 +3410,18 @@ class ISPApplication:
         if schedule_analysis:
             self.schedule_analysis_refresh()
         self._refresh_histogram_window(180 if schedule_analysis else 0)
+        if (
+            self.pixel_inspector_window is not None
+            and self.pixel_inspector_window.winfo_exists()
+        ):
+            self.pixel_inspector_window.refresh_from_app()
+        if (
+            self.line_profile_window is not None
+            and self.line_profile_window.winfo_exists()
+        ):
+            self.line_profile_window.refresh_from_app(
+                120 if schedule_analysis else 40
+            )
         self._update_performance_status()
 
     def _set_preview_brightness(self, exposure_ev: float) -> None:
@@ -3164,7 +3429,9 @@ class ISPApplication:
             np.clip(exposure_ev, -3.0, 3.0)
         )
         self.preview_brightness_label.configure(
-            text=f"预览 {self.preview_exposure_ev:+.1f} EV"
+            text=self.tr(
+                "toolbar.preview_ev", ev=self.preview_exposure_ev
+            )
         )
         self.render_current(schedule_analysis=False)
 
@@ -3347,6 +3614,8 @@ class ISPApplication:
             if result.domain == "bayer"
             else result.domain.upper()
         )
+        if result.data_state is not None:
+            domain_text += f" · {result.data_state.encoding}"
         overlay_text = (
             f"{result.name} · {domain_text} · "
             f"{self.zoom * 100:.0f}% · ROI {roi_text}"
@@ -3455,6 +3724,55 @@ class ISPApplication:
                     fill=COLORS["calibration_overlay"],
                     font=FONTS["small"], tags="colorchecker",
                 )
+        if (
+            self.line_profile_start is not None
+            and self.line_profile_end is not None
+        ):
+            profile_roi = (
+                self.roi
+                if self.roi_process_var.get() and self.roi is not None
+                else None
+            )
+            if (
+                self.loaded.domain == "yuv"
+                and self.loaded.yuv_metadata is not None
+            ):
+                profile_source_shape = (
+                    int(self.loaded.yuv_metadata.height),
+                    int(self.loaded.yuv_metadata.width),
+                )
+            else:
+                profile_source_shape = self.preview_image.shape
+            profile_start = ImageCoordinateMapper.source_to_display(
+                self.line_profile_start,
+                self.display_array.shape,
+                profile_source_shape,
+                profile_roi,
+            )
+            profile_end = ImageCoordinateMapper.source_to_display(
+                self.line_profile_end,
+                self.display_array.shape,
+                profile_source_shape,
+                profile_roi,
+            )
+            if profile_start is not None and profile_end is not None:
+                x0 = self.canvas_origin[0] + profile_start[0] * self.zoom
+                y0 = self.canvas_origin[1] + profile_start[1] * self.zoom
+                x1 = self.canvas_origin[0] + profile_end[0] * self.zoom
+                y1 = self.canvas_origin[1] + profile_end[1] * self.zoom
+                self.image_canvas.create_line(
+                    x0, y0, x1, y1,
+                    fill=COLORS["accent"], width=2,
+                    tags="line_profile",
+                )
+                for x, y in ((x0, y0), (x1, y1)):
+                    self.image_canvas.create_oval(
+                        x - 5, y - 5, x + 5, y + 5,
+                        fill=COLORS["accent"],
+                        outline=COLORS["foreground"],
+                        width=1,
+                        tags="line_profile",
+                    )
         self.zoom_label.configure(text=f"{self.zoom * 100:.0f}%")
         self.display_transform = (
             self.canvas_origin[0], self.canvas_origin[1], self.zoom, image_w, image_h
@@ -3594,25 +3912,179 @@ class ISPApplication:
         self._render_canvas_image()
 
     def _canvas_to_image(self, canvas_x: int, canvas_y: int) -> Optional[Tuple[int, int]]:
-        origin_x, origin_y, zoom, width, height = self.display_transform
-        x = int((canvas_x - origin_x) / max(zoom, 1e-9))
-        y = int((canvas_y - origin_y) / max(zoom, 1e-9))
-        if 0 <= x < width and 0 <= y < height:
-            return x, y
-        return None
+        return ImageCoordinateMapper.canvas_to_display(
+            canvas_x, canvas_y, self.display_transform
+        )
 
     def _display_to_source_point(self, point: Tuple[int, int]) -> Tuple[int, int]:
-        x, y = point
-        if self.roi_process_var.get() and self.roi is not None:
-            return x + self.roi.x, y + self.roi.y
+        display_shape = (
+            self.display_linear_array.shape
+            if self.display_linear_array is not None
+            else self.preview_image.shape
+        )
+        roi = (
+            self.roi
+            if self.roi_process_var.get() and self.roi is not None
+            else None
+        )
         if self.loaded.domain == "yuv" and self.loaded.yuv_metadata is not None:
             metadata = self.loaded.yuv_metadata
-            display_h, display_w = self.display_linear_array.shape[:2]
-            return (
-                min(metadata.width - 1, int(x * metadata.width / display_w)),
-                min(metadata.height - 1, int(y * metadata.height / display_h)),
+            source_shape = (
+                int(metadata.height), int(metadata.width)
             )
-        return x, y
+        else:
+            source_shape = display_shape
+        return ImageCoordinateMapper.display_to_source(
+            point, display_shape, source_shape, roi
+        )
+
+    def current_sample_stage_name(self) -> str:
+        if not self.results:
+            return ""
+        return self.results[self._current_result_index()].name
+
+    def sample_display_point(
+        self,
+        point: Tuple[int, int],
+        neighborhood_size: int = 5,
+        result_index: Optional[int] = None,
+    ):
+        if not self.results:
+            return None
+        index = self._current_result_index() if result_index is None else int(result_index)
+        index = max(0, min(index, len(self.results) - 1))
+        result = self.results[index]
+        x, y = map(int, point)
+        if not (
+            0 <= y < result.image.shape[0]
+            and 0 <= x < result.image.shape[1]
+        ):
+            return None
+        source_point = self._display_to_source_point((x, y))
+        yuv_frame = (
+            self.loaded.yuv_frame
+            if self.loaded.domain == "yuv" else None
+        )
+        yuv_rgb = (
+            self.loaded.yuv_conversion.rgb
+            if (
+                self.loaded.domain == "yuv"
+                and self.loaded.yuv_conversion is not None
+            )
+            else None
+        )
+        try:
+            sample = self.pixel_sampling_service.sample(
+                result.image,
+                result.domain,
+                self.loaded.metadata,
+                (x, y),
+                source_point,
+                data_state=result.data_state,
+                neighborhood_size=neighborhood_size,
+                yuv_frame=yuv_frame,
+                yuv_rgb=yuv_rgb,
+            )
+        except (IndexError, ValueError):
+            return None
+        return sample, result.name
+
+    def sample_source_point(
+        self,
+        point: Tuple[int, int],
+        neighborhood_size: int = 5,
+        result_index: Optional[int] = None,
+    ):
+        if not self.results:
+            return None
+        index = self._current_result_index() if result_index is None else int(result_index)
+        index = max(0, min(index, len(self.results) - 1))
+        result = self.results[index]
+        roi = (
+            self.roi
+            if self.roi_process_var.get() and self.roi is not None
+            else None
+        )
+        if self.loaded.domain == "yuv" and self.loaded.yuv_metadata is not None:
+            source_shape = (
+                int(self.loaded.yuv_metadata.height),
+                int(self.loaded.yuv_metadata.width),
+            )
+        else:
+            source_shape = self.preview_image.shape
+        local = ImageCoordinateMapper.source_to_display(
+            point, result.image.shape, source_shape, roi
+        )
+        if local is None:
+            return None
+        return self.sample_display_point(
+            local, neighborhood_size, index
+        )
+
+    def sample_line_profiles(self, include_input: bool = True):
+        if (
+            not self.results
+            or self.line_profile_start is None
+            or self.line_profile_end is None
+        ):
+            return None
+        result_index = self._current_result_index()
+        indexes = [("output", result_index)]
+        if (
+            include_input
+            and self.loaded.domain != "yuv"
+            and result_index > 0
+        ):
+            indexes.insert(0, ("input", result_index - 1))
+        roi = (
+            self.roi
+            if self.roi_process_var.get() and self.roi is not None
+            else None
+        )
+        if self.loaded.domain == "yuv" and self.loaded.yuv_metadata is not None:
+            source_shape = (
+                int(self.loaded.yuv_metadata.height),
+                int(self.loaded.yuv_metadata.width),
+            )
+        else:
+            source_shape = self.preview_image.shape
+        profiles = {}
+        for role, index in indexes:
+            result = self.results[index]
+            local_start = ImageCoordinateMapper.source_to_display(
+                self.line_profile_start,
+                result.image.shape,
+                source_shape,
+                roi,
+            )
+            local_end = ImageCoordinateMapper.source_to_display(
+                self.line_profile_end,
+                result.image.shape,
+                source_shape,
+                roi,
+            )
+            if local_start is None or local_end is None:
+                continue
+            try:
+                profiles[role] = self.pixel_sampling_service.sample_line(
+                    result.image,
+                    result.domain,
+                    self.loaded.metadata,
+                    local_start,
+                    local_end,
+                    self.line_profile_start,
+                    self.line_profile_end,
+                    data_state=result.data_state,
+                    yuv_frame=(
+                        self.loaded.yuv_frame
+                        if self.loaded.domain == "yuv" else None
+                    ),
+                )
+            except (IndexError, ValueError):
+                continue
+        if "output" not in profiles:
+            return None
+        return profiles, self.results[result_index].name
 
     def _roi_index_at(self, point: Tuple[int, int]) -> int:
         x, y = point
@@ -3665,22 +4137,36 @@ class ISPApplication:
         )
 
     def _on_left_press(self, event) -> None:
-        if self.gray_pick_mode:
-            self._on_canvas_click(event)
-            return
-        # The compare handle owns the gesture even while ROI selection is
-        # enabled. This prevents dragging the split line from creating or
-        # moving an ROI underneath it.
-        if self._compare_divider_hit(event.x, event.y):
-            self.compare_dragging = True
-            self.image_canvas.configure(cursor="sb_h_double_arrow")
-            self._update_compare_position(event.x)
-            return
         point = self._canvas_to_image(event.x, event.y)
         if point is None:
             return
-        if self.roi_mode_var.get():
+        gesture = self.canvas_gestures.begin(
+            point,
+            compare_divider_hit=self._compare_divider_hit(
+                event.x, event.y
+            ),
+            roi_enabled=bool(self.roi_mode_var.get()),
+            compare_enabled=bool(
+                self.compare_var.get()
+                and self._current_result_index() > 0
+            ),
+        )
+        if gesture == GESTURE_GRAY_PICK:
+            self._on_canvas_click(event)
+            return
+        if gesture == GESTURE_COMPARE:
+            self.image_canvas.configure(cursor="sb_h_double_arrow")
+            self._update_compare_position(event.x)
+            return
+        if gesture == GESTURE_LINE_PROFILE:
+            source_point = self._display_to_source_point(point)
+            self.line_profile_start = source_point
+            self.line_profile_end = source_point
+            self._schedule_canvas_render()
+            return
+        if gesture == GESTURE_ROI:
             if self.roi_process_var.get():
+                self.canvas_gestures.finish()
                 self.roi_process_var.set(False)
                 self.schedule_process(immediate=True)
                 return
@@ -3701,6 +4187,7 @@ class ISPApplication:
             else:
                 if len(self.rois) >= MAX_ROI_COUNT:
                     self.roi_drag_start = None
+                    self.canvas_gestures.finish()
                     self.toast.show(
                         f"ROI 数量已达到 {MAX_ROI_COUNT} 个，"
                         "请先删除一个框",
@@ -3714,19 +4201,36 @@ class ISPApplication:
             self._update_roi_label()
             self._schedule_canvas_render()
             return
-        if self.compare_var.get() and self._current_result_index() > 0:
-            self.compare_dragging = True
-            self._update_compare_position(event.x)
 
     def _on_left_drag(self, event) -> None:
-        if self.compare_dragging:
+        gesture = self.canvas_gestures.active
+        if gesture == GESTURE_COMPARE:
+            self.canvas_gestures.update(
+                self._canvas_to_image(event.x, event.y)
+            )
             self._update_compare_position(event.x)
             return
-        if self.roi_drag_start is None or not self.roi_mode_var.get():
+        if gesture == GESTURE_LINE_PROFILE:
+            point = self._canvas_to_image(event.x, event.y)
+            if point is None:
+                return
+            self.canvas_gestures.update(point)
+            self.line_profile_end = self._display_to_source_point(point)
+            self._schedule_canvas_render()
+            window = self.line_profile_window
+            if window is not None and window.winfo_exists():
+                window.refresh_from_app(70)
+            return
+        if (
+            gesture != GESTURE_ROI
+            or self.roi_drag_start is None
+            or not self.roi_mode_var.get()
+        ):
             return
         point = self._canvas_to_image(event.x, event.y)
         if point is None:
             return
+        self.canvas_gestures.update(point)
         current = self._display_to_source_point(point)
         image_h, image_w = self.preview_image.shape[:2]
         if self.roi_drag_mode == "move" and self.roi_drag_original is not None:
@@ -3768,17 +4272,30 @@ class ISPApplication:
         self._schedule_canvas_render()
 
     def _on_left_release(self, _event) -> None:
-        if self.compare_dragging:
-            self.compare_dragging = False
+        gesture = self.canvas_gestures.active
+        if gesture == GESTURE_COMPARE:
+            self.canvas_gestures.finish()
             self.image_canvas.configure(
-                cursor=(
-                    "crosshair"
-                    if self.roi_mode_var.get() else "arrow"
+                cursor=self.canvas_gestures.cursor(
+                    compare_divider_hit=self._compare_divider_hit(
+                        _event.x, _event.y
+                    ),
+                    roi_enabled=bool(self.roi_mode_var.get()),
                 )
             )
             return
-        if self.roi_drag_start is None:
+        if gesture == GESTURE_LINE_PROFILE:
+            self.canvas_gestures.finish()
+            self.image_canvas.configure(cursor="arrow")
+            self._schedule_canvas_render()
+            window = self.line_profile_window
+            if window is not None and window.winfo_exists():
+                window.refresh_from_app(0)
+            self.status_var.set(self.tr("line.ready"))
             return
+        if gesture != GESTURE_ROI or self.roi_drag_start is None:
+            return
+        self.canvas_gestures.finish()
         self.roi_drag_start = None
         self.roi_drag_original = None
         self.roi_drag_mode = ""
@@ -3819,6 +4336,9 @@ class ISPApplication:
         self.render_current(schedule_analysis=False)
 
     def _roi_mode_changed(self) -> None:
+        if self.roi_mode_var.get() and self.line_profile_mode:
+            self.line_profile_mode = False
+            self.line_profile_dragging = False
         if self.roi_mode_var.get() and self.roi_process_var.get():
             self.roi_process_var.set(False)
             self.schedule_process(immediate=True)
@@ -4047,12 +4567,11 @@ class ISPApplication:
 
     def _on_canvas_motion(self, event) -> None:
         if not self.compare_dragging:
-            cursor = (
-                "sb_h_double_arrow"
-                if self._compare_divider_hit(event.x, event.y)
-                else "crosshair"
-                if self.roi_mode_var.get()
-                else "arrow"
+            cursor = self.canvas_gestures.cursor(
+                compare_divider_hit=self._compare_divider_hit(
+                    event.x, event.y
+                ),
+                roi_enabled=bool(self.roi_mode_var.get()),
             )
             self.image_canvas.configure(cursor=cursor)
         now = time.perf_counter()
@@ -4063,7 +4582,6 @@ class ISPApplication:
         if point is None or self.display_linear_array is None:
             return
         x, y = point
-        source_x, source_y = self._display_to_source_point(point)
         result_index = self._current_result_index()
         if (
             result_index > 0
@@ -4075,107 +4593,28 @@ class ISPApplication:
             )
         ):
             result_index -= 1
-        result = self.results[result_index]
-        bit_depth = max(
-            1, min(int(self.loaded.metadata.bit_depth), 30)
+        inspector = self.pixel_inspector_window
+        neighborhood_size = (
+            inspector.neighborhood_size
+            if inspector is not None and inspector.winfo_exists()
+            else 5
         )
-        code_max = (1 << bit_depth) - 1
-        if (
-            self.loaded.domain == "yuv"
-            and self.loaded.yuv_frame is not None
-            and self.loaded.yuv_conversion is not None
-        ):
-            y_code, u_code, v_code = self.loaded.yuv_frame.sample(
-                source_x, source_y
-            )
-            rgb = np.asarray(
-                self.loaded.yuv_conversion.rgb[y, x],
-                dtype=np.float32,
-            )
-            absolute = tuple(
-                int(round(float(value) * code_max)) for value in rgb
-            )
-            display_absolute = tuple(
-                int(round(float(value) * code_max))
-                for value in np.clip(rgb, 0.0, 1.0)
-            )
-            metadata = self.loaded.yuv_metadata
-            self.status_var.set(
-                f"x={source_x}, y={source_y} · "
-                f"YUV=({y_code}, {u_code}, {v_code}) · "
-                f"RGB裁剪前≈{absolute} · "
-                f"显示RGB={display_absolute}/{code_max} · "
-                f"{metadata.pixel_format} · {metadata.color_matrix} · "
-                f"{metadata.color_range}"
-            )
-            return
-        if (
-            result.domain == "bayer"
-            and self.artifact_var.get() == "Main Output"
-            and result.image.ndim == 2
-            and y < result.image.shape[0]
-            and x < result.image.shape[1]
-        ):
-            positions = channel_positions(
-                self.loaded.metadata.bayer_pattern
-            )
-            channel = next(
-                name
-                for name, position in positions.items()
-                if position == (y % 2, x % 2)
-            )
-            raw_value = float(result.image[y, x])
-            is_normalized = self._bayer_stage_is_normalized(
-                result_index
-            )
-            if is_normalized:
-                absolute_value = int(round(
-                    raw_value * code_max
-                ))
-                display_value = int(np.clip(absolute_value, 0, code_max))
-                value_text = (
-                    f"{bit_depth}-bit计算值≈{absolute_value} · "
-                    f"显示值={display_value}/{code_max}"
-                )
-            else:
-                value_text = (
-                    f"DN={raw_value:.2f} · "
-                    f"{bit_depth}-bit范围=0…{code_max}"
-                )
-            self.status_var.set(
-                f"x={source_x}, y={source_y} · RAW {channel} "
-                f"{value_text} · "
-                f"{self.loaded.metadata.bayer_pattern} CFA（未去马赛克）"
-                + (
-                    " · 点击此处估算白平衡"
-                    if self.gray_pick_mode else ""
-                )
-            )
-            return
-        if (
-            self.artifact_var.get() == "Main Output"
-            and result.domain == "rgb"
-            and result.image.ndim == 3
-            and y < result.image.shape[0]
-            and x < result.image.shape[1]
-        ):
-            value = np.asarray(
-                result.image[y, x, :3], dtype=np.float32
-            )
-        else:
-            value = self.display_linear_array[y, x]
-        absolute = np.rint(value * code_max).astype(np.int64)
-        display_absolute = np.rint(
-            np.clip(value, 0.0, 1.0) * code_max
-        ).astype(np.int64)
-        self.status_var.set(
-            f"x={source_x}, y={source_y} · "
-            f"RGB裁剪前≈"
-            f"({absolute[0]}, {absolute[1]}, {absolute[2]}) · "
-            f"显示RGB=({display_absolute[0]}, {display_absolute[1]}, "
-            f"{display_absolute[2]})/{code_max}"
-            + (" · 点击此处估算白平衡" if self.gray_pick_mode else "")
+        sampled = self.sample_display_point(
+            (x, y), neighborhood_size, result_index
         )
+        if sampled is None:
+            return
+        sample, stage_name = sampled
+        self.status_var.set(format_pixel_status(
+            sample,
+            gray_pick_mode=self.gray_pick_mode,
+            yuv_metadata=(
+                self.loaded.yuv_metadata
+                if self.loaded.domain == "yuv" else None
+            ),
+        ))
+        if inspector is not None and inspector.winfo_exists():
+            inspector.update_hover(sample, stage_name)
 
     def arm_gray_picker(self) -> None:
         if self.loaded.domain == "yuv":
@@ -4187,6 +4626,12 @@ class ISPApplication:
         if self.compare_var.get():
             self.compare_var.set(False)
             self.render_current()
+        self.line_profile_mode = False
+        self.line_profile_dragging = False
+        self.roi_drag_start = None
+        self.roi_drag_original = None
+        self.roi_drag_mode = ""
+        self.roi_resize_handle = ""
         self.gray_pick_mode = True
         self.status_var.set("灰点白平衡：请在预览中点击中性灰区域")
 
@@ -4209,6 +4654,9 @@ class ISPApplication:
             return
         module = self.pipeline.module_by_id("white_balance")
         awb_source = self.preview_image
+        awb_data_state = StageDataState.for_input(
+            "bayer", self.loaded.metadata
+        )
         wb_input_index = next(
             index
             for index, pipeline_module in enumerate(
@@ -4223,6 +4671,10 @@ class ISPApplication:
             == self.preview_image.shape[:2]
         ):
             awb_source = self.results[wb_input_index].image
+            awb_data_state = (
+                self.results[wb_input_index].data_state
+                or awb_data_state
+            )
         try:
             result = estimate_awb(
                 awb_source,
@@ -4230,6 +4682,7 @@ class ISPApplication:
                 method="ROI Neutral",
                 roi=ImageROI(x0, y0, x1 - x0, y1 - y0),
                 gain_limit=float(module.parameters["gain_limit"]),
+                data_state=awb_data_state,
             )
         except ISPError as exc:
             self.toast.show(str(exc), "warning")
@@ -4373,12 +4826,14 @@ class ISPApplication:
         ):
             image = self._stage_rgb(index)
             domain = "rgb"
+            data_state = None
             if roi_key is not None:
                 ys, xs = self.roi.slices()
                 image = image[ys, xs]
         else:
             image = self._analysis_image(result)
             domain = result.domain
+            data_state = result.data_state
         image = np.asarray(image, dtype=np.float32)
         mode = (
             self.waveform_mode_var.get()
@@ -4398,6 +4853,9 @@ class ISPApplication:
             scale,
             width,
             height,
+            "RGB Overlay",
+            False,
+            data_state,
         )
         self.analysis_future = future
         self._schedule_analysis_poll(
@@ -4416,6 +4874,7 @@ class ISPApplication:
         height: int,
         histogram_mode: str = "RGB Overlay",
         bayer_normalized: bool = False,
+        data_state=None,
     ):
         started = time.perf_counter()
         if analysis_type == "Histogram":
@@ -4425,6 +4884,7 @@ class ISPApplication:
                 metadata,
                 mode=histogram_mode,
                 bayer_normalized=bayer_normalized,
+                data_state=data_state,
             )
         elif analysis_type == "Waveform":
             value = compute_waveform(
@@ -4434,6 +4894,7 @@ class ISPApplication:
                 mode=mode,
                 width=width,
                 height=height,
+                data_state=data_state,
             )
         elif analysis_type == "Vectorscope":
             size = max(128, min(width, max(height, 220)))
@@ -4444,9 +4905,12 @@ class ISPApplication:
                 mode=mode,
                 size=size,
                 saturation_scale=scale,
+                data_state=data_state,
             )
         else:
-            value = compute_statistics(image, domain, metadata)
+            value = compute_statistics(
+                image, domain, metadata, data_state=data_state
+            )
         elapsed = (time.perf_counter() - started) * 1000.0
         return {"value": value, "elapsed_ms": elapsed}
 
@@ -4989,69 +5453,51 @@ class ISPApplication:
             self.open_isp_files()
 
     def _runtime_cache_entries(self):
-        return [
-            (index, item, item.runtime_preview)
-            for index, item in enumerate(self.work_items)
-            if item.runtime_preview is not None
-        ]
+        return self.runtime_preview_cache_policy.entries(
+            self.work_items
+        )
 
     def _update_runtime_cache_metrics(self) -> None:
-        entries = self._runtime_cache_entries()
-        memory_bytes = sum(
-            state.memory_bytes for _, _, state in entries
+        summary = self.runtime_preview_cache_policy.summary(
+            self.work_items
         )
         self.performance.set_value(
             "workspace_preview_cache",
-            f"{len(entries)}/{self.runtime_cache_max_items} images · "
-            f"{memory_bytes / (1024 * 1024):.1f}/"
-            f"{self.runtime_cache_budget_bytes / (1024 * 1024):.0f} MiB",
+            f"{summary.count}/{summary.max_items} images · "
+            f"{summary.memory_bytes / (1024 * 1024):.1f}/"
+            f"{summary.budget_bytes / (1024 * 1024):.0f} MiB",
         )
 
     def _trim_runtime_preview_cache(
         self, protected_item: Optional[ImageWorkItem] = None
     ) -> None:
-        while True:
-            entries = self._runtime_cache_entries()
-            memory_bytes = sum(
-                state.memory_bytes for _, _, state in entries
-            )
-            if (
-                len(entries) <= self.runtime_cache_max_items
-                and memory_bytes <= self.runtime_cache_budget_bytes
-            ):
-                break
-            candidates = [
-                (index, item, state)
-                for index, item, state in entries
-                if item is not protected_item
-            ]
-            if not candidates:
-                break
-            _, item, _ = min(
-                candidates, key=lambda entry: entry[2].last_used
-            )
-            item.runtime_preview = None
+        evicted = self.runtime_preview_cache_policy.trim(
+            self.work_items, protected_item=protected_item
+        )
+        if evicted:
             self.performance.increment(
-                "workspace_cache_evictions"
+                "workspace_cache_evictions", len(evicted)
             )
         self._update_runtime_cache_metrics()
+
+    def _runtime_preview_context(
+        self, item: ImageWorkItem
+    ) -> PreviewCacheContext:
+        return PreviewCacheContext(
+            preview_quality=self.preview_quality_var.get(),
+            preview_max_side=self.preview_max_side,
+            backend_cache_key=self.pipeline.backend_cache_key,
+            input_revision=item.input_revision,
+            image_identity=id(item.loaded.image),
+            pipeline_snapshot=item.pipeline_snapshot,
+        )
 
     def _runtime_preview_is_valid(
         self, item: ImageWorkItem
     ) -> bool:
-        state = item.runtime_preview
-        if state is None:
-            return False
-        return (
-            state.preview_quality == self.preview_quality_var.get()
-            and state.preview_max_side == self.preview_max_side
-            and state.backend_cache_key
-            == self.pipeline.backend_cache_key
-            and state.input_revision == item.input_revision
-            and state.image_identity == id(item.loaded.image)
-            and state.pipeline_snapshot == item.pipeline_snapshot
-            and bool(state.results)
-            and state.pipeline_cache.get("results") is not None
+        return self.runtime_preview_cache_policy.is_valid(
+            item.runtime_preview,
+            self._runtime_preview_context(item),
         )
 
     def _cache_current_runtime_preview(
@@ -5066,11 +5512,10 @@ class ISPApplication:
         ):
             return
         item = self.work_items[self.current_image_index]
-        self.runtime_cache_clock += 1
         processed_snapshot = self.pipeline_cache.get("snapshot")
         if not isinstance(processed_snapshot, list):
             processed_snapshot = self.pipeline.snapshot()
-        item.runtime_preview = RuntimePreviewState(
+        state = RuntimePreviewState(
             preview_quality=self.preview_quality_var.get(),
             preview_max_side=self.preview_max_side,
             backend_cache_key=self.pipeline.backend_cache_key,
@@ -5081,27 +5526,37 @@ class ISPApplication:
             input_revision=self.input_revision,
             image_identity=id(self.loaded.image),
             memory_bytes=max(0, int(memory_bytes)),
-            last_used=self.runtime_cache_clock,
+            last_used=0,
+        )
+        evicted = self.runtime_preview_cache_policy.put(
+            item,
+            state,
+            self.work_items,
+            protected_item=item,
         )
         item.input_revision = self.input_revision
         item.preview_shape = tuple(self.preview_image.shape[:2])
-        self._trim_runtime_preview_cache(protected_item=item)
+        if evicted:
+            self.performance.increment(
+                "workspace_cache_evictions", len(evicted)
+            )
+        self._update_runtime_cache_metrics()
 
     def _restore_runtime_preview(
         self, item: ImageWorkItem
     ) -> bool:
-        if not self._runtime_preview_is_valid(item):
-            if item.runtime_preview is not None:
-                item.runtime_preview = None
+        lookup = self.runtime_preview_cache_policy.lookup(
+            item, self._runtime_preview_context(item)
+        )
+        if lookup.status != CACHE_HIT:
+            if lookup.status == CACHE_INVALID:
                 self.performance.increment(
                     "workspace_cache_invalidations"
                 )
             self.performance.increment("workspace_cache_misses")
             self._update_runtime_cache_metrics()
             return False
-        state = item.runtime_preview
-        self.runtime_cache_clock += 1
-        state.last_used = self.runtime_cache_clock
+        state = lookup.state
         self.preview_image = state.preview_image
         self.pipeline_cache = dict(state.pipeline_cache)
         self.results = list(state.results)
@@ -5112,11 +5567,9 @@ class ISPApplication:
         return True
 
     def clear_runtime_preview_cache(self) -> None:
-        count = 0
-        for item in self.work_items:
-            if item.runtime_preview is not None:
-                item.runtime_preview = None
-                count += 1
+        count = self.runtime_preview_cache_policy.clear(
+            self.work_items
+        )
         yuv_count = len(self.yuv_request_cache)
         self.yuv_request_cache.clear()
         self.performance.increment(
@@ -5144,27 +5597,22 @@ class ISPApplication:
             return
         self._sync_active_roi_to_list()
         item = self.work_items[self.current_image_index]
-        item.loaded = self.loaded
-        item.pipeline_snapshot = copy.deepcopy(
-            self.pipeline.snapshot()
+        state = self.workspace_state_controller.capture(
+            loaded=self.loaded,
+            pipeline_snapshot=self.pipeline.snapshot(),
+            calibration_session=self.calibration_session,
+            rois=self.rois,
+            active_roi_index=self.active_roi_index,
+            roi_grid_bounds=self.roi_grid_bounds,
+            roi_grid_rows=self.roi_grid_rows,
+            roi_grid_cols=self.roi_grid_cols,
+            roi_grid_inset=self.roi_grid_inset,
+            manual_parameter_snapshots=self.manual_parameter_snapshots,
+            manual_dirty_modules=tuple(self.manual_dirty_modules),
+            preview_shape=tuple(self.preview_image.shape[:2]),
+            input_revision=self.input_revision,
         )
-        item.calibration_session = copy.deepcopy(
-            self.calibration_session
-        )
-        item.rois = list(self.rois)
-        item.active_roi_index = self.active_roi_index
-        item.roi_grid_bounds = self.roi_grid_bounds
-        item.roi_grid_rows = self.roi_grid_rows
-        item.roi_grid_cols = self.roi_grid_cols
-        item.roi_grid_inset = self.roi_grid_inset
-        item.manual_parameter_snapshots = copy.deepcopy(
-            self.manual_parameter_snapshots
-        )
-        item.manual_dirty_modules = sorted(
-            self.manual_dirty_modules
-        )
-        item.preview_shape = tuple(self.preview_image.shape[:2])
-        item.input_revision = self.input_revision
+        self.workspace_state_controller.store(item, state)
 
     def _activate_work_item(self, index: int) -> None:
         if not (0 <= index < len(self.work_items)):
@@ -5186,30 +5634,42 @@ class ISPApplication:
         if self.roi_editor is not None and self.roi_editor.winfo_exists():
             self.roi_editor.destroy()
         item = self.work_items[index]
-        stored_preview_shape = item.preview_shape
+        state = self.workspace_state_controller.activation(item)
+        stored_preview_shape = state.preview_shape
         self.current_image_index = index
-        self.loaded = item.loaded
+        self.loaded = state.loaded
+        if (
+            self.pixel_inspector_window is not None
+            and self.pixel_inspector_window.winfo_exists()
+        ):
+            self.pixel_inspector_window.on_image_changed()
+        self.line_profile_start = None
+        self.line_profile_end = None
+        self.canvas_gestures.cancel_all()
+        if (
+            self.line_profile_window is not None
+            and self.line_profile_window.winfo_exists()
+        ):
+            self.line_profile_window.on_image_changed()
         self.pipeline.load_snapshot(
-            copy.deepcopy(item.pipeline_snapshot)
+            state.pipeline_snapshot
         )
-        self.calibration_session = copy.deepcopy(
-            item.calibration_session
-        )
+        self.calibration_session = state.calibration_session
         if (
             self.calibration_workspace is not None
             and self.calibration_workspace.winfo_exists()
         ):
             self.calibration_workspace.refresh_session()
-        self.rois = list(item.rois)
-        self.active_roi_index = item.active_roi_index
-        self.roi = item.active_roi()
-        self.roi_grid_bounds = item.roi_grid_bounds
-        self.roi_grid_rows = item.roi_grid_rows
-        self.roi_grid_cols = item.roi_grid_cols
-        self.roi_grid_inset = item.roi_grid_inset
+        self.rois = state.rois
+        self.active_roi_index = state.active_roi_index
+        self.roi = state.active_roi
+        self.roi_grid_bounds = state.roi_grid_bounds
+        self.roi_grid_rows = state.roi_grid_rows
+        self.roi_grid_cols = state.roi_grid_cols
+        self.roi_grid_inset = state.roi_grid_inset
         self.calibration_polygons = []
         self.roi_process_var.set(False)
-        self.input_revision = item.input_revision
+        self.input_revision = state.input_revision
         self.pipeline_cache = {}
         self.render_cache.clear()
         restored_from_cache = self._restore_runtime_preview(item)
@@ -5222,9 +5682,9 @@ class ISPApplication:
             item.preview_shape = tuple(self.preview_image.shape[:2])
             self.results = []
         self.fit_mode = True
-        if item.manual_parameter_snapshots:
-            self.manual_parameter_snapshots = copy.deepcopy(
-                item.manual_parameter_snapshots
+        if state.manual_parameter_snapshots:
+            self.manual_parameter_snapshots = (
+                state.manual_parameter_snapshots
             )
             for module in self.pipeline.modules:
                 self.manual_parameter_snapshots.setdefault(
@@ -5232,7 +5692,7 @@ class ISPApplication:
                     self._module_edit_snapshot(module),
                 )
             self.manual_dirty_modules = set(
-                item.manual_dirty_modules
+                state.manual_dirty_modules
             )
             self._update_manual_action_state()
         else:
@@ -5336,7 +5796,8 @@ class ISPApplication:
                 else "裸 RAW 元数据"
             )
             metadata = ask_raw_metadata(
-                self.root, copy.deepcopy(self.loaded.metadata), title
+                self.root, copy.deepcopy(self.loaded.metadata), title,
+                tr=self.tr,
             )
             if metadata is None:
                 return
@@ -5351,6 +5812,7 @@ class ISPApplication:
                 self.root,
                 yuv_paths[0],
                 copy.deepcopy(self.last_yuv_metadata),
+                tr=self.tr,
             )
             if yuv_metadata is None:
                 return
@@ -5525,7 +5987,8 @@ class ISPApplication:
             self.edit_yuv_metadata()
             return
         metadata = ask_raw_metadata(
-            self.root, copy.deepcopy(self.loaded.metadata), "查看 / 编辑 RAW 元数据"
+            self.root, copy.deepcopy(self.loaded.metadata),
+            "查看 / 编辑 RAW 元数据", tr=self.tr,
         )
         if metadata is None:
             return
@@ -5564,6 +6027,7 @@ class ISPApplication:
             self.root,
             self.loaded.source_path,
             copy.deepcopy(self.loaded.yuv_metadata),
+            tr=self.tr,
         )
         if metadata is None:
             return
@@ -5580,18 +6044,33 @@ class ISPApplication:
         if self.loaded.domain == "yuv":
             metadata = self.loaded.yuv_metadata
             self.status_var.set(
-                f"Image {self.current_image_index + 1}/{len(self.work_items)} · "
-                f"YUV {metadata.pixel_format} · {metadata.width}×{metadata.height} · "
-                f"{metadata.bit_depth} bit · {metadata.color_matrix} · "
-                f"{metadata.color_range} · Frame "
-                f"{metadata.frame_index + 1}/{metadata.frame_count}"
+                self.tr(
+                    "status.yuv_image",
+                    index=self.current_image_index + 1,
+                    count=len(self.work_items),
+                    format=metadata.pixel_format,
+                    width=metadata.width,
+                    height=metadata.height,
+                    depth=metadata.bit_depth,
+                    matrix=metadata.color_matrix,
+                    range=metadata.color_range,
+                    frame=metadata.frame_index + 1,
+                    frames=metadata.frame_count,
+                )
             )
             return
         meta = self.loaded.metadata
         self.status_var.set(
-            f"Image {self.current_image_index + 1}/{len(self.work_items)} · "
-            f"{self.loaded.description} · {meta.width}×{meta.height} · "
-            f"{meta.bit_depth} bit · {meta.bayer_pattern}"
+            self.tr(
+                "status.raw_image",
+                index=self.current_image_index + 1,
+                count=len(self.work_items),
+                description=self.loaded.description,
+                width=meta.width,
+                height=meta.height,
+                depth=meta.bit_depth,
+                pattern=meta.bayer_pattern,
+            )
         )
 
     def save_pipeline_config(self) -> None:
@@ -5659,6 +6138,7 @@ class ISPApplication:
                 "performance_details_visible": False,
                 "ui_scale": self.ui_scale,
                 "ui_scale_mode": self.ui_scale_var.get(),
+                "language": self.language_controller.language,
                 "preview_quality": self.preview_quality_var.get(),
                 "processing_backend": (
                     self.backend_preference_var.get()
@@ -5747,6 +6227,14 @@ class ISPApplication:
                         lsc_module.set_mesh(self.calibration_session.lsc_mesh)
             ui_state = data.get("ui_state", {})
             self.loaded_ui_state = copy.deepcopy(ui_state)
+            if self.language_controller.restore_from_ui_state(
+                ui_state, persist=True
+            ):
+                self.language_var.set(
+                    self.language_controller.language
+                )
+                self._build_menu()
+                self._refresh_language()
             self.last_directory = str(
                 ui_state.get("last_directory") or Path(path).parent
             )
@@ -5878,7 +6366,9 @@ class ISPApplication:
                 3.0,
             ))
             self.preview_brightness_label.configure(
-                text=f"预览 {self.preview_exposure_ev:+.1f} EV"
+                text=self.tr(
+                    "toolbar.preview_ev", ev=self.preview_exposure_ev
+                )
             )
             requested_mode = str(
                 ui_state.get("adjustment_mode", "manual")
@@ -6110,9 +6600,13 @@ class ISPApplication:
             if artifact_name != "Main Output" and artifact_name in result.artifacts:
                 image = artifact_to_rgb(artifact_name, result.artifacts[artifact_name])
                 domain = "rgb"
+                data_state = None
             else:
                 image, domain = result.image, result.domain
-            export_image(path, image, domain, self.loaded.metadata)
+                data_state = result.data_state
+            export_image(
+                path, image, domain, self.loaded.metadata, data_state
+            )
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc), parent=self.root)
             return
@@ -6130,9 +6624,11 @@ class ISPApplication:
         if artifact_name != "Main Output" and artifact_name in result.artifacts:
             source = artifact_to_rgb(artifact_name, result.artifacts[artifact_name])
             domain = "rgb"
+            data_state = None
         else:
             source = result.image
             domain = result.domain
+            data_state = result.data_state
         if not self.roi_process_var.get() and source.shape[:2] == self.preview_image.shape[:2]:
             ys, xs = self.roi.slices()
             source = source[ys, xs]
@@ -6145,7 +6641,9 @@ class ISPApplication:
         if not path:
             return
         try:
-            export_image(path, source, domain, self.loaded.metadata)
+            export_image(
+                path, source, domain, self.loaded.metadata, data_state
+            )
         except Exception as exc:
             messagebox.showerror("导出 ROI 失败", str(exc), parent=self.root)
             return
@@ -6154,26 +6652,19 @@ class ISPApplication:
 
     def show_about(self) -> None:
         messagebox.showinfo(
-            "关于",
-            "ISP RAW Visual Simulator 0.4.23\n\n"
-            "用于 RAW ISP 模块仿真和裸 YUV 逐帧预览。\n"
-            f"当前计算后端：{self.pipeline.backend.name}\n"
-            "内部使用 float32；当前不保证与硬件 ISP 逐位一致。",
+            self.tr("about.title"),
+            self.tr(
+                "about.body", backend=self.pipeline.backend.name
+            ),
             parent=self.root,
         )
 
     def close(self) -> None:
-        self.generation += 1
+        self._closing = True
+        self.canvas_gestures.cancel_all()
+        self.preview_requests.close()
         self.analysis_generation += 1
         self.import_generation += 1
-        if self.pipeline_cancel_event is not None:
-            self.pipeline_cancel_event.set()
-        if self.pending_after:
-            try:
-                self.root.after_cancel(self.pending_after)
-            except tk.TclError:
-                pass
-            self.pending_after = None
         for attr in (
             "analysis_pending_after",
             "canvas_resize_after",
@@ -6188,12 +6679,6 @@ class ISPApplication:
                 except tk.TclError:
                     pass
                 setattr(self, attr, None)
-        for after_id in tuple(self.poll_after_ids):
-            try:
-                self.root.after_cancel(after_id)
-            except tk.TclError:
-                pass
-        self.poll_after_ids.clear()
         for after_id in tuple(self.analysis_poll_after_ids):
             try:
                 self.root.after_cancel(after_id)
@@ -6215,8 +6700,26 @@ class ISPApplication:
             and self.histogram_window.winfo_exists()
         ):
             self.histogram_window.close()
+        if (
+            self.pixel_inspector_window is not None
+            and self.pixel_inspector_window.winfo_exists()
+        ):
+            self.pixel_inspector_window.close()
+        if (
+            self.line_profile_window is not None
+            and self.line_profile_window.winfo_exists()
+        ):
+            self.line_profile_window.close()
         self.toast.close()
         self.wheel_router.close()
+        for control in tuple(self.parameter_controls.values()):
+            try:
+                if control.winfo_exists():
+                    control.destroy()
+            except tk.TclError:
+                pass
+        self.parameter_controls.clear()
+        self.param_vars.clear()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.analysis_executor.shutdown(wait=False, cancel_futures=True)
         self.io_executor.shutdown(wait=False, cancel_futures=True)

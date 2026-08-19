@@ -5,13 +5,20 @@ from typing import Dict, Optional
 import numpy as np
 
 from ..bayer import channel_positions, split_planes
-from ..models import AWBResult, ISPError, ImageROI, RawMetadata
+from ..models import (
+    AWBResult,
+    ISPError,
+    ImageROI,
+    RawMetadata,
+    StageDataState,
+)
 
 
 def _prepare_bayer(
     image: np.ndarray,
     metadata: RawMetadata,
     roi: Optional[ImageROI],
+    data_state: Optional[StageDataState] = None,
 ) -> np.ndarray:
     src = np.asarray(image, dtype=np.float32)
     if src.ndim != 2:
@@ -20,11 +27,18 @@ def _prepare_bayer(
         roi = roi.align_for_bayer(src.shape)
         ys, xs = roi.slices()
         src = src[ys, xs]
-    # BLC/LSC output is normalized, but strong LSC gains may legitimately
-    # exceed 2.0. Detect DN input conservatively and normalize each CFA plane
-    # with its own black level instead of subtracting a four-channel average.
-    high_value = float(np.percentile(src, 99.9)) if src.size else 0.0
-    if metadata.white_level > 8.0 and high_value > 8.0:
+    # The active UI always supplies the stage contract.  The conservative
+    # percentile fallback is retained only for callers of the legacy public
+    # API that do not yet carry StageDataState.
+    is_dn = (
+        not data_state.normalized
+        if data_state is not None
+        else (
+            metadata.white_level > 8.0
+            and (float(np.percentile(src, 99.9)) if src.size else 0.0) > 8.0
+        )
+    )
+    if is_dn:
         normalized = np.empty_like(src)
         black_levels = dict(zip(
             ("R", "Gr", "Gb", "B"), metadata.black_level
@@ -50,8 +64,9 @@ def estimate_awb(
     gain_limit: float = 8.0,
     shades_p: float = 6.0,
     neutral_tolerance: float = 0.18,
+    data_state: Optional[StageDataState] = None,
 ) -> AWBResult:
-    src = _prepare_bayer(bayer_image, metadata, roi)
+    src = _prepare_bayer(bayer_image, metadata, roi, data_state)
     planes = split_planes(src, metadata.bayer_pattern)
     stacked = np.stack([planes[name] for name in ("R", "Gr", "Gb", "B")], axis=-1)
     green_plane = 0.5 * (stacked[:, :, 1] + stacked[:, :, 2])

@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.4.33
+
+- 新增 `PreviewResultApplicationController`，抽离完成 Future 的状态决策和 RAW/YUV Payload 合同验证。
+- 明确 wait、stale、cancelled、apply 四类结果，过期与取消路径不再进入通用异常弹窗。
+- RAW 结果验证非空 StageResult；YUV 结果验证 Frame、Conversion、Results、Metrics 和必要属性。
+- YUV Cache Write Key 成为标准化 Payload 的显式字段，缓存命中不会重复写回。
+- 主窗口新增单一 Prepared Payload 应用边界，后续性能统计统一读取已验证 Metrics。
+- 新增决策优先级、RAW/YUV 合同、非法 Payload 和缓存授权测试。
+
+## 0.4.32
+
+- 新增 `WorkItemEditableState` 与 `WorkspaceItemStateController`，集中管理工作图可编辑状态复制。
+- 主窗口的 `_store_current_work_item` 与激活数据读取迁移到统一状态边界。
+- Pipeline、Calibration、Manual Snapshot 使用深拷贝，Loaded Image 保持引用，避免无意义的大图复制。
+- 保存状态时保留 Runtime Preview Cache；激活 Payload 与原 Work Item 隔离，防止跨图参数串改。
+- Active ROI、Grid 尺寸和 Input Revision 在捕获阶段标准化。
+- 新增状态捕获、隔离、缓存保留和主窗口兼容测试。
+
+## 0.4.31
+
+- 新增纯策略 `WorkspacePreviewCachePolicy` 及上下文、查询结果和汇总数据结构。
+- 从主窗口抽离 Runtime Preview 有效性判断、单调访问时钟、确定性 LRU 和内存预算淘汰。
+- 缓存查询区分 hit、miss、invalid，失效项由策略层立即释放，性能计数由 UI 边界统一记录。
+- 当前工作图作为 protected entry；策略优先淘汰其他图，允许不可避免的单图超预算状态。
+- 后端切换与手动清理复用统一释放接口，同时保留旧缓存配置属性兼容性。
+- 新增策略汇总、容量、预算、protected、lookup、put、clear 和 UI 属性代理测试。
+
+## 0.4.30
+
+- 新增纯状态机 `CanvasGestureCoordinator`，集中管理主画布 Armed/Active/Start/Current 状态。
+- 明确 Gray Picker、Compare Divider、Line Profile、ROI 和 Compare Body 的统一优先级。
+- 主窗口按下、拖动、释放和光标选择迁移到协调器仲裁，几何计算与渲染行为保持不变。
+- 切换图像和关闭应用时统一取消待执行及活动手势，避免跨图拖动状态残留。
+- 为旧手势属性提供兼容代理，现有子窗口及调用方无需同步迁移。
+- 新增状态机优先级、一次性测量、光标、取消、ROI 集成和兼容属性测试。
+
+## 0.4.29
+
+- 在统一采样层新增 `LineProfile` 与无 UI 依赖的 Bayer/RGB/YUV 沿线绝对码值采样。
+- 新增单例非模态 `Line Profile` 窗口，支持 Output 实线、可选 Input 虚线、动态通道和悬停读数。
+- 主画布新增显式、一次性的绘线模式；它与 ROI 绘制互斥，并保持 Compare 分割线手势优先。
+- 测量线随阶段和参数变化重新采样，切换图像或关闭窗口时清除，且不会触发 ISP 重算。
+- 长剖面在 UI 绘制阶段限制为约2048点，完整采样数据与绝对码值不受影响。
+- 新增 RGB 越界、Bayer CFA 相位、YUV 原生码值、窗口生命周期和手势冲突回归测试。
+
+## 0.4.28
+
+- 新增 UI 无关的 `ImageCoordinateMapper` 与 `PixelSamplingService`，统一 Bayer/RGB/YUV 坐标和绝对码值解释。
+- 新增非模态 `Pixel Inspector`，支持鼠标跟随、5×5/7×7邻域、通道统计、绝对码值网格及最多16个固定点。
+- Bayer 邻域保持 R/Gr/Gb/B CFA 相位；RGB 保留负值/溢出计算码值；YUV 使用原生 Y/U/V Source Code。
+- 固定点在模块阶段或参数结果变化后重新采样，切换工作图像时安全清空。
+- 主状态栏迁移到统一采样服务，保留原有 RAW DN、RGB裁剪前、显示RGB和YUV状态文本契约。
+- Pixel Inspector 仅从下拉菜单打开，缩放、平移和采样不会提交 ISP 请求。
+
+## 0.4.27
+
+- 抽离 `PreviewRequestCoordinator`，统一负责主预览的 debounce、Generation、协作取消、Future 生命周期和 Tk 轮询回调。
+- 快速连续参数请求保持 latest-wins；旧 Generation 的 Future 不再持续轮询到完成。
+- 关闭应用时由控制器一次性取消待提交请求、活动任务和全部预览轮询回调。
+- 主窗口保留原有预览状态属性作为兼容代理，避免结构迁移改变 UI 和历史调用方。
+- 新增请求合并、显式取消、旧结果拒绝、轮询清理和关闭行为测试。
+
+## 0.4.26
+
+- 建立四种 Bayer Pattern、六个流水线阶段的量化 Golden Output 基线与独立验证命令。
+- 性能基准新增 JSON 输出，记录运行环境、后端、冷流水线、CCM 增量刷新及逐模块中位耗时，并修复旧的未定义参数输出错误。
+- 新增无 Tk 依赖的 `YUVPreviewController`，将缓存键、帧读取、YUV 转换与阶段构造从主窗口移出。
+- 新增 `LanguageController`，集中管理语言选择、回退、UI 状态恢复和偏好持久化。
+- 新增 V0.4.26 工程基线和 Controller 回归测试；UI、ISP 参数与输出行为保持不变。
+
+## 0.4.25
+
+- 新增集中式 `isp_tool/i18n` 翻译层，支持简体中文、English、默认语言回退和动态参数插值。
+- 顶部菜单新增 `语言 / Language`；运行时更新主菜单、常用工具栏、AWB、状态栏和 Histogram，不提交 ISP 任务。
+- 语言选择保存到用户 UI preferences 及 ISP JSON 的 `ui_state.language`。
+- AWB 右侧面板删除五种方法的常驻原理文字、RAW Bayer 预览说明和 ROI 坐标长提示，保留必要校验错误。
+- 内部继续使用稳定 module ID、method ID 和 Pixel Format，不以翻译后的显示文字执行业务判断。
+- 新增 V0.4.25 国际化与 UI 状态保持测试。
+
+## 0.4.24
+
+- 新增 `StageDataState`，明确区分 Bayer RAW DN、Bayer Linear Normalized、RGB DN 和 RGB Linear Normalized，并记录位深、Black/White Level 及 BLC 状态。
+- 修复 BLC/LSC 关闭后 DN 数据被当作 0～1 直接裁剪，导致后续 Demosaic/CCM 预览全白、全黑或颜色异常的问题。
+- 所有模块关闭时严格保持像素和数值域描述；Demosaic 关闭时 CCM 明确跳过并保留 Bayer Mosaic 最终预览。
+- Demosaic 继承输入尺度，CCM Offset 在 DN 路径按 White Level 换算，预览仅做显示映射，Histogram 和悬停读数保持真实绝对值。
+- AWB/AE 的当前 UI 分析路径使用显式阶段状态，避免强 LSC/WB 增益输出被误判为 DN。
+- 右侧数值参数重构为统一 `ParameterControl`，增强拖动热区、精确输入、step 对齐、键盘微调、复位和最新请求节流。
+- 统一增强深色 Combobox 箭头、焦点、悬停、按下与禁用样式。
+- 新增五模块 32 种启用组合与参数控件回归测试。
+
 ## 0.4.23
 
 - Histogram 从主界面底部抽屉迁移为单例非模态窗口，关闭后可从工具栏或预览菜单再次打开。

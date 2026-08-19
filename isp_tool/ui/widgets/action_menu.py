@@ -69,6 +69,12 @@ class ActionMenu(ttk.Menubutton):
     def add_cascade(self, label: str, submenu: tk.Menu) -> None:
         self.menu.add_cascade(label=label, menu=submenu)
 
+    def set_text(self, text: str) -> None:
+        self.configure(text=f"{text} ▾")
+
+    def set_item_label(self, index: int, label: str) -> None:
+        self.menu.entryconfigure(index, label=label)
+
     def refresh_states(self) -> None:
         for index, predicate in self._dynamic:
             try:

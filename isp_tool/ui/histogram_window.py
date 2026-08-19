@@ -37,7 +37,7 @@ class HistogramWindow(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("Histogram")
+        self.title(self.tr("hist.title"))
         self.minsize(680, 360)
         geometry = str(getattr(app, "histogram_window_geometry", ""))
         self.geometry(geometry or "860x440")
@@ -61,11 +61,28 @@ class HistogramWindow(tk.Toplevel):
         self.roi_var = tk.BooleanVar(
             value=bool(getattr(app, "histogram_use_roi", True))
         )
-        self.title_var = tk.StringVar(value="Histogram · 等待图像")
-        self.summary_var = tk.StringVar(value="等待当前模块输出")
+        self.title_var = tk.StringVar(
+            value=self.tr("hist.waiting_title")
+        )
+        self.summary_var = tk.StringVar(value=self.tr("hist.waiting"))
         self.hover_var = tk.StringVar(value="")
         self._build()
         self.refresh(0)
+
+    def tr(self, key: str, **values) -> str:
+        return self.app.tr(key, **values)
+
+    def refresh_language(self) -> None:
+        self.title(self.tr("hist.title"))
+        self.y_axis_label.configure(text=self.tr("hist.axis"))
+        if self.app.results:
+            result = self.app.results[self._module_result_index()]
+            self.title_var.set(f"Histogram · {result.name}")
+        else:
+            self.title_var.set(self.tr("hist.waiting_title"))
+            self.summary_var.set(self.tr("hist.waiting"))
+        if self.last_payload is not None:
+            self._redraw()
 
     def _build(self) -> None:
         toolbar = ttk.Frame(self, padding=(10, 8))
@@ -90,7 +107,10 @@ class HistogramWindow(tk.Toplevel):
         )
         self.scale_combo.pack(side="right")
         self.scale_combo.bind("<<ComboboxSelected>>", self._scale_changed)
-        ttk.Label(toolbar, text="纵轴").pack(side="right", padx=(8, 4))
+        self.y_axis_label = ttk.Label(
+            toolbar, text=self.tr("hist.axis")
+        )
+        self.y_axis_label.pack(side="right", padx=(8, 4))
 
         self.canvas = tk.Canvas(
             self,
@@ -164,7 +184,7 @@ class HistogramWindow(tk.Toplevel):
     def _channel_changed(self, changed: str) -> None:
         if not self._enabled_channels():
             self.channel_vars[changed].set(True)
-            self.summary_var.set("至少保留一个通道")
+            self.summary_var.set(self.tr("hist.keep_channel"))
             return
         self.refresh(0)
 
@@ -223,11 +243,11 @@ class HistogramWindow(tk.Toplevel):
             frame = self.app.loaded.yuv_frame
             conversion = self.app.loaded.yuv_conversion
             if frame is None or conversion is None:
-                self.summary_var.set("等待 YUV 解码结果")
+                self.summary_var.set(self.tr("hist.waiting_yuv"))
                 return
             args = (
                 "yuv", frame, np.asarray(conversion.rgb, np.float32),
-                metadata, False, roi, channels,
+                metadata, False, roi, channels, None,
             )
         else:
             image = np.asarray(result.image, np.float32)
@@ -244,16 +264,18 @@ class HistogramWindow(tk.Toplevel):
             )
             args = (
                 domain, image, None, metadata, normalized, None, channels,
+                result.data_state,
             )
         if self.future is not None and not self.future.done():
             self.future.cancel()
-        self.summary_var.set("正在统计当前模块…")
+        self.summary_var.set(self.tr("hist.computing"))
         self.future = self.app.analysis_executor.submit(self._compute, *args)
         self._poll(self.future, generation, key)
 
     @staticmethod
     def _compute(
-        domain, image_or_frame, rgb, metadata, normalized, roi, channels
+        domain, image_or_frame, rgb, metadata, normalized, roi, channels,
+        data_state,
     ):
         started = time.perf_counter()
         if domain == "yuv":
@@ -270,6 +292,7 @@ class HistogramWindow(tk.Toplevel):
                 metadata,
                 mode="RGB Overlay",
                 bayer_normalized=normalized,
+                data_state=data_state,
             )
         payload["curves"] = {
             key: value for key, value in payload["curves"].items()
@@ -299,7 +322,7 @@ class HistogramWindow(tk.Toplevel):
         try:
             payload, elapsed_ms = future.result()
         except Exception as exc:
-            self.summary_var.set(f"Histogram 失败：{exc}")
+            self.summary_var.set(self.tr("hist.failed", error=exc))
             return
         payload["elapsed_ms"] = elapsed_ms
         self.cache[key] = payload
@@ -381,10 +404,12 @@ class HistogramWindow(tk.Toplevel):
             anchor="nw", fill=COLORS["muted"], font=FONTS["small"],
         )
         stats = payload["stats"]
-        summary = (
-            f"暗部 {stats['dark_ratio'] * 100:.2f}% · "
-            f"高光 {stats['highlight_ratio'] * 100:.2f}% · "
-            f"Min {stats['minimum']:.0f} · Max {stats['maximum']:.0f}"
+        summary = self.tr(
+            "hist.summary",
+            dark=stats["dark_ratio"] * 100,
+            highlight=stats["highlight_ratio"] * 100,
+            minimum=stats["minimum"],
+            maximum=stats["maximum"],
         )
         if stats["underflow_ratio"] or stats["overflow_ratio"]:
             summary += (
@@ -392,9 +417,13 @@ class HistogramWindow(tk.Toplevel):
                 f" · >{code_max} {stats['overflow_ratio'] * 100:.2f}%"
             )
         if markers:
-            summary += " · 虚线=Limited 合法范围"
+            summary += " · " + self.tr("hist.legal")
         if self.roi_var.get():
-            summary += " · ROI" if self.app.roi is not None else " · ROI 未选择"
+            summary += (
+                " · ROI"
+                if self.app.roi is not None
+                else " · " + self.tr("hist.roi_missing")
+            )
         summary += f" · {payload.get('elapsed_ms', 0.0):.1f} ms"
         self.summary_var.set(summary)
         self.plot_bounds = (left, top, right, bottom)
@@ -419,7 +448,11 @@ class HistogramWindow(tk.Toplevel):
             total = max(1, int(payload["curve_sizes"].get(key, 0)))
             values.append(f"{key} {count:,} ({count / total * 100:.2f}%)")
         self.hover_var.set(
-            f"码值 {edges[index]:.0f}…{edges[index + 1]:.0f} · "
+            self.tr(
+                "hist.code_range",
+                low=edges[index],
+                high=edges[index + 1],
+            ) + " · "
             + " · ".join(values)
         )
         self.canvas.delete("hist_cursor")

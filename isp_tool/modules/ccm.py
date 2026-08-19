@@ -43,12 +43,18 @@ class ColorCorrectionMatrix(ISPModule):
             self.parameters["offset_g"],
             self.parameters["offset_b"],
         ], np.float32)
+        data_state = getattr(metadata, "_stage_data_state", None)
+        offset_scale = (
+            1.0
+            if data_state is None or data_state.normalized
+            else max(float(data_state.white_level), 1.0)
+        )
         strength = float(self.parameters["strength"])
         effective_matrix = (
             np.eye(3, dtype=np.float32) * (1.0 - strength)
             + matrix * strength
         )
-        effective_offset = offset * strength
+        effective_offset = offset * (strength * offset_scale)
         if (
             np.array_equal(effective_matrix, np.eye(3, dtype=np.float32))
             and not np.any(effective_offset)
@@ -58,11 +64,17 @@ class ColorCorrectionMatrix(ISPModule):
             output = cv2.transform(src, effective_matrix)
             if np.any(effective_offset):
                 output = output + effective_offset
+        range_max = (
+            1.0
+            if data_state is None or data_state.normalized
+            else max(float(data_state.white_level), 1.0)
+        )
         out_of_range = (
             np.count_nonzero(output < 0)
-            + np.count_nonzero(output > 1)
+            + np.count_nonzero(output > range_max)
         ) / max(output.size, 1)
         return output.astype(np.float32, copy=False), "rgb", {
             "矩阵行列式": float(np.linalg.det(matrix)),
             "输出越界比例": float(out_of_range),
+            "Offset Scale": float(offset_scale),
         }

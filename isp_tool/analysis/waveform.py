@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from ..models import RawMetadata
+from ..models import RawMetadata, StageDataState
 from ..preview import bayer_cell_rgb, display_rgb
 
 
@@ -30,14 +30,20 @@ def compute_waveform(
     mode: str = "RGB Overlay",
     width: int = 512,
     height: int = 256,
+    data_state: StageDataState | None = None,
 ) -> np.ndarray:
     """Return a display-ready float RGB waveform image in [0, 1]."""
     width = max(48, int(width))
     height = max(32, int(height))
     rgb = (
-        bayer_cell_rgb(image, metadata)
+        bayer_cell_rgb(
+            image, metadata,
+            already_normalized=(
+                data_state.normalized if data_state is not None else None
+            ),
+        )
         if domain == "bayer"
-        else display_rgb(image, domain, metadata)
+        else display_rgb(image, domain, metadata, data_state=data_state)
     )
     if mode == "Luma":
         y = np.sum(rgb * np.array([0.2126, 0.7152, 0.0722], np.float32), axis=2)
