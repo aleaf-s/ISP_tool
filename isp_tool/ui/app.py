@@ -23,6 +23,7 @@ from ..backends import (
 )
 from ..bayer import resize_bayer_preview
 from ..calibration.awb import estimate_awb
+from ..calibration.colorchecker import generate_colorchecker_grid
 from ..analysis import (
     compute_histogram_details,
     compute_statistics,
@@ -87,12 +88,18 @@ from .controllers import (
     ACTION_CANCELLED,
     ACTION_STALE,
     ACTION_WAIT,
+    AnalysisRequestCoordinator,
+    AnalysisResultApplicationController,
     CanvasGestureCoordinator,
     GESTURE_COMPARE,
+    GESTURE_COLORCHECKER,
     GESTURE_GRAY_PICK,
     GESTURE_LINE_PROFILE,
     GESTURE_NONE,
     GESTURE_ROI,
+    ImportFailure,
+    ImportRequestCoordinator,
+    ImportResultApplicationController,
     LanguageController,
     PreviewRequestCoordinator,
     PreviewResultApplicationController,
@@ -103,7 +110,11 @@ from .dpi import enable_process_dpi_awareness
 from .final_preview import FinalImpactWindow
 from .histogram_window import HistogramWindow
 from .line_profile_window import LineProfileWindow
-from .performance_metrics import PerformanceMetrics
+from .performance_metrics import (
+    PerformanceMetrics,
+    estimate_ndarray_bytes,
+)
+from .performance_monitor import PerformanceMonitorWindow
 from .pixel_inspector import PixelInspectorWindow
 from .render_cache import RenderCache
 from .roi_editor import MAX_ROI_COUNT, ROIEditor, ask_roi_grid
@@ -112,7 +123,7 @@ from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, ParameterControl, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.33 · Preview Result Application"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.40 · CCM Stability Fix"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,
@@ -150,7 +161,7 @@ BASIC_PARAMETER_KEYS = {
     },
     "color_correction_matrix": {
         "m00", "m01", "m02", "m10", "m11",
-        "m12", "m20", "m21", "m22", "strength",
+        "m12", "m20", "m21", "m22", "input_gain",
     },
 }
 
@@ -182,8 +193,9 @@ class ISPApplication:
             DEFAULT_PREVIEW_QUALITY
         ]
         self.performance_details_visible = False
-        self.performance_window: Optional[tk.Toplevel] = None
-        self.performance_text: Optional[tk.Text] = None
+        self.performance_window: Optional[
+            PerformanceMonitorWindow
+        ] = None
         self.pipeline = ISPPipeline(
             backend_preference=self.backend_preference_var.get()
         )
@@ -219,6 +231,13 @@ class ISPApplication:
         self.histogram_scale = "Log"
         self.histogram_use_roi = True
         self.calibration_polygons = []
+        self.colorchecker_corners = []
+        self.colorchecker_selected_patch = 0
+        self.colorchecker_edit_active = False
+        self.colorchecker_drag_mode = ""
+        self.colorchecker_drag_corner = -1
+        self.colorchecker_drag_start = None
+        self.colorchecker_drag_original = None
         self.preview_image = self.loaded.image
         self.results: List[StageResult] = []
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="isp-preview")
@@ -228,24 +247,32 @@ class ISPApplication:
         self.io_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="isp-import"
         )
-        self.analysis_future: Optional[Future] = None
-        self.import_future: Optional[Future] = None
-        self.import_generation = 0
-        self.import_poll_after: Optional[str] = None
         self.pipeline_cache: Dict[str, object] = {}
         self.yuv_request_cache: Dict[tuple, dict] = {}
         self.yuv_preview_controller = YUVPreviewController()
         self.pixel_sampling_service = PixelSamplingService()
         self.render_cache = RenderCache()
         self.performance = PerformanceMetrics()
+        self.analysis_requests = AnalysisRequestCoordinator(
+            self.root,
+            on_request_superseded=self._record_analysis_task_cancelled,
+            on_result_stale=self._record_analysis_result_stale,
+        )
+        self.analysis_result_application = (
+            AnalysisResultApplicationController()
+        )
+        self.import_requests = ImportRequestCoordinator(
+            self.root,
+            on_request_superseded=self._record_import_task_cancelled,
+            on_result_stale=self._record_import_result_stale,
+        )
+        self.import_result_application = (
+            ImportResultApplicationController()
+        )
         self.preview_requests = PreviewRequestCoordinator(
             self.root,
-            on_request_dropped=lambda: self.performance.increment(
-                "dropped_pipeline_requests"
-            ),
-            on_result_dropped=lambda: self.performance.increment(
-                "dropped_pipeline_results"
-            ),
+            on_request_dropped=self._record_preview_task_cancelled,
+            on_result_dropped=self._record_preview_result_stale,
         )
         self.preview_result_application = (
             PreviewResultApplicationController()
@@ -253,12 +280,9 @@ class ISPApplication:
         self._update_backend_performance_state()
         self.input_revision = 0
         self.result_revision = 0
-        self.analysis_generation = 0
-        self.analysis_pending_after: Optional[str] = None
         self.canvas_resize_after: Optional[str] = None
         self.canvas_overlay_after: Optional[str] = None
         self.view_render_after: Optional[str] = None
-        self.analysis_poll_after_ids: set[str] = set()
         self.photo: Optional[ImageTk.PhotoImage] = None
         self.waveform_photo: Optional[ImageTk.PhotoImage] = None
         self.vectorscope_photo: Optional[ImageTk.PhotoImage] = None
@@ -442,6 +466,60 @@ class ISPApplication:
     def poll_after_ids(self):
         return self.preview_requests.poll_after_ids
 
+    @property
+    def analysis_generation(self) -> int:
+        return self.analysis_requests.generation
+
+    @analysis_generation.setter
+    def analysis_generation(self, value: int) -> None:
+        self.analysis_requests.generation = int(value)
+
+    @property
+    def analysis_pending_after(self):
+        return self.analysis_requests.pending_after
+
+    @analysis_pending_after.setter
+    def analysis_pending_after(self, value) -> None:
+        self.analysis_requests.pending_after = value
+
+    @property
+    def analysis_future(self):
+        return self.analysis_requests.current_future
+
+    @analysis_future.setter
+    def analysis_future(self, value) -> None:
+        self.analysis_requests.current_future = value
+
+    @property
+    def analysis_poll_after_ids(self):
+        return self.analysis_requests.poll_after_ids
+
+    @property
+    def import_generation(self) -> int:
+        return self.import_requests.generation
+
+    @import_generation.setter
+    def import_generation(self, value: int) -> None:
+        self.import_requests.generation = int(value)
+
+    @property
+    def import_future(self):
+        return self.import_requests.current_future
+
+    @import_future.setter
+    def import_future(self, value) -> None:
+        self.import_requests.current_future = value
+
+    @property
+    def import_poll_after(self):
+        return next(iter(self.import_requests.poll_after_ids), None)
+
+    @import_poll_after.setter
+    def import_poll_after(self, value) -> None:
+        self.import_requests.poll_after_ids.clear()
+        if value is not None:
+            self.import_requests.poll_after_ids.add(value)
+
     def _configure_style(self) -> None:
         configure_theme(self.root, self.ui_scale)
 
@@ -554,6 +632,12 @@ class ISPApplication:
         line_profile = getattr(self, "line_profile_window", None)
         if line_profile is not None and line_profile.winfo_exists():
             line_profile.refresh_language()
+        performance_window = getattr(self, "performance_window", None)
+        if (
+            performance_window is not None
+            and performance_window.winfo_exists()
+        ):
+            performance_window.refresh_language()
         if hasattr(self, "status_var"):
             if (
                 self.current_future is not None
@@ -587,10 +671,8 @@ class ISPApplication:
             )
         backend_menu.add_separator()
         backend_menu.add_command(
-            label="后端状态…", command=self.show_backend_status
-        )
-        backend_menu.entryconfigure(
-            "end", label=self.tr("menu.performance")
+            label=self.tr("menu.backend_status"),
+            command=self.show_backend_status,
         )
         return backend_menu
 
@@ -1290,11 +1372,13 @@ class ISPApplication:
         performance_status = tk.Label(
             status_bar, textvariable=self.performance_status_var,
             bg=COLORS["canvas_alt"], fg=MUTED,
-            anchor="e", padx=8, pady=4,
+            anchor="e", padx=8, pady=4, cursor="hand2",
         )
         self.performance_status_label = performance_status
-        if self.expert_mode:
-            performance_status.pack(side="right")
+        performance_status.pack(side="right")
+        performance_status.bind(
+            "<Button-1>", lambda _event: self.show_performance_details()
+        )
 
     @staticmethod
     def _is_text_input(widget) -> bool:
@@ -1464,17 +1548,7 @@ class ISPApplication:
         self._update_performance_status()
 
     def _cancel_analysis_refresh(self) -> None:
-        self.analysis_generation += 1
-        if self.analysis_pending_after is not None:
-            try:
-                self.root.after_cancel(self.analysis_pending_after)
-            except tk.TclError:
-                pass
-            self.analysis_pending_after = None
-            self.performance.increment("dropped_analysis_requests")
-        if self.analysis_future is not None and not self.analysis_future.done():
-            if self.analysis_future.cancel():
-                self.performance.increment("dropped_analysis_requests")
+        self.analysis_requests.cancel(count_superseded=True)
 
     def _restore_main_sashes(self, values) -> None:
         for index, value in enumerate(values):
@@ -1491,7 +1565,8 @@ class ISPApplication:
         self.expert_mode_var.set(False)
         self.stage_selector.pack_forget()
         self.expert_diagnostics_label.pack_forget()
-        self.performance_status_label.pack_forget()
+        if not self.performance_status_label.winfo_manager():
+            self.performance_status_label.pack(side="right")
         if self.loaded.domain == "yuv":
             self._build_yuv_parameter_panel()
         elif self.pipeline.modules:
@@ -1625,9 +1700,151 @@ class ISPApplication:
         self.stage_combo.current(self.selected_module_index + 1)
         self._build_parameter_editor(module)
         self._refresh_auto_summary()
+        self._update_colorchecker_module_overlay()
         if self.results:
             self._update_artifact_choices()
             self.render_current()
+
+    def _ccm_is_selected(self) -> bool:
+        return (
+            self.loaded.domain != "yuv"
+            and 0 <= self.selected_module_index < len(self.pipeline.modules)
+            and self.pipeline.modules[self.selected_module_index].module_id
+            == "color_correction_matrix"
+        )
+
+    def _default_colorchecker_corners(self):
+        height, width = self.preview_image.shape[:2]
+        chart_width = min(width * 0.68, height * 0.68 * 1.5)
+        chart_height = chart_width / 1.5
+        chart_width = max(min(chart_width, width - 4), min(width * 0.35, 300))
+        chart_height = max(min(chart_height, height - 4), min(height * 0.28, 200))
+        x0 = (width - chart_width) / 2.0
+        y0 = (height - chart_height) / 2.0
+        return [
+            (x0, y0),
+            (x0 + chart_width, y0),
+            (x0 + chart_width, y0 + chart_height),
+            (x0, y0 + chart_height),
+        ]
+
+    def _colorchecker_panel(self):
+        if (
+            self.calibration_workspace is not None
+            and self.calibration_workspace.winfo_exists()
+        ):
+            return self.calibration_workspace.auto_panel
+        return None
+
+    def _set_colorchecker_corners(self, corners, *, source=None) -> None:
+        points = [tuple(map(float, point)) for point in corners]
+        # Validation also rejects crossed and degenerate quadrilaterals.
+        rotation = 0
+        if self.calibration_workspace is not None:
+            rotation = int(self.calibration_workspace.ccm_rotation_var.get())
+        columns, rows = ((4, 6) if rotation in {90, 270} else (6, 4))
+        polygons = generate_colorchecker_grid(
+            points, columns=columns, rows=rows
+        )
+        self.colorchecker_corners = points
+        self.calibration_polygons = polygons
+        if self.calibration_workspace is not None:
+            self.calibration_workspace._set_colorchecker_corners(points)
+        panel = self._colorchecker_panel()
+        if panel is not None and source is not None:
+            panel.ccm_region_source = str(source)
+            panel.ccm_detection_confidence = None
+            panel.use_roi_var.set(False)
+            panel._refresh_ccm_source_status()
+
+    def _update_colorchecker_module_overlay(self) -> None:
+        if not self._ccm_is_selected():
+            self.colorchecker_edit_active = False
+            self.calibration_polygons = []
+            return
+        self.colorchecker_edit_active = True
+        # ColorChecker adjustment owns primary-button chart interaction.  ROI
+        # processing is not changed; only ROI drawing is disarmed.
+        if self.roi_mode_var.get():
+            self.roi_mode_var.set(False)
+        corners = self.colorchecker_corners
+        if not corners:
+            corners = self._default_colorchecker_corners()
+            source = "default"
+        else:
+            panel = self._colorchecker_panel()
+            source = panel.ccm_region_source if panel is not None else "corners"
+        try:
+            self._set_colorchecker_corners(corners, source=source)
+        except ISPError:
+            self._set_colorchecker_corners(
+                self._default_colorchecker_corners(), source="default"
+            )
+
+    def _colorchecker_hit_at(self, point):
+        if (
+            not self.colorchecker_edit_active
+            or len(self.colorchecker_corners) != 4
+            or self.roi_process_var.get()
+        ):
+            return None
+        x, y = map(float, point)
+        corners = np.asarray(self.colorchecker_corners, dtype=np.float64)
+        tolerance = max(3.0, 15.0 / max(float(self.zoom), 0.05))
+        distances = np.linalg.norm(corners - (x, y), axis=1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= tolerance:
+            return "corner", nearest
+        contour = corners.astype(np.float32).reshape(-1, 1, 2)
+        if cv2.pointPolygonTest(contour, (x, y), False) >= 0:
+            return "move", -1
+        return None
+
+    def select_colorchecker_patch(self, patch_id: int) -> None:
+        selected = max(0, min(int(patch_id), 24))
+        if selected == self.colorchecker_selected_patch:
+            return
+        self.colorchecker_selected_patch = selected
+        self._schedule_canvas_render()
+
+    def _capture_colorchecker_state(self) -> Dict[str, object]:
+        panel = self._colorchecker_panel()
+        workspace = self.calibration_workspace
+        return {
+            "corners": [list(point) for point in self.colorchecker_corners],
+            "source": panel.ccm_region_source if panel is not None else "",
+            "detection_confidence": (
+                panel.ccm_detection_confidence if panel is not None else None
+            ),
+            "rotation": int(workspace.ccm_rotation_var.get()) if workspace else 0,
+            "flipped": bool(workspace.ccm_flip_var.get()) if workspace else False,
+            "excluded": workspace.ccm_exclude_var.get() if workspace else "",
+            "selected_patch": int(self.colorchecker_selected_patch),
+        }
+
+    def _restore_colorchecker_state(self, state: Dict[str, object]) -> None:
+        values = dict(state or {})
+        self.colorchecker_corners = [
+            tuple(map(float, point))
+            for point in values.get("corners", [])
+            if isinstance(point, (list, tuple)) and len(point) == 2
+        ]
+        self.colorchecker_selected_patch = int(values.get("selected_patch", 0))
+        workspace = self.calibration_workspace
+        panel = self._colorchecker_panel()
+        if workspace is not None:
+            workspace.ccm_rotation_var.set(int(values.get("rotation", 0)))
+            workspace.ccm_flip_var.set(bool(values.get("flipped", False)))
+            workspace.ccm_exclude_var.set(str(values.get("excluded", "")))
+            if self.colorchecker_corners:
+                workspace._set_colorchecker_corners(self.colorchecker_corners)
+        if panel is not None:
+            panel.ccm_region_source = str(values.get("source", ""))
+            confidence = values.get("detection_confidence")
+            panel.ccm_detection_confidence = (
+                None if confidence is None else float(confidence)
+            )
+            panel._refresh_ccm_source_status()
 
     def _build_yuv_parameter_panel(self) -> None:
         metadata = self.loaded.yuv_metadata
@@ -2717,6 +2934,7 @@ class ISPApplication:
                 module.parameters["offset_g"],
                 module.parameters["offset_b"],
             ],
+            "input_gain": module.parameters.get("input_gain", 1.0),
             "strength": module.parameters["strength"],
         }
         Path(path).write_text(
@@ -2739,6 +2957,9 @@ class ISPApplication:
             ):
                 module.parameters[key] = float(value)
             module.parameters["strength"] = float(payload.get("strength", 1.0))
+            module.parameters["input_gain"] = float(
+                payload.get("input_gain", 1.0)
+            )
             self._build_parameter_editor(module)
             self._mark_manual_parameter_state(module)
             self._refresh_module_state()
@@ -2819,6 +3040,18 @@ class ISPApplication:
         self.rois = [scaled(roi) for roi in self.rois]
         if self.roi_grid_bounds is not None:
             self.roi_grid_bounds = scaled(self.roi_grid_bounds)
+        if len(self.colorchecker_corners) == 4:
+            scaled_corners = [
+                (float(x) * scale_x, float(y) * scale_y)
+                for x, y in self.colorchecker_corners
+            ]
+            try:
+                self._set_colorchecker_corners(
+                    scaled_corners, source=None
+                )
+            except ISPError:
+                self.colorchecker_corners = []
+                self.calibration_polygons = []
         if self.rois:
             self.active_roi_index = min(
                 max(self.active_roi_index, 0),
@@ -2988,6 +3221,9 @@ class ISPApplication:
 
     def _start_process(self) -> None:
         token = self.preview_requests.begin()
+        self.performance.increment("preview_tasks_submitted")
+        self.performance.set_value("preview_task_state", "running")
+        self._update_performance_status()
         generation = token.generation
         cancel_event = token.cancel_event
         if self.loaded.domain == "yuv":
@@ -3094,6 +3330,8 @@ class ISPApplication:
             self._schedule_future_poll(future, generation)
             return
         if decision == ACTION_CANCELLED:
+            self.performance.set_value("preview_task_state", "cancelled")
+            self._update_performance_status()
             self.status_var.set(self.tr("status.ready"))
             return
         if decision != ACTION_APPLY:
@@ -3113,9 +3351,14 @@ class ISPApplication:
                 )
             self._apply_prepared_preview_payload(prepared)
         except CancelledError:
+            self.performance.set_value("preview_task_state", "cancelled")
+            self._update_performance_status()
             self.status_var.set(self.tr("status.ready"))
             return
         except Exception as exc:
+            self.performance.increment("preview_tasks_failed")
+            self.performance.set_value("preview_task_state", "failed")
+            self._update_performance_status()
             self.status_var.set(f"处理失败：{exc}")
             messagebox.showerror(
                 "ISP 处理失败", f"{exc}\n\n{traceback.format_exc(limit=4)}", parent=self.root
@@ -3124,6 +3367,15 @@ class ISPApplication:
         run_metrics = prepared.metrics
         cache_hits = run_metrics.get("cache_hits", 0)
         recomputed = run_metrics.get("recomputed", len(self.pipeline.modules))
+        self.performance.add_cache(
+            "pipeline", hits=cache_hits, misses=recomputed
+        )
+        if getattr(future, "is_yuv_request", False):
+            self.performance.add_cache(
+                "yuv_frame",
+                hits=int(bool(getattr(future, "is_yuv_cached", False))),
+                misses=int(not bool(getattr(future, "is_yuv_cached", False))),
+            )
         module_total = run_metrics.get(
             "elapsed_ms", sum(result.elapsed_ms for result in self.results)
         )
@@ -3162,15 +3414,7 @@ class ISPApplication:
         self.performance.set_value(
             "pipeline_cache", f"{cache_hits}/{cache_hits + recomputed}"
         )
-        memory_roots = {}
-        for result in self.results:
-            for value in (result.image, *result.artifacts.values()):
-                array = np.asarray(value)
-                root = array
-                while isinstance(getattr(root, "base", None), np.ndarray):
-                    root = root.base
-                memory_roots[id(root)] = int(getattr(root, "nbytes", 0))
-        memory_bytes = sum(memory_roots.values())
+        memory_bytes = estimate_ndarray_bytes(self.results)
         self.performance.set_value(
             "preview_size",
             f"{self.preview_image.shape[1]}×{self.preview_image.shape[0]}",
@@ -3182,6 +3426,9 @@ class ISPApplication:
             "result_memory_estimate",
             f"{memory_bytes / (1024 * 1024):.1f} MiB",
         )
+        self.performance.set_memory("current_results", memory_bytes)
+        self.performance.increment("preview_tasks_completed")
+        self.performance.set_value("preview_task_state", "ready")
         self._cache_current_runtime_preview(memory_bytes)
         roi_text = (
             f" · ROI {self.roi.width}×{self.roi.height}"
@@ -3712,7 +3959,8 @@ class ISPApplication:
                     ))
                 self.image_canvas.create_polygon(
                     *points, outline=COLORS["calibration_overlay"],
-                    fill="", width=1,
+                    fill="",
+                    width=(3 if index + 1 == self.colorchecker_selected_patch else 1),
                     tags="colorchecker",
                 )
                 center_x = sum(point[0] for point in polygon) / len(polygon)
@@ -3723,6 +3971,64 @@ class ISPApplication:
                     text=str(index + 1),
                     fill=COLORS["calibration_overlay"],
                     font=FONTS["small"], tags="colorchecker",
+                )
+            if (
+                self.colorchecker_edit_active
+                and len(self.colorchecker_corners) == 4
+            ):
+                outer_points = []
+                for x, y in self.colorchecker_corners:
+                    outer_points.extend((
+                        self.canvas_origin[0] + x * self.zoom,
+                        self.canvas_origin[1] + y * self.zoom,
+                    ))
+                self.image_canvas.create_polygon(
+                    *outer_points,
+                    outline="#ffd166",
+                    fill="",
+                    width=2,
+                    dash=(7, 3),
+                    tags="colorchecker",
+                )
+                corner_names = ("TL", "TR", "BR", "BL")
+                handle_radius = max(6, round(7 * self.ui_scale))
+                for (x, y), name in zip(
+                    self.colorchecker_corners, corner_names
+                ):
+                    cx = self.canvas_origin[0] + x * self.zoom
+                    cy = self.canvas_origin[1] + y * self.zoom
+                    self.image_canvas.create_oval(
+                        cx - handle_radius,
+                        cy - handle_radius,
+                        cx + handle_radius,
+                        cy + handle_radius,
+                        fill="#ffd166",
+                        outline=COLORS["canvas"],
+                        width=2,
+                        tags="colorchecker",
+                    )
+                    self.image_canvas.create_text(
+                        cx + handle_radius + 3,
+                        cy - handle_radius - 2,
+                        text=name,
+                        anchor="sw",
+                        fill="#ffd166",
+                        font=FONTS["small"],
+                        tags="colorchecker",
+                    )
+                self.image_canvas.create_text(
+                    outer_points[0] + 4,
+                    outer_points[1] - 12,
+                    text=(
+                        "ColorChecker 24 · "
+                        f"R{int(self.calibration_workspace.ccm_rotation_var.get()) if self.calibration_workspace else 0}°"
+                        f"{' · Flip' if self.calibration_workspace and self.calibration_workspace.ccm_flip_var.get() else ''}"
+                        " · drag corners / chart"
+                    ),
+                    anchor="sw",
+                    fill="#ffd166",
+                    font=FONTS["section"],
+                    tags="colorchecker",
                 )
         if (
             self.line_profile_start is not None
@@ -4140,11 +4446,13 @@ class ISPApplication:
         point = self._canvas_to_image(event.x, event.y)
         if point is None:
             return
+        colorchecker_hit = self._colorchecker_hit_at(point)
         gesture = self.canvas_gestures.begin(
             point,
             compare_divider_hit=self._compare_divider_hit(
                 event.x, event.y
             ),
+            colorchecker_hit=colorchecker_hit is not None,
             roi_enabled=bool(self.roi_mode_var.get()),
             compare_enabled=bool(
                 self.compare_var.get()
@@ -4157,6 +4465,21 @@ class ISPApplication:
         if gesture == GESTURE_COMPARE:
             self.image_canvas.configure(cursor="sb_h_double_arrow")
             self._update_compare_position(event.x)
+            return
+        if gesture == GESTURE_COLORCHECKER:
+            self.colorchecker_drag_mode = colorchecker_hit[0]
+            self.colorchecker_drag_corner = int(colorchecker_hit[1])
+            self.colorchecker_drag_start = np.asarray(point, dtype=np.float64)
+            self.colorchecker_drag_original = np.asarray(
+                self.colorchecker_corners, dtype=np.float64
+            )
+            self.image_canvas.configure(
+                cursor=(
+                    "crosshair"
+                    if self.colorchecker_drag_mode == "corner"
+                    else "hand2"
+                )
+            )
             return
         if gesture == GESTURE_LINE_PROFILE:
             source_point = self._display_to_source_point(point)
@@ -4209,6 +4532,36 @@ class ISPApplication:
                 self._canvas_to_image(event.x, event.y)
             )
             self._update_compare_position(event.x)
+            return
+        if gesture == GESTURE_COLORCHECKER:
+            point = self._canvas_to_image(event.x, event.y)
+            if (
+                point is None
+                or self.colorchecker_drag_start is None
+                or self.colorchecker_drag_original is None
+            ):
+                return
+            self.canvas_gestures.update(point)
+            current = np.asarray(point, dtype=np.float64)
+            candidate = self.colorchecker_drag_original.copy()
+            height, width = self.preview_image.shape[:2]
+            if self.colorchecker_drag_mode == "corner":
+                candidate[self.colorchecker_drag_corner] = (
+                    np.clip(current[0], 0, width - 1),
+                    np.clip(current[1], 0, height - 1),
+                )
+            else:
+                delta = current - self.colorchecker_drag_start
+                minimum = candidate.min(axis=0)
+                maximum = candidate.max(axis=0)
+                delta[0] = np.clip(delta[0], -minimum[0], width - 1 - maximum[0])
+                delta[1] = np.clip(delta[1], -minimum[1], height - 1 - maximum[1])
+                candidate += delta
+            try:
+                self._set_colorchecker_corners(candidate, source=None)
+            except ISPError:
+                return
+            self._schedule_canvas_render()
             return
         if gesture == GESTURE_LINE_PROFILE:
             point = self._canvas_to_image(event.x, event.y)
@@ -4283,6 +4636,40 @@ class ISPApplication:
                     roi_enabled=bool(self.roi_mode_var.get()),
                 )
             )
+            return
+        if gesture == GESTURE_COLORCHECKER:
+            moved = False
+            point = self._canvas_to_image(_event.x, _event.y)
+            if point is not None and self.colorchecker_drag_start is not None:
+                moved = float(np.linalg.norm(
+                    np.asarray(point, dtype=np.float64)
+                    - self.colorchecker_drag_start
+                )) > max(1.0, 3.0 / max(self.zoom, 0.05))
+            self.canvas_gestures.finish()
+            if not moved and point is not None:
+                for index, polygon in enumerate(self.calibration_polygons):
+                    contour = np.asarray(polygon, np.float32).reshape(-1, 1, 2)
+                    if cv2.pointPolygonTest(
+                        contour, tuple(map(float, point)), False
+                    ) >= 0:
+                        self.select_colorchecker_patch(index + 1)
+                        panel = self._colorchecker_panel()
+                        if panel is not None:
+                            panel.focus_ccm_patch(index + 1)
+                        break
+            panel = self._colorchecker_panel()
+            if panel is not None:
+                panel.ccm_region_source = "corners"
+                panel.ccm_detection_confidence = None
+                panel.use_roi_var.set(False)
+                panel._refresh_ccm_source_status()
+                panel._options_changed()
+            self.colorchecker_drag_mode = ""
+            self.colorchecker_drag_corner = -1
+            self.colorchecker_drag_start = None
+            self.colorchecker_drag_original = None
+            self.image_canvas.configure(cursor="arrow")
+            self._schedule_canvas_render()
             return
         if gesture == GESTURE_LINE_PROFILE:
             self.canvas_gestures.finish()
@@ -4567,12 +4954,19 @@ class ISPApplication:
 
     def _on_canvas_motion(self, event) -> None:
         if not self.compare_dragging:
-            cursor = self.canvas_gestures.cursor(
-                compare_divider_hit=self._compare_divider_hit(
-                    event.x, event.y
-                ),
-                roi_enabled=bool(self.roi_mode_var.get()),
+            compare_hit = self._compare_divider_hit(event.x, event.y)
+            point_for_cursor = self._canvas_to_image(event.x, event.y)
+            checker_hit = (
+                self._colorchecker_hit_at(point_for_cursor)
+                if point_for_cursor is not None and not compare_hit else None
             )
+            if checker_hit is not None:
+                cursor = "crosshair" if checker_hit[0] == "corner" else "hand2"
+            else:
+                cursor = self.canvas_gestures.cursor(
+                    compare_divider_hit=compare_hit,
+                    roi_enabled=bool(self.roi_mode_var.get()),
+                )
             self.image_canvas.configure(cursor=cursor)
         now = time.perf_counter()
         if now - self._last_mouse_status_at < (1.0 / 30.0):
@@ -4746,33 +5140,25 @@ class ISPApplication:
         return None
 
     def schedule_analysis_refresh(self, delay: int = 220) -> None:
-        self.analysis_generation += 1
-        generation = self.analysis_generation
-        if self.analysis_pending_after is not None:
-            try:
-                self.root.after_cancel(self.analysis_pending_after)
-            except tk.TclError:
-                pass
-            self.analysis_pending_after = None
-            self.performance.increment("dropped_analysis_requests")
         if self.analysis_collapsed or not self.results:
+            self.analysis_requests.cancel(count_superseded=True)
             self.performance.set_value(
                 "analysis_state",
                 "collapsed" if self.analysis_collapsed else "deferred",
             )
             self._update_performance_status()
             return
+        self.performance.increment("analysis_tasks_submitted")
+        self.analysis_requests.schedule(
+            self._start_analysis,
+            delay_ms=max(0, int(delay)),
+        )
         self.performance.set_value("analysis_state", "deferred")
         self._update_performance_status()
-        self.analysis_pending_after = self.root.after(
-            max(0, int(delay)),
-            lambda: self._start_analysis(generation),
-        )
 
     def _start_analysis(self, generation: int) -> None:
-        self.analysis_pending_after = None
         if (
-            generation != self.analysis_generation
+            not self.analysis_requests.is_current(generation)
             or self.analysis_collapsed
             or not self.results
         ):
@@ -4806,16 +5192,25 @@ class ISPApplication:
         )
         cached = self.render_cache.get_analysis(key)
         if cached is not None:
-            self.performance.increment("analysis_cache_hits")
-            self.performance.set_value("analysis_state", "cached")
-            self._apply_analysis_payload(
-                generation, key, analysis_type, index, cached
-            )
-            return
+            try:
+                prepared = self.analysis_result_application.prepare(cached)
+            except Exception:
+                self.render_cache.remove_analysis(key)
+            else:
+                self.performance.increment("analysis_cache_hits")
+                if self._apply_analysis_payload(
+                    generation,
+                    key,
+                    analysis_type,
+                    index,
+                    prepared,
+                    record_timing=False,
+                ):
+                    self.performance.increment("analysis_tasks_completed")
+                    self.performance.set_value("analysis_state", "cached")
+                    self._update_performance_status()
+                return
         self.performance.increment("analysis_cache_misses")
-        if self.analysis_future is not None and not self.analysis_future.done():
-            if self.analysis_future.cancel():
-                self.performance.increment("dropped_analysis_requests")
         metadata = copy.deepcopy(self.loaded.metadata)
         if (
             analysis_type in {"Waveform", "Vectorscope"}
@@ -4857,7 +5252,7 @@ class ISPApplication:
             False,
             data_state,
         )
-        self.analysis_future = future
+        self.analysis_requests.bind_future(future)
         self._schedule_analysis_poll(
             future, generation, key, analysis_type, index
         )
@@ -4922,38 +5317,57 @@ class ISPApplication:
         analysis_type: str,
         index: int,
     ) -> None:
-        after_id: Optional[str] = None
-
         def poll() -> None:
-            if after_id is not None:
-                self.analysis_poll_after_ids.discard(after_id)
-            if not future.done():
+            context_valid = (
+                not self.analysis_collapsed
+                and bool(self.results)
+                and analysis_type == self._active_analysis_type()
+                and index == self._analysis_result_index(analysis_type)
+            )
+            decision = self.analysis_result_application.decide(
+                is_current=self.analysis_requests.is_current(generation),
+                context_valid=context_valid,
+                done=future.done(),
+                cancelled=(future.cancelled() if future.done() else False),
+            )
+            if decision == ACTION_STALE:
+                self.analysis_requests.reject_stale_result()
+                return
+            if decision == ACTION_WAIT:
                 self._schedule_analysis_poll(
                     future, generation, key, analysis_type, index
                 )
                 return
-            if future.cancelled():
+            if decision == ACTION_CANCELLED:
+                self.performance.set_value("analysis_state", "cancelled")
+                self._update_performance_status()
                 return
             try:
-                payload = future.result()
+                prepared = self.analysis_result_application.prepare(
+                    future.result()
+                )
+            except CancelledError:
+                self.performance.set_value("analysis_state", "cancelled")
+                self._update_performance_status()
+                return
             except Exception as exc:
-                if generation == self.analysis_generation:
+                if self.analysis_requests.is_current(generation):
+                    self.performance.increment("analysis_tasks_failed")
                     self.performance.set_value("analysis_state", "failed")
                     self.module_diagnostics_var.set(
                         f"Analysis failed: {exc}"
                     )
                     self._update_performance_status()
                 return
-            self.render_cache.put_analysis(key, payload)
-            if generation != self.analysis_generation:
-                self.performance.increment("dropped_analysis_results")
-                return
-            self._apply_analysis_payload(
-                generation, key, analysis_type, index, payload
+            self.render_cache.put_analysis(
+                key, prepared.original_payload
             )
+            if self._apply_analysis_payload(
+                generation, key, analysis_type, index, prepared
+            ):
+                self.performance.increment("analysis_tasks_completed")
 
-        after_id = self.root.after(15, poll)
-        self.analysis_poll_after_ids.add(after_id)
+        self.analysis_requests.schedule_poll(poll)
 
     def _apply_analysis_payload(
         self,
@@ -4962,18 +5376,28 @@ class ISPApplication:
         analysis_type: str,
         index: int,
         payload,
-    ) -> None:
+        *,
+        record_timing: bool = True,
+    ) -> bool:
         if (
-            generation != self.analysis_generation
+            not self.analysis_requests.is_current(generation)
             or self.analysis_collapsed
             or analysis_type != self._active_analysis_type()
             or index != self._analysis_result_index(analysis_type)
         ):
-            return
-        self._last_analysis_payload = (key, analysis_type, payload)
-        self.performance.record("analysis", payload["elapsed_ms"])
+            return False
+        prepared = (
+            payload
+            if hasattr(payload, "elapsed_ms") and hasattr(payload, "value")
+            else self.analysis_result_application.prepare(payload)
+        )
+        self._last_analysis_payload = (
+            key, analysis_type, prepared.original_payload
+        )
+        if record_timing:
+            self.performance.record("analysis", prepared.elapsed_ms)
         self.performance.set_value("analysis_state", "ready")
-        value = payload["value"]
+        value = prepared.value
         if analysis_type == "Histogram":
             self._render_histogram(value)
         elif analysis_type == "Waveform":
@@ -4983,6 +5407,7 @@ class ISPApplication:
         else:
             self._render_statistics(value)
         self._update_performance_status()
+        return True
 
     def _refresh_analysis(self) -> None:
         self.schedule_analysis_refresh(0)
@@ -5245,8 +5670,87 @@ class ISPApplication:
             f"L {stats['clipped_low'] * 100:.3f}%"
         )
 
+    def _record_preview_task_cancelled(self) -> None:
+        self.performance.increment("dropped_pipeline_requests")
+        self.performance.increment("preview_tasks_cancelled")
+        self.performance.set_value("preview_task_state", "superseded")
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _record_preview_result_stale(self) -> None:
+        self.performance.increment("dropped_pipeline_results")
+        self.performance.increment("preview_results_stale")
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _record_analysis_task_cancelled(self) -> None:
+        self.performance.increment("dropped_analysis_requests")
+        self.performance.increment("analysis_tasks_cancelled")
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _record_analysis_result_stale(self) -> None:
+        self.performance.increment("dropped_analysis_results")
+        self.performance.increment("analysis_results_stale")
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _record_import_task_cancelled(self) -> None:
+        self.performance.increment("import_tasks_cancelled")
+        self.performance.set_value("import_task_state", "superseded")
+        self.performance.set_value("import_tasks_in_flight", 0)
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _record_import_result_stale(self) -> None:
+        self.performance.increment("import_results_stale")
+        if hasattr(self, "performance_status_var"):
+            self._update_performance_status()
+
+    def _update_runtime_memory_metrics(self) -> None:
+        runtime_states = [
+            item.runtime_preview
+            for item in self.work_items
+            if item.runtime_preview is not None
+        ]
+        render_values = self.render_cache.values()
+        display_assets = (
+            render_values,
+            self.display_array,
+            self.display_linear_array,
+        )
+        workspace_bytes = sum(
+            max(0, int(state.memory_bytes)) for state in runtime_states
+        )
+        render_bytes = estimate_ndarray_bytes(display_assets)
+        yuv_bytes = estimate_ndarray_bytes(self.yuv_request_cache)
+        current_bytes = estimate_ndarray_bytes(self.results)
+        estimated_total = estimate_ndarray_bytes(
+            self.results,
+            self.pipeline_cache,
+            runtime_states,
+            display_assets,
+            self.yuv_request_cache,
+            self.preview_image,
+        )
+        self.performance.set_memory("current_results", current_bytes)
+        self.performance.set_memory("workspace_preview_cache", workspace_bytes)
+        self.performance.set_memory("display_analysis_cache", render_bytes)
+        self.performance.set_memory("yuv_frame_cache", yuv_bytes)
+        self.performance.set_memory("estimated_runtime", estimated_total)
+
     def _update_performance_status(self) -> None:
         counters = self.render_cache.counters()
+        self.performance.set_cache(
+            "display",
+            counters["stage_hits"],
+            counters["stage_misses"],
+        )
+        self.performance.set_cache(
+            "analysis",
+            counters["analysis_hits"],
+            counters["analysis_misses"],
+        )
         self.performance.set_value(
             "display_cache",
             f"{counters['stage_hits']}/"
@@ -5257,17 +5761,22 @@ class ISPApplication:
             f"{counters['analysis_hits']}/"
             f"{counters['analysis_hits'] + counters['analysis_misses']}",
         )
+        future = self.preview_requests.current_future
+        self.performance.set_value(
+            "preview_tasks_in_flight",
+            int(future is not None and not future.done()),
+        )
+        analysis_future = self.analysis_requests.current_future
+        self.performance.set_value(
+            "analysis_tasks_in_flight",
+            int(
+                analysis_future is not None
+                and not analysis_future.done()
+            ),
+        )
+        self._update_runtime_memory_metrics()
         if hasattr(self, "performance_status_var"):
             self.performance_status_var.set(self.performance.status_text())
-        if (
-            self.performance_window is not None
-            and self.performance_window.winfo_exists()
-            and self.performance_text is not None
-        ):
-            self.performance_text.configure(state="normal")
-            self.performance_text.delete("1.0", "end")
-            self.performance_text.insert("1.0", self.performance.details_text())
-            self.performance_text.configure(state="disabled")
 
     def show_performance_details(self) -> None:
         if (
@@ -5278,36 +5787,20 @@ class ISPApplication:
             self.performance_window.focus_set()
             self._update_performance_status()
             return
-        window = tk.Toplevel(self.root)
-        window.title("Performance Details")
-        window.geometry("650x430")
-        window.minsize(480, 300)
-        window.configure(bg=BG)
-        self.performance_window = window
-        self.performance_details_visible = True
-        text = tk.Text(
-            window,
-            bg=COLORS["canvas_alt"],
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            wrap="none",
-            font=FONTS["mono"],
-            padx=12,
-            pady=10,
-        )
-        text.pack(fill="both", expand=True, padx=10, pady=10)
-        self.performance_text = text
-        self.wheel_router.register(text, text)
+        self._update_performance_status()
 
-        def close_window() -> None:
+        def closed() -> None:
             self.performance_details_visible = False
             self.performance_window = None
-            self.performance_text = None
-            window.destroy()
 
-        window.protocol("WM_DELETE_WINDOW", close_window)
-        self._update_performance_status()
+        window = PerformanceMonitorWindow(
+            self.root,
+            self.performance,
+            self.tr,
+            on_close=closed,
+        )
+        self.performance_window = window
+        self.performance_details_visible = True
 
     def _apply_ui_scale_from_menu(self) -> None:
         scale = UI_SCALE_CHOICES.get(self.ui_scale_var.get(), 1.0)
@@ -5461,11 +5954,20 @@ class ISPApplication:
         summary = self.runtime_preview_cache_policy.summary(
             self.work_items
         )
+        counters = self.performance.structured_snapshot().counters
+        self.performance.set_cache(
+            "workspace_preview",
+            counters.get("workspace_cache_hits", 0),
+            counters.get("workspace_cache_misses", 0),
+        )
         self.performance.set_value(
             "workspace_preview_cache",
             f"{summary.count}/{summary.max_items} images · "
             f"{summary.memory_bytes / (1024 * 1024):.1f}/"
             f"{summary.budget_bytes / (1024 * 1024):.0f} MiB",
+        )
+        self.performance.set_memory(
+            "workspace_preview_cache", summary.memory_bytes
         )
 
     def _trim_runtime_preview_cache(
@@ -5576,6 +6078,7 @@ class ISPApplication:
             "workspace_cache_manual_clears"
         )
         self._update_runtime_cache_metrics()
+        self._update_performance_status()
         self.toast.show(
             f"已清除 {count} 张图像缓存和 {yuv_count} 个 YUV 帧缓存",
             "info",
@@ -5611,6 +6114,7 @@ class ISPApplication:
             manual_dirty_modules=tuple(self.manual_dirty_modules),
             preview_shape=tuple(self.preview_image.shape[:2]),
             input_revision=self.input_revision,
+            colorchecker_state=self._capture_colorchecker_state(),
         )
         self.workspace_state_controller.store(item, state)
 
@@ -5660,6 +6164,7 @@ class ISPApplication:
             and self.calibration_workspace.winfo_exists()
         ):
             self.calibration_workspace.refresh_session()
+        self._restore_colorchecker_state(state.colorchecker_state)
         self.rois = state.rois
         self.active_roi_index = state.active_roi_index
         self.roi = state.active_roi
@@ -5668,6 +6173,7 @@ class ISPApplication:
         self.roi_grid_cols = state.roi_grid_cols
         self.roi_grid_inset = state.roi_grid_inset
         self.calibration_polygons = []
+        self.colorchecker_edit_active = False
         self.roi_process_var.set(False)
         self.input_revision = state.input_revision
         self.pipeline_cache = {}
@@ -5711,6 +6217,7 @@ class ISPApplication:
             self._build_parameter_editor(
                 self.pipeline.modules[self.selected_module_index]
             )
+            self._update_colorchecker_module_overlay()
         self._update_roi_label()
         self._set_loaded_status()
         if restored_from_cache:
@@ -5818,32 +6325,47 @@ class ISPApplication:
                 return
             self.last_yuv_metadata = copy.deepcopy(yuv_metadata)
         base_snapshot = copy.deepcopy(self.pipeline.snapshot())
-        if len(paths) > 1 or yuv_paths:
-            self.import_generation += 1
-            generation = self.import_generation
-            self.status_var.set(
-                f"正在后台导入 {len(paths)} 张图像…"
-            )
-            self.import_future = self.io_executor.submit(
-                self._read_work_items,
-                paths,
-                metadata,
-                base_snapshot,
-                yuv_metadata,
-                self.preview_max_side,
-            )
-            self._poll_image_import(
-                self.import_future, generation, paths
-            )
-            return
-        new_items, failures = self._read_work_items(
+        generation = self.import_requests.begin()
+        self.status_var.set(
+            f"正在后台导入 {len(paths)} 张图像…"
+        )
+        self.performance.increment("import_tasks_submitted")
+        self.performance.set_value("import_task_state", "running")
+        self.performance.set_value("import_tasks_in_flight", 1)
+        future = self.io_executor.submit(
+            self._compute_import_payload,
             paths,
             metadata,
             base_snapshot,
             yuv_metadata,
             self.preview_max_side,
         )
-        self._finish_image_import(paths, new_items, failures)
+        self.import_requests.bind_future(future)
+        self._poll_image_import(future, generation, tuple(paths))
+
+    @classmethod
+    def _compute_import_payload(
+        cls,
+        paths,
+        metadata,
+        base_snapshot,
+        yuv_metadata=None,
+        preview_max_side=None,
+    ):
+        started = time.perf_counter()
+        items, failures = cls._read_work_items(
+            paths,
+            metadata,
+            base_snapshot,
+            yuv_metadata,
+            preview_max_side,
+        )
+        return {
+            "requested_paths": tuple(str(path) for path in paths),
+            "items": items,
+            "failures": failures,
+            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+        }
 
     @staticmethod
     def _read_work_items(
@@ -5881,42 +6403,90 @@ class ISPApplication:
                     )
                 )
             except Exception as exc:
-                failures.append(f"{Path(path).name}: {exc}")
+                failures.append(ImportFailure(str(path), str(exc)))
         return new_items, failures
 
     def _poll_image_import(
         self, future: Future, generation: int, paths
     ) -> None:
-        if generation != self.import_generation:
+        decision = self.import_result_application.decide(
+            is_current=self.import_requests.is_current(generation),
+            done=future.done(),
+            cancelled=(future.cancelled() if future.done() else False),
+        )
+        if decision == ACTION_STALE:
+            self.import_requests.reject_stale_result()
             return
-        if not future.done():
-            self.import_poll_after = self.root.after(
-                40,
+        if decision == ACTION_WAIT:
+            self.import_requests.schedule_poll(
                 lambda: self._poll_image_import(
                     future, generation, paths
-                ),
+                )
             )
             return
-        self.import_poll_after = None
-        try:
-            new_items, failures = future.result()
-        except Exception as exc:
-            new_items, failures = [], [str(exc)]
-        self.import_future = None
-        if generation != self.import_generation:
+        if decision == ACTION_CANCELLED:
+            self.performance.increment("import_tasks_cancelled")
+            self.performance.set_value("import_task_state", "cancelled")
+            self.performance.set_value("import_tasks_in_flight", 0)
+            self._update_performance_status()
             return
-        self._finish_image_import(paths, new_items, failures)
+        try:
+            prepared = self.import_result_application.prepare(
+                future.result(), paths
+            )
+        except CancelledError:
+            self.performance.increment("import_tasks_cancelled")
+            self.performance.set_value("import_task_state", "cancelled")
+            self.performance.set_value("import_tasks_in_flight", 0)
+            self._update_performance_status()
+            return
+        except Exception as exc:
+            if self.import_requests.is_current(generation):
+                self.performance.increment("import_tasks_failed")
+                self.performance.set_value("import_task_state", "failed")
+                self.performance.set_value("import_tasks_in_flight", 0)
+                self.status_var.set(f"导入失败：{exc}")
+                messagebox.showerror(
+                    "导入失败", str(exc), parent=self.root
+                )
+                self._update_performance_status()
+            return
+        self.import_requests.bind_future(None)
+        self.performance.record("import", prepared.elapsed_ms)
+        self.performance.increment(
+            "import_files_succeeded", prepared.succeeded
+        )
+        self.performance.increment(
+            "import_files_failed", prepared.failed
+        )
+        succeeded = self._finish_image_import(
+            prepared.requested_paths,
+            list(prepared.items),
+            list(prepared.failure_messages),
+        )
+        self.performance.set_value("import_tasks_in_flight", 0)
+        if succeeded:
+            self.performance.increment("import_tasks_completed")
+            self.performance.set_value("import_task_state", "ready")
+        else:
+            self.performance.increment("import_tasks_failed")
+            self.performance.set_value("import_task_state", "failed")
+            self.status_var.set(
+                f"导入失败 · 0/{len(prepared.requested_paths)}"
+            )
+        self._update_performance_status()
 
     def _finish_image_import(
         self, paths, new_items, failures
-    ) -> None:
+    ) -> bool:
+        failures = [str(failure) for failure in failures]
         if not new_items:
             messagebox.showerror(
                 "导入失败",
                 "\n".join(failures[:12]) or "没有可导入的图像",
                 parent=self.root,
             )
-            return
+            return False
         self._store_current_work_item()
         replace_placeholder = (
             len(self.work_items) == 1
@@ -5943,6 +6513,7 @@ class ISPApplication:
                 parent=self.root,
             )
         self.toast.show(message, "success" if not failures else "warning")
+        return True
 
     def open_files(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -6663,14 +7234,12 @@ class ISPApplication:
         self._closing = True
         self.canvas_gestures.cancel_all()
         self.preview_requests.close()
-        self.analysis_generation += 1
-        self.import_generation += 1
+        self.analysis_requests.close()
+        self.import_requests.close()
         for attr in (
-            "analysis_pending_after",
             "canvas_resize_after",
             "canvas_overlay_after",
             "view_render_after",
-            "import_poll_after",
         ):
             after_id = getattr(self, attr, None)
             if after_id:
@@ -6679,12 +7248,6 @@ class ISPApplication:
                 except tk.TclError:
                     pass
                 setattr(self, attr, None)
-        for after_id in tuple(self.analysis_poll_after_ids):
-            try:
-                self.root.after_cancel(after_id)
-            except tk.TclError:
-                pass
-        self.analysis_poll_after_ids.clear()
         if (
             self.calibration_workspace is not None
             and self.calibration_workspace.winfo_exists()
@@ -6710,6 +7273,11 @@ class ISPApplication:
             and self.line_profile_window.winfo_exists()
         ):
             self.line_profile_window.close()
+        if (
+            self.performance_window is not None
+            and self.performance_window.winfo_exists()
+        ):
+            self.performance_window.close()
         self.toast.close()
         self.wheel_router.close()
         for control in tuple(self.parameter_controls.values()):

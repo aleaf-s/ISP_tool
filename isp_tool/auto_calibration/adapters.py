@@ -243,7 +243,7 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                 options.get("row_sum_regularization", 0.25)
             ),
             perceptual_weight=float(
-                options.get("perceptual_weight", 0.08)
+                options.get("perceptual_weight", 0.80)
             ),
             structure_prior=bool(
                 options.get("structure_prior", True)
@@ -251,8 +251,23 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
             sign_regularization=float(
                 options.get("sign_regularization", 0.35)
             ),
+            lightness_weight=float(
+                options.get("lightness_weight", 0.02)
+            ),
+            chroma_weight=float(
+                options.get("chroma_weight", 1.0)
+            ),
+            hue_weight=float(
+                options.get("hue_weight", 1.0)
+            ),
+            normalize_exposure=bool(
+                options.get("normalize_exposure", True)
+            ),
         )
         source = np.asarray(image, dtype=np.float32)
+        pre_ccm_gain = float(
+            result.diagnostics.get("pre_ccm_exposure_gain", 1.0)
+        )
         if source.ndim == 3 and source.shape[2] >= 3:
             step = max(
                 1,
@@ -261,7 +276,7 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                 )),
             )
             predicted_frame = apply_ccm(
-                source[::step, ::step, :3],
+                source[::step, ::step, :3] * pre_ccm_gain,
                 result.matrix,
                 result.offset,
             )
@@ -297,6 +312,7 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
             for row in range(3) for col in range(3)
         }
         suggested.update({
+            "input_gain": pre_ccm_gain,
             "offset_r": float(result.offset[0]),
             "offset_g": float(result.offset[1]),
             "offset_b": float(result.offset[2]),
@@ -335,6 +351,9 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                     "delta_e_initial", {}
                 ),
                 "delta_e_after": result.delta_e_after,
+                "delta_e_after_exposure": result.diagnostics.get(
+                    "delta_e_after_exposure", {}
+                ),
                 "patch_count": len(result.patches),
                 "valid_patch_count": len(
                     result.diagnostics.get("valid_patch_ids", [])
@@ -380,6 +399,75 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                     "valid_patch_ids", []
                 ),
                 "rejected_patch_ids": rejected_patch_ids,
+                "auto_rejected_patch_ids": result.diagnostics.get(
+                    "auto_rejected_patch_ids", []
+                ),
+                "neutral_delta_e_before": result.diagnostics.get(
+                    "neutral_delta_e_before", {}
+                ),
+                "neutral_delta_e_after": result.diagnostics.get(
+                    "neutral_delta_e_after", {}
+                ),
+                "delta_lch_before": result.diagnostics.get(
+                    "delta_lch_before", {}
+                ),
+                "delta_lch_after_exposure": result.diagnostics.get(
+                    "delta_lch_after_exposure", {}
+                ),
+                "delta_lch_initial": result.diagnostics.get(
+                    "delta_lch_initial", {}
+                ),
+                "delta_lch_after": result.diagnostics.get(
+                    "delta_lch_after", {}
+                ),
+                "chroma_hue_error_before": result.diagnostics.get(
+                    "chroma_hue_error_before", {}
+                ),
+                "chroma_hue_error_after": result.diagnostics.get(
+                    "chroma_hue_error_after", {}
+                ),
+                "structural_warnings": result.diagnostics.get(
+                    "structural_warnings", []
+                ),
+                "exposure_normalization_gain": result.diagnostics.get(
+                    "exposure_normalization_gain", 1.0
+                ),
+                "pre_ccm_exposure_gain": pre_ccm_gain,
+                "exposure_match": result.diagnostics.get(
+                    "exposure_match", {}
+                ),
+                "optimisation_target": result.diagnostics.get(
+                    "optimisation_target", "CIE Lab a*b*"
+                ),
+                "delta_e_exposure_normalized_after": result.diagnostics.get(
+                    "delta_e_exposure_normalized_after", {}
+                ),
+                "design_condition_number": result.diagnostics.get(
+                    "design_condition_number", 0.0
+                ),
+                "optimizer_status": result.diagnostics.get(
+                    "optimizer_status", ""
+                ),
+                "input_stage": str(
+                    options.get("input_stage", "WB / Demosaic output")
+                ),
+                "input_color_space": str(
+                    options.get("input_color_space", "Camera linear RGB")
+                ),
+                "target_color_space": str(
+                    options.get("target_color_space", "linear sRGB")
+                ),
+                "reference_white": str(
+                    options.get("reference_white", "D65")
+                ),
+                "delta_e_method": "CIE 2000",
+                "matrix_convention": "RGB_out = M × RGB_in + offset",
+                "geometry_source": str(
+                    options.get("geometry_source", "manual")
+                ),
+                "detection_confidence": options.get(
+                    "detection_confidence"
+                ),
                 "patches": [
                     patch.to_dict() for patch in result.patches
                 ],

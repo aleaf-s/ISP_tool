@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.4.41
+
+- 修复 CCM 色块表格/分析窗口双向同步引发的无限选择事件循环；去掉无内容变化的 FocusOut 失效处理。
+- 分析窗口改为校正结果专用表：DEab / DCab / DL / DC / Dh / Da / Db；数字列按字体测量，支持横向滚动。
+- a*b* 图改为彩色 Lab 背景、标准方块、输出圆点和偏差连线；背景有界生成并缓存，重绘节流。
+- CCM 自动页改为可编辑矩阵与“校正 / Color Analysis”；手动校正只评估并应用输入矩阵，保留独立曝光增益，不重新拟合。
+- 移除重复缩略图/结果表与非核心参数的常驻展示；方向、光源保留在区域菜单。
+- 修复已有建议后“重新计算 CCM”被状态门控静默忽略的问题；分析窗口不再自动弹出。
+- 新增指标公式、手动矩阵应用、选择反馈收敛、重开窗口不执行 ISP、绘图缓存及精简控件回归测试。
+- 验证：全量 `python -m unittest discover -s tests -q` 332 项通过；本轮相关 17 项复跑通过。首轮全量中旧 Histogram 用例发生一次超时，单独复跑及第二轮全量均通过；测试退出时仍有历史 Tk ThemeChanged/回调清理警告。使用可见桌面合成色卡窗口实测双击打开和数字/图形布局，未将其作为真实 RAW 校准精度验证。
+
+## 0.4.40
+
+- 修复 CCM 结果展示在 Tk 主线程对全分辨率图执行 float64 变换导致窗口未响应的问题；缩略预览现在先降采样再套用 CCM。
+- 修复分析表格行高未跟随字体/DPI造成数字裁切，以及左右窗格被表格请求宽度挤压的问题。
+- 新增独立 `Pre-CCM Exposure` 参数：先以中性色块的加权中位数对数亮度比匹配标准色卡，再计算颜色矩阵。
+- 自动 CCM 非线性阶段改为直接优化 CIE Lab a*/b*，L* 仅用于很弱的稳定性保护；曝光不再由矩阵承担。
+- Auto CCM、手动预览、整图安全检查、CCM 导入导出均支持新的曝光标量。
+- 新增 V0.4.40 回归测试，覆盖曝光分离、a*/b* 收敛、参数执行次序、高 DPI 行高、窗格宽度和缩略图计算范围。
+
+## 0.4.39
+
+- 进入 CCM 模块时在主预览自动创建或恢复 ColorChecker Classic 24 色卡框，支持整框移动、四角透视调整、方向标记和中心重置。
+- 将色卡拖动接入统一画布手势仲裁；Compare 分割线优先于色卡，色卡优先于普通 ROI，拖动期间只更新 Overlay。
+- 色卡几何、Rotation、Flip、排除块、检测来源和选中色块改为每张工作图独立保存，并随预览缩放同步换算。
+- 新增 Lab→LCh 和 ΔL*/ΔC*/ΔH* 公共实现；Hue 使用 0°/360° 最短角差，低色度 Hue 单独标记为不稳定。
+- CCM 感知优化改为色度/色相优先、明度低权重；使用中性色块估计曝光诊断增益，将曝光与矩阵色彩拟合解耦。
+- 主对角 1.0～2.5 和非对角符号由硬边界改为软先验，异常结构作为 Warning，并继续使用行和、条件数、负值、溢出和色差作安全验收。
+- 新增非模态 CCM Color Difference Analysis 窗口，提供 24 块可排序 L/C/H/ΔE 表格、等比例 Lab a*b* 误差向量图及与主预览联动高亮。
+- 结果窗口支持选中色块排除/恢复并重新拟合；Calculate、Preview 与 Apply 保持显式分离。
+- 新增 7 项 V0.4.39 回归，覆盖 Hue 环绕、曝光解耦、软结构先验、手势优先级、自动 Overlay、状态持久化和分析窗口联动。
+
+## 0.4.38
+
+- CCM 自动页新增 `Detect ColorChecker`，可搜索全图，也可通过“Region Tools”仅在当前 ROI 内搜索。
+- 新增 UI 无关的 ColorChecker 检测器：候选凸四边形检测、透视展开、6×4 网格采样、参考色可拟合度、中性灰阶顺序、块内均匀度和颜色多样性联合评分。
+- 自动识别横向、竖向、旋转与镜像候选，输出统一为标准 6×4 方向，检测结果不再需要额外 Rotation/Flip。
+- 检测只生成四角与 24 块覆盖层，不会计算或应用 CCM；用户必须检查覆盖层后再点击 Calculate CCM。
+- 界面显示 Detection Confidence；低于阈值时保留原几何不变，并建议使用 ROI 缩小搜索范围或手动微调。
+- 区域相关低频操作收拢到 `Region Tools` 下拉菜单，主页仅保留一个高频自动检测按钮。
+- 新增透视色卡、竖向旋转、ROI 全局坐标、非色卡拒绝和 UI 提案不应用参数测试。
+
+## 0.4.37
+
+- CCM 自动页新增紧凑的 ColorChecker 工作流：当前 ROI 外框、4×6 可微调色块、透视四角、方向/Flip、Illuminant、统计方法与手动排除。
+- 修复“Use current ROI”没有真正进入 CCM 采样链路、默认坐标被误用的问题。
+- 只有带明确 4×6 网格来源的 24 个 ROI 才会当作 ColorChecker 色块，避免将其他 24 个 ROI 误用于拟合。
+- 修正 D50/A 光源参考色的白点适应，先经 CAT02 适应到 sRGB D65，中性色块不再因参考数据错误带暖色。
+- 色块采样新增质量分数、Inlier 比例与用户排除标记；求解器可自动排除少量明显残差异常块并重新拟合。
+- CCM 改为先计算、再显式 Preview/Apply；未通过 ΔE、矩阵稳定性、负值与溢出检查的结果在所有入口均不可应用。
+- CCM 拟合前显式校验 BLC、WB、Demosaic 与线性归一化 RGB 数值域，避免将 RGB DN 直接与 0～1 参考色拟合。
+
+## 0.4.36
+
+- 新增 `ImportRequestCoordinator`，抽离 Latest-wins Generation、Future、Poll 与关闭清理。
+- 新增结构化 `ImportFailure`、`PreparedImportPayload` 和导入 Payload 合同。
+- 导入结果必须与活动请求路径顺序及集合匹配，每个文件恰好产生一个成功或失败结果。
+- 单张普通图片与相机 RAW 也迁移到 IO Executor，避免主线程同步解码造成界面停顿。
+- 旧导入任务的迟到结果在工作区写入前丢弃，重复导入不会追加错误批次。
+- 保留部分成功行为，并统一失败摘要、成功/失败文件计数和 Import Task 性能状态。
+- 应用退出时由协调器集中取消 Import Future 与全部 Poll 回调。
+- 新增协调器、Payload 路径绑定、部分成功、单图后台导入和 Stale Workspace 隔离测试。
+
+## 0.4.35
+
+- 新增 `AnalysisRequestCoordinator`，抽离分析 Debounce、Generation、Future 所有权、轮询注册和关闭清理。
+- 新增 `AnalysisResultApplicationController` 与标准化 Payload，验证 Value 及有限、非负的 Elapsed 时间。
+- 主 Analysis Drawer 和独立 Histogram 统一使用 Wait、Stale、Cancelled、Apply 状态决策。
+- 修复 Stale Analysis Payload 在 Generation 检查前写入 Render Cache 的问题。
+- Histogram Window Cache 改为存储经过验证的标准 Payload，并接入统一 Hit/Miss 统计。
+- Performance Monitor 增加 Analysis 与 Histogram 的 Submitted、Completed、Cancelled、Failed、Stale 和 In-flight 指标。
+- 应用退出及 Histogram 关闭通过协调器集中取消全部 After/Poll 回调与未开始 Future。
+- 新增协调器、决策优先级、Payload 合同、Stale Cache 防污染和 Histogram 关闭测试。
+
+## 0.4.34
+
+- 将旧 `PerformanceMetrics` 升级为线程安全的结构化 Timing、Cache、Memory、Value 和 Counter 快照。
+- Timing 增加 Latest、Average、P50、P95、Max 和滚动样本数，状态栏自动指出当前最慢模块。
+- Pipeline、Display、Analysis、Workspace Preview 和 YUV Frame 使用统一累计缓存命中率。
+- 新增共享 NumPy backing store 去重估算，分别统计当前结果、Runtime Preview、Render/Analysis 和 YUV Cache 内存。
+- 新增非模态三页签 `Performance Monitor`，状态栏摘要可直接点击打开，专家模式保持移除。
+- 预览请求增加 Submitted、Completed、Cancelled/Superseded、Failed 和 Stale Result 计数及当前 In-flight 状态。
+- 修复 Processing Backend 子菜单将“后端状态”错误标成“性能详情”的旧文案问题。
+- 新增结构化快照、命中率、共享数组内存、摘要热点和窗口布局测试。
+
 ## 0.4.33
 
 - 新增 `PreviewResultApplicationController`，抽离完成 Future 的状态决策和 RAW/YUV Payload 合同验证。

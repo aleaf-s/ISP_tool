@@ -11,6 +11,7 @@ GESTURE_GRAY_PICK = "gray_pick"
 GESTURE_COMPARE = "compare"
 GESTURE_LINE_PROFILE = "line_profile"
 GESTURE_ROI = "roi"
+GESTURE_COLORCHECKER = "colorchecker"
 
 ARMABLE_GESTURES = {GESTURE_GRAY_PICK, GESTURE_LINE_PROFILE}
 ACTIVE_GESTURES = {
@@ -18,6 +19,7 @@ ACTIVE_GESTURES = {
     GESTURE_COMPARE,
     GESTURE_LINE_PROFILE,
     GESTURE_ROI,
+    GESTURE_COLORCHECKER,
 }
 
 
@@ -33,7 +35,8 @@ class CanvasGestureCoordinator:
     """Pure state machine for mutually exclusive main-canvas gestures.
 
     Priority is intentionally fixed to match the product contract:
-    Gray Picker > Compare divider > armed measurement > ROI > Compare body.
+    Gray Picker > Compare divider > ColorChecker > armed measurement > ROI >
+    Compare body.
     The coordinator owns arbitration and transient pointer state, while the
     application remains responsible for geometry changes and rendering.
     """
@@ -67,6 +70,7 @@ class CanvasGestureCoordinator:
         point: Optional[Point],
         *,
         compare_divider_hit: bool,
+        colorchecker_hit: bool = False,
         roi_enabled: bool,
         compare_enabled: bool,
     ) -> str:
@@ -76,6 +80,8 @@ class CanvasGestureCoordinator:
             gesture = GESTURE_GRAY_PICK
         elif compare_divider_hit:
             gesture = GESTURE_COMPARE
+        elif colorchecker_hit:
+            gesture = GESTURE_COLORCHECKER
         elif self.armed == GESTURE_LINE_PROFILE:
             gesture = GESTURE_LINE_PROFILE
         elif roi_enabled:

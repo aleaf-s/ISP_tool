@@ -135,7 +135,7 @@ class HiddenTkYUVQuickFormatTests(unittest.TestCase):
                     pass
             self.assertNotIn("Gray", texts)
             self.assertNotIn("1:1", texts)
-            self.assertIn("适合窗口", texts)
+            self.assertIn(app.tr("toolbar.fit"), texts)
         finally:
             if root.winfo_exists():
                 app.close()

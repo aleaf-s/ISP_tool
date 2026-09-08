@@ -37,7 +37,9 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             self.assertFalse(app.analysis_container.winfo_manager())
             self.assertFalse(app.stage_selector.winfo_manager())
             self.assertFalse(app.expert_diagnostics_label.winfo_manager())
-            self.assertFalse(app.performance_status_label.winfo_manager())
+            # V0.4.34 keeps only a compact, clickable performance summary;
+            # the removed expert controls remain hidden.
+            self.assertTrue(app.performance_status_label.winfo_manager())
             self.assertIsNotNone(app.advanced_params_button)
             self.assertFalse(app.advanced_params_frame.winfo_manager())
 
@@ -48,7 +50,7 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             self.assertFalse(app.expert_mode_var.get())
             self.assertFalse(app.stage_selector.winfo_manager())
             self.assertFalse(app.expert_diagnostics_label.winfo_manager())
-            self.assertFalse(app.performance_status_label.winfo_manager())
+            self.assertTrue(app.performance_status_label.winfo_manager())
         finally:
             if root.winfo_exists():
                 app.close()
@@ -136,7 +138,7 @@ class HiddenTkSimpleWorkspaceTests(unittest.TestCase):
             panel._update_action_states()
             self.assertEqual(
                 str(panel.analyze_button["text"]),
-                "矫正并应用",
+                app.tr("awb.correct_apply"),
             )
         finally:
             if root.winfo_exists():

@@ -85,7 +85,10 @@ class HiddenTkYUVIntegrationTests(unittest.TestCase):
             )
             self.assertFalse(app.mode_switch.winfo_manager())
             self.assertEqual(str(app.auto_calibration_button["state"]), "disabled")
-            self.assertIn("RAW ISP 未执行", app.module_state_var.get())
+            self.assertIn(
+                app.tr("panel.yuv_path").split(" · ")[-1],
+                app.module_state_var.get(),
+            )
             self.assertEqual(
                 app.pipeline_cache["last_metrics"]["yuv_cache_key"][1],
                 0,

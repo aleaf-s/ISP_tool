@@ -22,6 +22,9 @@ class ColorCorrectionMatrix(ISPModule):
                     identity[row * 3 + col], -4, 4, 0.001,
                 ))
         specs.extend([
+            ParameterSpec(
+                "input_gain", "Pre-CCM Exposure", "float", 1.0, 0.25, 4.0, 0.01
+            ),
             ParameterSpec("offset_r", "R Offset", "float", 0.0, -1, 1, 0.001),
             ParameterSpec("offset_g", "G Offset", "float", 0.0, -1, 1, 0.001),
             ParameterSpec("offset_b", "B Offset", "float", 0.0, -1, 1, 0.001),
@@ -50,9 +53,10 @@ class ColorCorrectionMatrix(ISPModule):
             else max(float(data_state.white_level), 1.0)
         )
         strength = float(self.parameters["strength"])
+        input_gain = float(self.parameters.get("input_gain", 1.0))
         effective_matrix = (
             np.eye(3, dtype=np.float32) * (1.0 - strength)
-            + matrix * strength
+            + matrix * (strength * input_gain)
         )
         effective_offset = offset * (strength * offset_scale)
         if (
@@ -77,4 +81,5 @@ class ColorCorrectionMatrix(ISPModule):
             "矩阵行列式": float(np.linalg.det(matrix)),
             "输出越界比例": float(out_of_range),
             "Offset Scale": float(offset_scale),
+            "Pre-CCM Exposure": input_gain,
         }

@@ -159,7 +159,7 @@ class HiddenTkHistogramToolTests(unittest.TestCase):
             app.open_histogram_window()
             window = app.histogram_window
             self._wait(root, lambda: window.last_payload is not None)
-            self.assertIn("暗部", window.summary_var.get())
+            self.assertIn("Min", window.summary_var.get())
             left, top, right, bottom = window.plot_bounds
             window._on_motion(
                 SimpleNamespace(
@@ -167,7 +167,7 @@ class HiddenTkHistogramToolTests(unittest.TestCase):
                     y=int((top + bottom) / 2),
                 )
             )
-            self.assertIn("码值", window.hover_var.get())
+            self.assertIn(" · ", window.hover_var.get())
             self.assertIn("R", window.hover_var.get())
 
             for variable in window.channel_vars.values():

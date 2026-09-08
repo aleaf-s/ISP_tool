@@ -60,7 +60,7 @@ class HiddenTkQuickCorrectionTests(unittest.TestCase):
             self.assertFalse(hasattr(panel, "preview_button"))
             self.assertEqual(
                 str(panel.analyze_button["text"]),
-                "矫正并应用",
+                app.tr("awb.correct_apply"),
             )
             self.assertFalse(hasattr(app, "module_brush_menu"))
             self.assertFalse(hasattr(app, "auto_more_menu"))
@@ -119,7 +119,7 @@ class HiddenTkQuickCorrectionTests(unittest.TestCase):
             )
             self.assertTrue(panel.result.applied)
             self.assertIsNotNone(app.calibration_session.awb_result)
-            self.assertIn("已矫正并应用", str(panel.message["text"]))
+            self.assertIn("AWB", str(panel.message["text"]))
         finally:
             if root.winfo_exists():
                 app.close()

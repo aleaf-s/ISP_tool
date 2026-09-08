@@ -7,8 +7,8 @@ This document defines the regression contract used before structural changes.
 - RAW ISP: `RAW Input → BLC → LSC → WB → Demosaic → CCM`.
 - YUV preview: `YUV Input → Chroma Upsampling → YUV to RGB → Display Preview`.
 - Shared tools: ROI, Compare, Histogram, Waveform, Vectorscope, Statistics,
-  Pixel Inspector, Line Profile, final-impact preview, multi-image workset and
-  bilingual UI.
+  Pixel Inspector, Line Profile, ColorChecker L/C/H + Lab a*b* inspection,
+  final-impact preview, multi-image workset and bilingual UI.
 - Optional compute backend: Auto, OpenCV/NumPy and compatible Native C++.
 
 The inactive DPC, Tone, NR, Sharpen and Color Adjustment implementations are
@@ -75,13 +75,16 @@ OpenCV or backend configurations.
 | Preview result | Future decision and payload validation extracted in V0.4.33; UI assignment remains in `app.py` | Keep widget mutation at the UI boundary |
 | Workspace cache | Validity, LRU and byte-budget policy extracted in V0.4.31 | Keep UI counters at the application boundary |
 | Work-item state | Editable snapshot/store/activation boundary extracted in V0.4.32 | Keep widget refresh and job submission in `app.py` |
+| Performance accounting | Timing/cache/memory/task snapshots and formatting extracted in V0.4.34 | Keep data collection calls and widgets at the UI boundary |
+| Analysis jobs | Debounce/Future/poll lifecycle and result validation extracted in V0.4.35 | Keep plot rendering and Tk mutation at the UI boundary |
+| Import jobs | Future/poll lifecycle, batch identity and result validation extracted in V0.4.36 | Keep dialogs and workspace mutation at the UI boundary |
 | ROI interaction | Gesture arbitration and pointer lifecycle extracted in V0.4.30; ROI geometry mutation remains in `app.py` | Keep geometry local until ROI editing is redesigned |
 | Legacy calibration UI | Retained for compatibility but mostly hidden | Do not expose without a concrete workflow requirement |
 | UI framework | Tk remains adequate for the current scope | Reassess PySide6/OpenGL only after profiling |
 
 ## Next structural slice
 
-The next structural slice is performance-result accounting. It should move
-module timing aggregation, shared-array memory estimation and cache ratio
-formatting out of `app.py`, while leaving visible status text and widgets at the
-UI boundary.
+The next structural slice is application shutdown coordination. It should make
+window ownership, After callback cancellation and executor shutdown order
+explicit, reducing the remaining Tk "application has been destroyed" warnings
+in long grouped test runs without changing normal interactive behavior.

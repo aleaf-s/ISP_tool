@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -36,8 +36,24 @@ def colorchecker_reference(
             colour.sd_to_XYZ(sd, cmfs=cmfs, illuminant=illuminant_sd) / 100.0
             for sd in checker.values()
         ], dtype=np.float64)
+    # ``sd_to_XYZ`` returns tristimulus values relative to the requested
+    # illuminant.  XYZ_to_sRGB defaults to D65 input, so D50/A references must
+    # identify their source white and be chromatically adapted to sRGB D65.
+    # Omitting this makes the neutral row strongly warm for D50/A and the CCM
+    # then tries to compensate for an error in the reference data itself.
+    source_white = np.asarray(
+        colour.CCS_ILLUMINANTS[
+            "CIE 1931 2 Degree Standard Observer"
+        ][illuminant],
+        dtype=np.float64,
+    )
     rgb = np.asarray(
-        colour.XYZ_to_sRGB(xyz, apply_cctf_encoding=False),
+        colour.XYZ_to_sRGB(
+            xyz,
+            illuminant=source_white,
+            chromatic_adaptation_transform="CAT02",
+            apply_cctf_encoding=False,
+        ),
         dtype=np.float32,
     )
     if len(names) != 24 or rgb.shape != (24, 3):
@@ -64,6 +80,13 @@ def generate_colorchecker_grid(
     points = np.asarray(corners, dtype=np.float64)
     if points.shape != (4, 2):
         raise ISPError("色卡四角必须按 TL、TR、BR、BL 提供 4×2 坐标")
+    if not np.all(np.isfinite(points)):
+        raise ISPError("色卡四角包含无效坐标")
+    contour = points.astype(np.float32).reshape(-1, 1, 2)
+    if not cv2.isContourConvex(contour):
+        raise ISPError("色卡四角必须构成不交叉的凸四边形")
+    if abs(float(cv2.contourArea(contour))) < 64.0:
+        raise ISPError("色卡区域过小，无法稳定采样 24 个色块")
     if columns <= 0 or rows <= 0:
         raise ISPError("色卡行列数必须大于 0")
     if not 0.1 <= inner_scale <= 1.0:
@@ -108,6 +131,7 @@ def sample_colorchecker(
     names: Sequence[str],
     statistic: str = "Median",
     reference_indices: np.ndarray = None,
+    excluded_patch_ids: Iterable[int] = (),
 ) -> List[ColorCheckerPatch]:
     image = np.asarray(linear_rgb, dtype=np.float32)
     if image.ndim != 3 or image.shape[2] < 3:
@@ -123,6 +147,9 @@ def sample_colorchecker(
     )
     if order.shape != (24,):
         raise ISPError("色卡参考顺序必须包含 24 个索引")
+    excluded = {int(value) for value in excluded_patch_ids}
+    if any(value < 1 or value > 24 for value in excluded):
+        raise ISPError("排除色块编号必须在 1～24")
 
     height, width = image.shape[:2]
     patches = []
@@ -139,9 +166,17 @@ def sample_colorchecker(
             or points[:, 0].max() >= width or points[:, 1].max() >= height
         ):
             raise ISPError(f"色块 {patch_id + 1} ROI 超出图像")
-        mask = np.zeros((height, width), np.uint8)
-        cv2.fillConvexPoly(mask, points, 1)
-        raw_samples = image[mask.astype(bool), :3]
+        # Build the mask only for this patch's bounding rectangle.  A full
+        # image mask repeated 24 times causes avoidable memory traffic on 4K
+        # frames and can make the desktop UI appear hung despite background
+        # execution.
+        x0, y0 = points.min(axis=0)
+        x1, y1 = points.max(axis=0)
+        local_points = points - np.array((x0, y0), dtype=np.int32)
+        patch_image = image[y0:y1 + 1, x0:x1 + 1, :3]
+        mask = np.zeros(patch_image.shape[:2], np.uint8)
+        cv2.fillConvexPoly(mask, local_points, 1)
+        raw_samples = patch_image[mask.astype(bool)]
         finite_mask = np.all(np.isfinite(raw_samples), axis=1)
         finite = raw_samples[finite_mask]
         if finite.shape[0] < 9:
@@ -179,9 +214,10 @@ def sample_colorchecker(
         measured = measured.astype(np.float32)
         clipped_ratio = float(np.mean(clipped_mask))
         dark_ratio = float(np.mean(dark_mask))
-        variation = float(
-            np.max(mad / np.maximum(np.abs(median), 0.02))
-        )
+        relative_mad = mad / np.maximum(np.abs(median), 0.04)
+        variation = float(np.percentile(relative_mad, 75))
+        inlier_ratio = float(inliers.shape[0] / max(usable.shape[0], 1))
+        median_luma = float(np.dot(median, (0.2126, 0.7152, 0.0722)))
         reasons = []
         if clipped_ratio > 0.12:
             reasons.append("过曝像素过多")
@@ -191,6 +227,16 @@ def sample_colorchecker(
             reasons.append("色块内部不均匀")
         if inliers.shape[0] < max(9, int(finite.shape[0] * 0.35)):
             reasons.append("异常像素过多")
+        if patch_id + 1 in excluded:
+            reasons.append("用户排除")
+        quality_score = float(np.clip(
+            (1.0 - clipped_ratio)
+            * (1.0 - min(dark_ratio, 0.9))
+            * inlier_ratio
+            / (1.0 + variation * 3.0),
+            0.05,
+            1.0,
+        ))
         reference_index = int(order[patch_id])
         delta, measured_lab, reference_lab = delta_e_values(
             measured[None, :], references[reference_index][None, :], "CIE 2000"
@@ -214,6 +260,9 @@ def sample_colorchecker(
                 "clipped_ratio": clipped_ratio,
                 "dark_ratio": dark_ratio,
                 "variation": variation,
+                "inlier_ratio": inlier_ratio,
+                "median_luma": median_luma,
+                "quality_score": quality_score,
                 "statistic": statistic,
                 "sample_inner_scale": 0.82,
                 "reference_index": reference_index,

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .models import CalibrationSession, ImageROI, LoadedImage
 from .workspace import ImageWorkItem
@@ -23,6 +23,7 @@ class WorkItemEditableState:
     manual_dirty_modules: Tuple[str, ...]
     preview_shape: Optional[tuple]
     input_revision: int
+    colorchecker_state: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def active_roi(self) -> Optional[ImageROI]:
@@ -50,6 +51,7 @@ class WorkspaceItemStateController:
         manual_dirty_modules: Sequence[str],
         preview_shape: Optional[tuple],
         input_revision: int,
+        colorchecker_state: Optional[Dict[str, Any]] = None,
     ) -> WorkItemEditableState:
         roi_list = list(rois)
         active = int(active_roi_index)
@@ -73,6 +75,7 @@ class WorkspaceItemStateController:
                 tuple(preview_shape) if preview_shape is not None else None
             ),
             input_revision=max(0, int(input_revision)),
+            colorchecker_state=copy.deepcopy(colorchecker_state or {}),
         )
 
     @staticmethod
@@ -97,6 +100,7 @@ class WorkspaceItemStateController:
         item.manual_dirty_modules = list(state.manual_dirty_modules)
         item.preview_shape = state.preview_shape
         item.input_revision = state.input_revision
+        item.colorchecker_state = copy.deepcopy(state.colorchecker_state)
         item.runtime_preview = runtime_preview
 
     @classmethod
@@ -115,4 +119,5 @@ class WorkspaceItemStateController:
             manual_dirty_modules=item.manual_dirty_modules,
             preview_shape=item.preview_shape,
             input_revision=item.input_revision,
+            colorchecker_state=item.colorchecker_state,
         )

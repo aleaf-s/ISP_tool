@@ -96,7 +96,8 @@ class PreviewRequestCoordinator:
         if self.cancel_event is not None:
             self.cancel_event.set()
         future = self.current_future
-        if self._future_running(future) and future.cancel():
+        if self._future_running(future):
+            future.cancel()
             if count_drops:
                 self._notify_request_dropped()
 
@@ -113,6 +114,7 @@ class PreviewRequestCoordinator:
         future = self.current_future
         if self._future_running(future):
             future.cancel()
+            self._notify_request_dropped()
         event = threading.Event()
         self.cancel_event = event
         return PreviewRequestToken(self.generation, event)

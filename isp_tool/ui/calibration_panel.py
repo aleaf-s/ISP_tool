@@ -34,7 +34,7 @@ class CalibrationWorkspace(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.title("快速自动矫正 · V0.4.15")
+        self.title("快速自动矫正 · V0.4.38")
         self.geometry("720x700")
         self.minsize(620, 560)
         self.transient(parent)
@@ -90,7 +90,7 @@ class CalibrationWorkspace(tk.Toplevel):
         ]
         self.ccm_rotation_var = tk.IntVar(value=0)
         self.ccm_flip_var = tk.BooleanVar(value=False)
-        self.ccm_offset_var = tk.BooleanVar(value=True)
+        self.ccm_offset_var = tk.BooleanVar(value=False)
         self.ccm_ridge_var = tk.DoubleVar(value=0.0001)
         self.ccm_exclude_var = tk.StringVar(value="")
 
@@ -597,6 +597,9 @@ class CalibrationWorkspace(tk.Toplevel):
             "condition_number": result.condition_number,
             "matrix": result.matrix.tolist(),
             "offset": result.offset.tolist(),
+            "pre_ccm_exposure_gain": result.diagnostics.get(
+                "pre_ccm_exposure_gain", 1.0
+            ),
             "delta_e_before": result.delta_e_before,
             "delta_e_after": result.delta_e_after,
             "delta_e76_before": result.diagnostics.get("delta_e76_before"),
@@ -619,6 +622,9 @@ class CalibrationWorkspace(tk.Toplevel):
             for col in range(3):
                 module.parameters[f"m{row}{col}"] = float(result.matrix[row, col])
         module.parameters.update({
+            "input_gain": float(
+                result.diagnostics.get("pre_ccm_exposure_gain", 1.0)
+            ),
             "offset_r": float(result.offset[0]),
             "offset_g": float(result.offset[1]),
             "offset_b": float(result.offset[2]),
@@ -840,6 +846,9 @@ class InlineCalibrationWorkspace(ttk.Frame):
     def _set_colorchecker_corners(self, corners) -> None:
         for variable, point in zip(self.corner_vars, corners):
             variable.set(f"{point[0]:.3f},{point[1]:.3f}")
+        self.app.colorchecker_corners = [
+            tuple(map(float, point)) for point in corners
+        ]
 
     def sync_session(self) -> None:
         self.session.name = self.session_name_var.get().strip()

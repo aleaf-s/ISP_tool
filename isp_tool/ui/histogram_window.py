@@ -3,13 +3,21 @@ from __future__ import annotations
 import copy
 import time
 import tkinter as tk
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from tkinter import ttk
 
 import numpy as np
 
 from ..analysis import compute_histogram_details
 from ..yuv import compute_yuv_histogram_details
+from .controllers import (
+    ACTION_APPLY,
+    ACTION_CANCELLED,
+    ACTION_STALE,
+    ACTION_WAIT,
+    AnalysisRequestCoordinator,
+    AnalysisResultApplicationController,
+)
 from .theme import COLORS, FONTS
 
 
@@ -44,10 +52,12 @@ class HistogramWindow(tk.Toplevel):
         self.transient(app.root)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.generation = 0
-        self.pending_after = None
-        self.poll_after_ids: set[str] = set()
-        self.future: Future | None = None
+        self.requests = AnalysisRequestCoordinator(
+            self,
+            on_request_superseded=self._request_superseded,
+            on_result_stale=self._result_stale,
+        )
+        self.result_application = AnalysisResultApplicationController()
         self.cache = {}
         self.cache_limit = 12
         self.current_domain = ""
@@ -71,6 +81,43 @@ class HistogramWindow(tk.Toplevel):
 
     def tr(self, key: str, **values) -> str:
         return self.app.tr(key, **values)
+
+    @property
+    def generation(self) -> int:
+        return self.requests.generation
+
+    @generation.setter
+    def generation(self, value: int) -> None:
+        self.requests.generation = int(value)
+
+    @property
+    def pending_after(self):
+        return self.requests.pending_after
+
+    @pending_after.setter
+    def pending_after(self, value) -> None:
+        self.requests.pending_after = value
+
+    @property
+    def poll_after_ids(self):
+        return self.requests.poll_after_ids
+
+    @property
+    def future(self):
+        return self.requests.current_future
+
+    @future.setter
+    def future(self, value) -> None:
+        self.requests.current_future = value
+
+    def _request_superseded(self) -> None:
+        self.app._record_analysis_task_cancelled()
+        self.app.performance.increment("histogram_tasks_cancelled")
+        self.app.performance.set_value("histogram_tasks_in_flight", 0)
+
+    def _result_stale(self) -> None:
+        self.app._record_analysis_result_stale()
+        self.app.performance.increment("histogram_results_stale")
 
     def refresh_language(self) -> None:
         self.title(self.tr("hist.title"))
@@ -199,20 +246,17 @@ class HistogramWindow(tk.Toplevel):
     def refresh(self, delay: int = 180) -> None:
         if not self.winfo_exists():
             return
-        self.generation += 1
-        generation = self.generation
-        if self.pending_after is not None:
-            try:
-                self.after_cancel(self.pending_after)
-            except tk.TclError:
-                pass
-        self.pending_after = self.after(
-            max(0, int(delay)), lambda: self._start(generation)
+        self.app.performance.increment("analysis_tasks_submitted")
+        self.app.performance.increment("histogram_tasks_submitted")
+        self.requests.schedule(
+            self._start, delay_ms=max(0, int(delay))
         )
 
     def _start(self, generation: int) -> None:
-        self.pending_after = None
-        if generation != self.generation or not self.app.results:
+        if (
+            not self.requests.is_current(generation)
+            or not self.app.results
+        ):
             return
         index = self._module_result_index()
         result = self.app.results[index]
@@ -235,8 +279,26 @@ class HistogramWindow(tk.Toplevel):
         self.title_var.set(f"Histogram · {result.name}")
         cached = self.cache.get(key)
         if cached is not None:
-            self._apply(generation, key, cached)
-            return
+            try:
+                prepared = self.result_application.prepare(cached)
+            except Exception:
+                self.cache.pop(key, None)
+            else:
+                self.app.performance.add_cache(
+                    "histogram_window", hits=1
+                )
+                if self._apply(generation, key, prepared):
+                    self.app.performance.increment(
+                        "analysis_tasks_completed"
+                    )
+                    self.app.performance.increment(
+                        "histogram_tasks_completed"
+                    )
+                    self.app.performance.set_value(
+                        "histogram_tasks_in_flight", 0
+                    )
+                return
+        self.app.performance.add_cache("histogram_window", misses=1)
 
         metadata = copy.deepcopy(self.app.loaded.metadata)
         if domain == "yuv":
@@ -266,11 +328,11 @@ class HistogramWindow(tk.Toplevel):
                 domain, image, None, metadata, normalized, None, channels,
                 result.data_state,
             )
-        if self.future is not None and not self.future.done():
-            self.future.cancel()
         self.summary_var.set(self.tr("hist.computing"))
-        self.future = self.app.analysis_executor.submit(self._compute, *args)
-        self._poll(self.future, generation, key)
+        future = self.app.analysis_executor.submit(self._compute, *args)
+        self.requests.bind_future(future)
+        self.app.performance.set_value("histogram_tasks_in_flight", 1)
+        self._poll(future, generation, key)
 
     @staticmethod
     def _compute(
@@ -302,39 +364,62 @@ class HistogramWindow(tk.Toplevel):
             key: value for key, value in payload["curve_sizes"].items()
             if key in channels
         }
-        return payload, (time.perf_counter() - started) * 1000.0
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        payload["elapsed_ms"] = elapsed_ms
+        return {"value": payload, "elapsed_ms": elapsed_ms}
 
     def _poll(self, future: Future, generation: int, key) -> None:
         if not self.winfo_exists():
             return
-        if not future.done():
-            callback_id = None
-
-            def poll_again() -> None:
-                self.poll_after_ids.discard(callback_id)
-                self._poll(future, generation, key)
-
-            callback_id = self.after(15, poll_again)
-            self.poll_after_ids.add(callback_id)
+        decision = self.result_application.decide(
+            is_current=self.requests.is_current(generation),
+            context_valid=self.winfo_exists(),
+            done=future.done(),
+            cancelled=(future.cancelled() if future.done() else False),
+        )
+        if decision == ACTION_STALE:
+            self.requests.reject_stale_result()
             return
-        if generation != self.generation or future.cancelled():
+        if decision == ACTION_WAIT:
+            self.requests.schedule_poll(
+                lambda: self._poll(future, generation, key)
+            )
+            return
+        if decision == ACTION_CANCELLED:
+            self.app.performance.set_value("histogram_tasks_in_flight", 0)
             return
         try:
-            payload, elapsed_ms = future.result()
-        except Exception as exc:
-            self.summary_var.set(self.tr("hist.failed", error=exc))
+            prepared = self.result_application.prepare(future.result())
+        except CancelledError:
+            self.app.performance.set_value("histogram_tasks_in_flight", 0)
             return
-        payload["elapsed_ms"] = elapsed_ms
-        self.cache[key] = payload
+        except Exception as exc:
+            if self.requests.is_current(generation):
+                self.app.performance.increment("analysis_tasks_failed")
+                self.app.performance.increment("histogram_tasks_failed")
+                self.app.performance.set_value(
+                    "histogram_tasks_in_flight", 0
+                )
+                self.summary_var.set(self.tr("hist.failed", error=exc))
+            return
+        self.cache[key] = prepared.original_payload
         while len(self.cache) > self.cache_limit:
             self.cache.pop(next(iter(self.cache)))
-        self._apply(generation, key, payload)
+        if self._apply(generation, key, prepared):
+            self.app.performance.record("histogram", prepared.elapsed_ms)
+            self.app.performance.increment("analysis_tasks_completed")
+            self.app.performance.increment("histogram_tasks_completed")
+            self.app.performance.set_value("histogram_tasks_in_flight", 0)
 
-    def _apply(self, generation: int, _key, payload) -> None:
-        if generation != self.generation or not self.winfo_exists():
-            return
-        self.last_payload = payload
+    def _apply(self, generation: int, _key, prepared) -> bool:
+        if (
+            not self.requests.is_current(generation)
+            or not self.winfo_exists()
+        ):
+            return False
+        self.last_payload = prepared.value
         self._redraw()
+        return True
 
     def _redraw(self) -> None:
         payload = self.last_payload
@@ -468,21 +553,8 @@ class HistogramWindow(tk.Toplevel):
     def close(self) -> None:
         if not self.winfo_exists():
             return
-        self.generation += 1
-        if self.pending_after is not None:
-            try:
-                self.after_cancel(self.pending_after)
-            except tk.TclError:
-                pass
-            self.pending_after = None
-        for callback_id in tuple(self.poll_after_ids):
-            try:
-                self.after_cancel(callback_id)
-            except tk.TclError:
-                pass
-        self.poll_after_ids.clear()
-        if self.future is not None and not self.future.done():
-            self.future.cancel()
+        self.requests.close()
+        self.app.performance.set_value("histogram_tasks_in_flight", 0)
         self.app.histogram_window_geometry = self.geometry()
         self.app.histogram_scale = self.scale_var.get()
         self.app.histogram_use_roi = bool(self.roi_var.get())

@@ -29,7 +29,9 @@ from ..calibration.colorchecker import (
     reorder_reference_indices,
     sample_colorchecker,
 )
+from ..calibration.colorchecker_detection import detect_colorchecker
 from ..calibration.ccm_solver import apply_ccm
+from ..calibration.ccm_analysis import evaluate_matrix
 from ..models import (
     AWBResult,
     CCMCalibrationResult,
@@ -40,6 +42,7 @@ from ..models import (
 from ..preview import encode_display_uint8
 from ..raw_io import PLAIN_EXTENSIONS, load_image
 from .calibration_state import CalibrationStateMachine, CalibrationUIState
+from .ccm_analysis_window import CCMAnalysisWindow
 from .theme import COLORS, STATUS_COLORS
 from .widgets import (
     ActionMenu,
@@ -101,6 +104,9 @@ class AutoCalibrationPanel(ttk.Frame):
         }
         self.method_preferences: Dict[str, str] = {}
         self.direct_apply_after_analysis = ""
+        self.ccm_region_source = ""
+        self.ccm_detection_confidence: Optional[float] = None
+        self.ccm_analysis_window: Optional[CCMAnalysisWindow] = None
         self.toast = ToastManager(self)
         self._build()
 
@@ -140,10 +146,11 @@ class AutoCalibrationPanel(ttk.Frame):
         )
         self.settings_label.pack(anchor="w", pady=(0, 4))
         self.source_var = tk.StringVar(value="Stage: — · Domain: — · ROI: Full")
-        ttk.Label(
+        self.source_label = ttk.Label(
             middle, textvariable=self.source_var, style="Muted.TLabel",
             wraplength=370,
-        ).pack(fill="x", pady=(0, 6))
+        )
+        self.source_label.pack(fill="x", pady=(0, 6))
         self.message = InlineMessage(middle)
         self.message.pack(fill="x")
         self.message.hide()
@@ -244,6 +251,8 @@ class AutoCalibrationPanel(ttk.Frame):
         )
         self.awb_region_frame.pack(fill="x", pady=(2, 0))
 
+        self._build_ccm_setup_panel(basic)
+
         self.data_section = CollapsibleSection(
             options_host, "校准图像（可选）", expanded=True,
             on_toggle=lambda value: self._section_changed("data", value),
@@ -336,100 +345,215 @@ class AutoCalibrationPanel(ttk.Frame):
             self.awb_region_buttons[1].configure(
                 text=self.tr("awb.current_roi")
             )
+        self.ccm_setup_frame.configure(text=self.tr("ccm.setup"))
+        self.ccm_region_label.configure(text=self.tr("ccm.region"))
+        self.ccm_detect_button.configure(text=self.tr("ccm.detect"))
+        self.ccm_region_menu.set_text(self.tr("ccm.region_menu"))
+        self.ccm_region_menu.set_item_label(
+            self.ccm_use_roi_index, self.tr("ccm.use_roi")
+        )
+        self.ccm_region_menu.set_item_label(
+            self.ccm_detect_roi_index, self.tr("ccm.detect_roi")
+        )
+        self.ccm_region_menu.set_item_label(
+            self.ccm_grid_index, self.tr("ccm.make_grid")
+        )
+        self.ccm_region_menu.set_item_label(
+            self.ccm_edit_index, self.tr("ccm.edit_corners")
+        )
+        self.ccm_region_menu.set_item_label(
+            self.ccm_center_index, self.tr("ccm.center")
+        )
+        self.ccm_orientation_label.configure(text=self.tr("ccm.orientation"))
+        self.ccm_flip_check.configure(text=self.tr("ccm.flip"))
+        self.ccm_illuminant_label.configure(text=self.tr("ccm.illuminant"))
+        self.ccm_statistic_label.configure(text=self.tr("ccm.statistic"))
+        self.ccm_offset_check.configure(text=self.tr("ccm.include_offset"))
+        self.ccm_exclude_label.configure(text=self.tr("ccm.exclude"))
+        self.ccm_result_frame.configure(text="CCM")
+        self.ccm_preview_button.configure(text=self.tr("ccm.preview"))
+        self.ccm_apply_button.configure(text=self.tr("ccm.correct"))
+        self.ccm_exclude_button.configure(text=self.tr("ccm.exclude_refit"))
+        self.ccm_analysis_button.configure(text="Color Analysis")
         self._update_action_states()
 
-    def _build_ccm_result_panel(self, parent) -> None:
-        self.ccm_result_frame = ttk.LabelFrame(
-            parent, text="CCM 结果验证", padding=8
+    def _build_ccm_setup_panel(self, parent) -> None:
+        """Build the compact, task-oriented ColorChecker setup controls."""
+        self.ccm_setup_frame = ttk.LabelFrame(
+            parent, text="ColorChecker 设置", padding=(8, 6)
         )
-        self.ccm_verdict_var = tk.StringVar(value="")
+        self.ccm_region_label = ttk.Label(
+            self.ccm_setup_frame, text="1. 色卡区域"
+        )
+        self.ccm_region_label.grid(row=0, column=0, sticky="w")
+        region_actions = ttk.Frame(self.ccm_setup_frame)
+        region_actions.grid(
+            row=1, column=0, columnspan=4, sticky="ew", pady=(3, 3)
+        )
+        self.ccm_detect_button = ttk.Button(
+            region_actions,
+            text="自动检测",
+            command=self._detect_ccm_chart,
+            style="Primary.TButton",
+        )
+        self.ccm_detect_button.pack(side="left")
+        self.ccm_region_menu = ActionMenu(region_actions, "Region")
+        self.ccm_use_roi_index = self.ccm_region_menu.add_command(
+            "使用当前 ROI", self._ccm_corners_from_roi,
+            enabled=lambda: self.app.roi is not None,
+        )
+        self.ccm_detect_roi_index = self.ccm_region_menu.add_command(
+            "在当前 ROI 内检测",
+            lambda: self._detect_ccm_chart(use_current_roi=True),
+            enabled=lambda: (
+                self.app.roi is not None
+                or getattr(self.app, "roi_grid_bounds", None) is not None
+            ),
+        )
+        self.ccm_grid_index = self.ccm_region_menu.add_command(
+            "生成 4×6 色块", self._ccm_generate_patch_rois,
+            enabled=lambda: self.app.roi is not None,
+        )
+        self.ccm_edit_index = self.ccm_region_menu.add_command(
+            "微调四角", self._ccm_edit_corners,
+        )
+        self.ccm_center_index = self.ccm_region_menu.add_command(
+            "重置到图像中心", self._ccm_reset_center,
+        )
+        self.ccm_region_menu.pack(side="left", padx=4)
+        self.ccm_source_status_var = tk.StringVar(value="")
         ttk.Label(
-            self.ccm_result_frame,
-            textvariable=self.ccm_verdict_var,
-            wraplength=350,
-        ).pack(fill="x")
-        self.ccm_summary_var = tk.StringVar(value="")
-        ttk.Label(
-            self.ccm_result_frame,
-            textvariable=self.ccm_summary_var,
+            self.ccm_setup_frame,
+            textvariable=self.ccm_source_status_var,
             style="Muted.TLabel",
-            wraplength=350,
-        ).pack(fill="x", pady=(3, 6))
-        matrices = ttk.Frame(self.ccm_result_frame)
-        matrices.pack(fill="x")
+            wraplength=340,
+        ).grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+
+        self.ccm_orientation_label = ttk.Label(
+            self.ccm_setup_frame, text="方向"
+        )
+        self.ccm_orientation_label.grid(row=3, column=0, sticky="w")
+        self.ccm_rotation_combo = ttk.Combobox(
+            self.ccm_setup_frame,
+            textvariable=self.workspace.ccm_rotation_var,
+            values=(0, 90, 180, 270),
+            state="readonly",
+            width=7,
+        )
+        self.ccm_rotation_combo.grid(row=4, column=0, sticky="ew", padx=(0, 5))
+        self.ccm_flip_check = ttk.Checkbutton(
+            self.ccm_setup_frame,
+            text="Flip",
+            variable=self.workspace.ccm_flip_var,
+            command=self._options_changed,
+        )
+        self.ccm_flip_check.grid(row=4, column=1, sticky="w")
+        self.ccm_illuminant_label = ttk.Label(
+            self.ccm_setup_frame, text="Illuminant"
+        )
+        self.ccm_illuminant_label.grid(row=3, column=2, sticky="w")
+        self.ccm_illuminant_combo = ttk.Combobox(
+            self.ccm_setup_frame,
+            textvariable=self.workspace.illuminant_var,
+            values=("D65", "D50", "A"),
+            state="readonly",
+            width=8,
+        )
+        self.ccm_illuminant_combo.grid(row=4, column=2, sticky="ew", padx=(5, 0))
+
+        self.ccm_statistic_var = tk.StringVar(value="Median")
+        self.ccm_statistic_label = ttk.Label(
+            self.ccm_setup_frame, text="采样"
+        )
+        self.ccm_statistic_label.grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.ccm_statistic_combo = ttk.Combobox(
+            self.ccm_setup_frame,
+            textvariable=self.ccm_statistic_var,
+            values=("Median", "Trimmed Mean", "Robust Mean"),
+            state="readonly",
+            width=15,
+        )
+        self.ccm_statistic_combo.grid(row=6, column=0, columnspan=2, sticky="ew", padx=(0, 5))
+        self.ccm_offset_check = ttk.Checkbutton(
+            self.ccm_setup_frame,
+            text="Include Offset",
+            variable=self.workspace.ccm_offset_var,
+            command=self._options_changed,
+        )
+        self.ccm_offset_check.grid(row=6, column=2, sticky="w", padx=(5, 0))
+        self.ccm_exclude_label = ttk.Label(
+            self.ccm_setup_frame, text="排除色块"
+        )
+        self.ccm_exclude_label.grid(row=7, column=0, sticky="w", pady=(6, 0))
+        self.ccm_exclude_entry = ttk.Entry(
+            self.ccm_setup_frame,
+            textvariable=self.workspace.ccm_exclude_var,
+        )
+        self.ccm_exclude_entry.grid(row=8, column=0, columnspan=3, sticky="ew")
+        self.ccm_exclude_entry.bind("<Return>", lambda _event: self._options_changed())
+        self.ccm_rotation_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._ccm_setup_changed()
+        )
+        self.ccm_illuminant_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._options_changed()
+        )
+        self.ccm_statistic_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._options_changed()
+        )
+        for column in range(3):
+            self.ccm_setup_frame.columnconfigure(column, weight=1)
+        self._ccm_extra_widgets = [
+            self.ccm_orientation_label, self.ccm_rotation_combo, self.ccm_flip_check,
+            self.ccm_illuminant_label, self.ccm_illuminant_combo,
+        ]
+        for widget in self._ccm_extra_widgets + [
+            self.ccm_statistic_label, self.ccm_statistic_combo, self.ccm_offset_check,
+            self.ccm_exclude_label, self.ccm_exclude_entry,
+        ]:
+            widget.grid_remove()
+        self.ccm_region_menu.add_command("ColorChecker · Orientation / Illuminant", self._toggle_ccm_setup)
+
+    def _toggle_ccm_setup(self):
+        visible = bool(self.ccm_rotation_combo.winfo_manager())
+        for widget in self._ccm_extra_widgets:
+            widget.grid_remove() if visible else widget.grid()
+
+    def _build_ccm_result_panel(self, parent) -> None:
+        self.ccm_result_frame = ttk.LabelFrame(parent, text="CCM", padding=8)
+        self.ccm_verdict_var = tk.StringVar(value="")
+        self.ccm_summary_var = tk.StringVar(value="")
         self.ccm_initial_matrix_var = tk.StringVar(value="")
         self.ccm_final_matrix_var = tk.StringVar(value="")
-        for column, title, variable in (
-            (0, "优化前 CCM", self.ccm_initial_matrix_var),
-            (1, "优化后 CCM", self.ccm_final_matrix_var),
-        ):
-            box = ttk.Frame(matrices)
-            box.grid(row=0, column=column, sticky="nsew", padx=(0, 6))
-            ttk.Label(box, text=title).pack(anchor="w")
-            ttk.Label(
-                box,
-                textvariable=variable,
-                style="Mono.TLabel",
-                justify="left",
-            ).pack(anchor="w")
-            matrices.columnconfigure(column, weight=1)
-
-        previews = ttk.Frame(self.ccm_result_frame)
-        previews.pack(fill="x", pady=(7, 5))
-        self.ccm_before_preview = ttk.Label(
-            previews, text="原图（显示映射）", anchor="center"
-        )
-        self.ccm_after_preview = ttk.Label(
-            previews, text="校正图（显示映射）", anchor="center"
-        )
-        self.ccm_before_preview.grid(row=0, column=0, sticky="nsew")
-        self.ccm_after_preview.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        previews.columnconfigure(0, weight=1)
-        previews.columnconfigure(1, weight=1)
+        self.ccm_matrix_vars = []
+        self.ccm_matrix_entries = []
+        matrix_frame = ttk.Frame(self.ccm_result_frame)
+        matrix_frame.pack(fill="x", pady=(3, 8))
+        for row in range(3):
+            for col in range(3):
+                variable = tk.StringVar(value="1.0000" if row == col else "0.0000")
+                entry = ttk.Entry(matrix_frame, textvariable=variable, width=9, justify="right")
+                entry.grid(row=row, column=col, sticky="ew", padx=3, pady=4)
+                entry.bind("<Return>", lambda e: self._correct_edited_ccm())
+                self.ccm_matrix_vars.append(variable)
+                self.ccm_matrix_entries.append(entry)
+            matrix_frame.columnconfigure(row, weight=1)
+        ttk.Label(self.ccm_result_frame, textvariable=self.ccm_verdict_var,
+                  wraplength=340, style="Muted.TLabel").pack(fill="x")
+        actions = ttk.Frame(self.ccm_result_frame)
+        actions.pack(fill="x", pady=(8, 0))
+        self.ccm_apply_button = ttk.Button(
+            actions, text=self.tr("ccm.correct"), command=self._correct_edited_ccm,
+            style="Primary.TButton")
+        self.ccm_apply_button.pack(side="left", expand=True, fill="x")
+        self.ccm_analysis_button = ttk.Button(
+            actions, text="Color Analysis", command=self.open_ccm_analysis)
+        self.ccm_analysis_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        # Compatibility handles for the existing state controller; these are
+        # not rendered, and there is no second result table to synchronise.
+        self.ccm_preview_button = ttk.Button(self.ccm_result_frame, command=self.preview)
+        self.ccm_exclude_button = ttk.Button(self.ccm_result_frame)
+        self.ccm_patch_tree = ttk.Treeview(self.ccm_result_frame, columns=("id",), show="headings")
         self._ccm_preview_photos = []
-
-        columns = (
-            "id", "status", "input", "target", "corrected",
-            "before", "after",
-        )
-        self.ccm_patch_tree = ttk.Treeview(
-            self.ccm_result_frame,
-            columns=columns,
-            show="headings",
-            height=8,
-        )
-        headings = {
-            "id": "#",
-            "status": "状态",
-            "input": "输入 RGB",
-            "target": "目标 RGB",
-            "corrected": "校正 RGB",
-            "before": "ΔE 前",
-            "after": "ΔE 后",
-        }
-        for column in columns:
-            self.ccm_patch_tree.heading(
-                column, text=headings[column]
-            )
-            self.ccm_patch_tree.column(
-                column,
-                width=46 if column in {"id", "before", "after"} else 118,
-                anchor="center",
-                stretch=column not in {"id", "before", "after"},
-            )
-        patch_scroll = ttk.Scrollbar(
-            self.ccm_result_frame,
-            orient="horizontal",
-            command=self.ccm_patch_tree.xview,
-        )
-        self.ccm_patch_tree.configure(
-            xscrollcommand=patch_scroll.set
-        )
-        self.ccm_patch_tree.pack(fill="x")
-        patch_scroll.pack(fill="x")
-        router = getattr(self.app, "wheel_router", None)
-        if router is not None:
-            router.register(self.ccm_patch_tree, self.ccm_patch_tree)
 
     @staticmethod
     def _format_ccm_matrix(values) -> str:
@@ -457,7 +581,16 @@ class AutoCalibrationPanel(ttk.Frame):
             return "—"
         return f"{numeric:.2f}" if np.isfinite(numeric) else "—"
 
-    def _thumbnail_photo(self, rgb: np.ndarray) -> ImageTk.PhotoImage:
+    def _thumbnail_photo(
+        self,
+        rgb: np.ndarray,
+        *,
+        matrix: Optional[np.ndarray] = None,
+        offset: Optional[np.ndarray] = None,
+        input_gain: float = 1.0,
+    ) -> ImageTk.PhotoImage:
+        """Create a CCM preview without transforming the full-resolution frame."""
+
         values = np.asarray(rgb, dtype=np.float32)
         height, width = values.shape[:2]
         scale = min(170 / max(width, 1), 110 / max(height, 1), 1.0)
@@ -470,134 +603,132 @@ class AutoCalibrationPanel(ttk.Frame):
                 ),
                 interpolation=cv2.INTER_AREA,
             )
+        if matrix is not None:
+            values = apply_ccm(
+                values * float(input_gain),
+                np.asarray(matrix, dtype=np.float64),
+                offset,
+            )
         display = encode_display_uint8(
             values,
             getattr(self.app, "preview_exposure_ev", 0.0),
         )
         return ImageTk.PhotoImage(Image.fromarray(display))
 
-    def _show_ccm_result(
-        self,
-        result: ParameterRecommendation,
-        base_image: Optional[np.ndarray] = None,
-    ) -> None:
+    def _show_ccm_result(self, result, base_image=None) -> None:
         measurements = result.measurements
-        safe = bool(measurements.get("safe_to_apply", False))
-        reasons = list(measurements.get("rejection_reasons", []))
-        self.ccm_verdict_var.set(
-            "✓ 结果通过安全检查，可以应用"
-            if safe
-            else "⚠ 结果未通过安全检查，不会自动应用"
-            + (f"：{'；'.join(reasons)}" if reasons else "")
-        )
-        before = measurements.get("delta_e_before", {})
-        initial = measurements.get("delta_e_initial", {})
-        after = measurements.get("delta_e_after", {})
-        row_sums = measurements.get("row_sums") or []
-        diagonal_values = measurements.get("diagonal_values") or []
-        negative_off_diagonal_count = int(
-            measurements.get("negative_off_diagonal_count", 0)
-        )
-        self.ccm_summary_var.set(
-            "平均 ΔE "
-            f"{before.get('mean', 0):.2f} → "
-            f"{initial.get('mean', 0):.2f} → "
-            f"{after.get('mean', 0):.2f}；最大 ΔE "
-            f"{before.get('max', 0):.2f} → "
-            f"{after.get('max', 0):.2f}\n"
-            "行和 "
-            + ", ".join(f"{float(value):.3f}" for value in row_sums)
-            + "\n主对角 "
-            + ", ".join(
-                f"{float(value):.3f}" for value in diagonal_values
-            )
-            + f"；负非对角 {negative_off_diagonal_count}/6"
-            + f"；矩阵条件数 {float(measurements.get('condition_number', 0)):.2f}；"
-            f"整图负值 {float(measurements.get('frame_negative_ratio', measurements.get('negative_ratio', 0))) * 100:.1f}% / "
-            f"溢出 {float(measurements.get('frame_overflow_ratio', measurements.get('overflow_ratio', 0))) * 100:.1f}%"
-        )
-        initial_matrix = measurements.get("initial_matrix")
-        final_matrix = measurements.get("matrix")
-        self.ccm_initial_matrix_var.set(
-            self._format_ccm_matrix(initial_matrix)
-            if initial_matrix is not None else "—"
-        )
-        self.ccm_final_matrix_var.set(
-            self._format_ccm_matrix(final_matrix)
-            if final_matrix is not None else "—"
-        )
-        self.ccm_patch_tree.delete(
-            *self.ccm_patch_tree.get_children()
-        )
-        for patch in measurements.get("patches", []):
-            diagnostics = patch.get("diagnostics", {})
-            status = (
-                "有效"
-                if diagnostics.get("valid", True)
-                else "异常："
-                + "、".join(
-                    map(str, diagnostics.get("reasons", []))
-                )
-            )
-            self.ccm_patch_tree.insert(
-                "",
-                "end",
-                values=(
-                    patch.get("patch_id", ""),
-                    status,
-                    self._format_rgb(patch.get("measured_rgb", (0, 0, 0))),
-                    self._format_rgb(patch.get("reference_rgb", (0, 0, 0))),
-                    self._format_rgb(
-                        diagnostics.get("corrected_rgb", (0, 0, 0))
-                    ),
-                    self._format_metric(
-                        diagnostics.get("delta_e_before")
-                    ),
-                    self._format_metric(
-                        diagnostics.get("delta_e_after")
-                    ),
-                ),
-            )
-        if base_image is None and self.app.results:
-            try:
-                base_image = self.app.results[
-                    self._stage_before("color_correction_matrix")
-                ].image
-            except Exception:
-                base_image = None
-        self._ccm_preview_photos = []
-        if (
-            base_image is not None
-            and final_matrix is not None
-            and np.asarray(base_image).ndim == 3
-        ):
-            offset = np.asarray(
-                measurements.get("offset", (0, 0, 0)),
-                dtype=np.float64,
-            )
-            corrected = apply_ccm(
-                base_image, np.asarray(final_matrix), offset
-            )
-            before_photo = self._thumbnail_photo(base_image)
-            after_photo = self._thumbnail_photo(corrected)
-            self._ccm_preview_photos = [before_photo, after_photo]
-            self.ccm_before_preview.configure(
-                image=before_photo, text="原图"
-            )
-            self.ccm_after_preview.configure(
-                image=after_photo, text="校正图"
-            )
-        else:
-            self.ccm_before_preview.configure(
-                image="", text="原图预览不可用"
-            )
-            self.ccm_after_preview.configure(
-                image="", text="校正预览不可用"
-            )
+        matrix = np.asarray(measurements.get("matrix", np.eye(3))).reshape(3, 3)
+        for variable, value in zip(self.ccm_matrix_vars, matrix.ravel()):
+            variable.set(f"{value:.6f}")
+        self.ccm_initial_matrix_var.set(self._format_ccm_matrix(
+            measurements.get("initial_matrix", matrix)))
+        self.ccm_final_matrix_var.set(self._format_ccm_matrix(matrix))
+        self.ccm_verdict_var.set(self.tr("ccm.edit_hint"))
+        self.ccm_summary_var.set("")
         if not self.ccm_result_frame.winfo_manager():
-            self.ccm_result_frame.pack(
-                fill="x", pady=(7, 0)
+            self.ccm_result_frame.pack(fill="x", pady=(7, 0))
+        window = self.ccm_analysis_window
+        if window is not None and window.winfo_exists():
+            window.set_result(measurements)
+
+    def _correct_edited_ccm(self) -> None:
+        """Apply and evaluate exactly the nine visible cells, without fitting."""
+        if self.result is None or self.module_var.get() != "CCM":
+            return
+        if self.states["CCM"].state == CalibrationUIState.RUNNING:
+            return
+        try:
+            matrix = np.array([float(v.get()) for v in self.ccm_matrix_vars]).reshape(3, 3)
+            if self.controller.has_preview:
+                self.controller.revert()
+            current = self.app.pipeline.module_by_id("color_correction_matrix")
+            # Re-sample the current upstream stage so ROI or WB edits cannot
+            # silently reuse measurements from an older image.
+            patches = self._colorchecker_patches()
+            measurements = dict(self.result.measurements)
+            measurements["patches"] = [p.to_dict() for p in patches]
+            gain = float(measurements.get("pre_ccm_exposure_gain", 1.0))
+            offset = np.asarray(measurements.get("offset", [0, 0, 0]), dtype=float)
+            measurements = evaluate_matrix(measurements, matrix, gain, offset)
+            result = copy.deepcopy(self.result)
+            result.current_parameters = copy.deepcopy(current.parameters)
+            result.suggested_parameters = {
+                f"m{r}{c}": float(matrix[r, c]) for r in range(3) for c in range(3)
+            }
+            result.suggested_parameters.update(
+                input_gain=gain, offset_r=float(offset[0]),
+                offset_g=float(offset[1]), offset_b=float(offset[2]), strength=1.0)
+            result.measurements = measurements
+            result.method = "Manual CCM evaluation"
+            result.warnings = []
+            machine = self.states["CCM"]
+            machine.state = CalibrationUIState.SUGGESTED
+            machine.parameter_snapshot = copy.deepcopy(current.parameters)
+            self.result = result
+            self.preview()
+            if machine.state != CalibrationUIState.PREVIEWING:
+                return
+            self.apply()
+            if machine.state != CalibrationUIState.APPLIED:
+                return
+            self._show_ccm_result(result)
+            self.ccm_verdict_var.set(self.tr("ccm.corrected"))
+        except Exception as exc:
+            self.message.show(str(exc), "error")
+
+    def open_ccm_analysis(self) -> None:
+        if self.result is None or self.result.module_id != "colorchecker_ccm":
+            self.message.show("请先计算 CCM。", "warning")
+            return
+        if (
+            self.ccm_analysis_window is None
+            or not self.ccm_analysis_window.winfo_exists()
+        ):
+            self.ccm_analysis_window = CCMAnalysisWindow(
+                self,
+                on_patch_selected=self.focus_ccm_patch,
+                on_toggle_patch=self._toggle_ccm_patch,
             )
+        self.ccm_analysis_window.set_result(self.result.measurements)
+        self.ccm_analysis_window.deiconify()
+        self.ccm_analysis_window.lift()
+
+    def focus_ccm_patch(self, patch_id: int) -> None:
+        patch_id = max(1, min(int(patch_id), 24))
+        iid = f"patch-{patch_id}"
+        if self.ccm_patch_tree.exists(iid) and self.ccm_patch_tree.selection() != (iid,):
+            self.ccm_patch_tree.selection_set(iid)
+            self.ccm_patch_tree.see(iid)
+        self.app.select_colorchecker_patch(patch_id)
+        window = self.ccm_analysis_window
+        if window is not None and window.winfo_exists():
+            window.focus_patch(patch_id, notify=False)
+
+    def _ccm_patch_tree_selected(self, _event=None) -> None:
+        selection = self.ccm_patch_tree.selection()
+        if not selection:
+            return
+        values = self.ccm_patch_tree.item(selection[0], "values")
+        if values:
+            self.focus_ccm_patch(int(values[0]))
+
+    def _toggle_ccm_patch(self, patch_id: int) -> None:
+        excluded = {
+            int(token)
+            for token in self.workspace.ccm_exclude_var.get()
+            .replace("，", ",").split(",")
+            if token.strip()
+        }
+        patch_id = int(patch_id)
+        if patch_id in excluded:
+            excluded.remove(patch_id)
+        else:
+            excluded.add(patch_id)
+        self.workspace.ccm_exclude_var.set(
+            ",".join(map(str, sorted(excluded)))
+        )
+        self._options_changed()
+        self.analyze()
 
     def _module_changed(self, _event=None) -> None:
         if self.controller.has_preview:
@@ -765,6 +896,17 @@ class AutoCalibrationPanel(ttk.Frame):
 
     def _update_module_specific_layout(self) -> None:
         is_awb = self.module_var.get() == "AWB"
+        is_ccm = self.module_var.get() == "CCM"
+        if is_ccm:
+            self.source_label.pack_forget()
+            self.method_label.pack_forget()
+            self.method_combo.pack_forget()
+        else:
+            if not self.source_label.winfo_manager():
+                self.source_label.pack(fill="x", pady=(0, 6), after=self.settings_label)
+            if not self.method_label.winfo_manager():
+                self.method_label.pack(anchor="w")
+                self.method_combo.pack(fill="x", pady=(2, 5), after=self.method_label)
         uses_calibration_files = self.module_var.get() in {
             "BLC", "LSC",
         }
@@ -782,12 +924,21 @@ class AutoCalibrationPanel(ttk.Frame):
                 after=self.method_combo,
             )
             self.data_section.pack_forget()
+            self.ccm_setup_frame.pack_forget()
             self._refresh_awb_quick_options()
         else:
             self.method_label.configure(text="Method / Mode")
             self.method_help_label.pack_forget()
             self.awb_region_frame.pack_forget()
-            if not self.use_roi_check.winfo_manager():
+            if is_ccm:
+                if not self.ccm_setup_frame.winfo_manager():
+                    self.ccm_setup_frame.pack(fill="x", pady=(6, 0))
+                self._refresh_ccm_source_status()
+            else:
+                self.ccm_setup_frame.pack_forget()
+            if is_ccm:
+                self.use_roi_check.pack_forget()
+            elif not self.use_roi_check.winfo_manager():
                 self.use_roi_check.pack(anchor="w")
             if (
                 uses_calibration_files
@@ -910,15 +1061,9 @@ class AutoCalibrationPanel(ttk.Frame):
                     f"{'Yes' if p99 <= dark_limit else 'No'}"
                 )
             if self.module_var.get() == "CCM":
-                rotation_value = self.option_vars.get(
-                    "rotation", self.workspace.ccm_rotation_var
-                ).get()
-                flip_value = self.option_vars.get(
-                    "flip", self.workspace.ccm_flip_var
-                ).get()
-                excluded_value = str(self.option_vars.get(
-                    "excluded_patches", self.workspace.ccm_exclude_var
-                ).get())
+                rotation_value = self.workspace.ccm_rotation_var.get()
+                flip_value = self.workspace.ccm_flip_var.get()
+                excluded_value = self.workspace.ccm_exclude_var.get()
                 excluded = {
                     token.strip()
                     for token in excluded_value.replace("，", ",").split(",")
@@ -949,13 +1094,31 @@ class AutoCalibrationPanel(ttk.Frame):
         state = machine.state
         self.analyze_button.configure(
             text=(
+                self.tr("ccm.calculating")
+                if self.module_var.get() == "CCM"
+                and state == CalibrationUIState.RUNNING
+                else self.tr("ccm.recalculate")
+                if self.module_var.get() == "CCM"
+                and state in {
+                    CalibrationUIState.SUGGESTED,
+                    CalibrationUIState.APPLIED,
+                    CalibrationUIState.FAILED,
+                    CalibrationUIState.STALE,
+                }
+                else self.tr("ccm.calculate")
+                if self.module_var.get() == "CCM"
+                else
                 self.tr("awb.correcting")
                 if state == CalibrationUIState.RUNNING
                 else self.tr("awb.recorrect_apply")
                 if state == CalibrationUIState.APPLIED
                 else self.tr("awb.correct_apply")
             ),
-            command=self.correct_and_apply_current,
+            command=(
+                self.calculate_ccm
+                if self.module_var.get() == "CCM"
+                else self.correct_and_apply_current
+            ),
             style="Primary.TButton",
             state=(
                 "disabled"
@@ -963,6 +1126,32 @@ class AutoCalibrationPanel(ttk.Frame):
                 else "normal"
             ),
         )
+        if hasattr(self, "ccm_apply_button"):
+            safe = bool(
+                self.result
+                and self.result.measurements.get("safe_to_apply", False)
+            )
+            self.ccm_preview_button.configure(
+                state="normal" if machine.can_preview else "disabled"
+            )
+            self.ccm_apply_button.configure(
+                state=(
+                    "normal"
+                    if self.result is not None and self.module_var.get() == "CCM"
+                    and state != CalibrationUIState.RUNNING
+                    else "disabled"
+                )
+            )
+            self.ccm_analysis_button.configure(
+                state="normal" if self.result is not None else "disabled"
+            )
+            self.ccm_exclude_button.configure(
+                state=(
+                    "normal"
+                    if self.module_var.get() == "CCM" and self.result
+                    else "disabled"
+                )
+            )
         self.state_var.set(
             {
                 CalibrationUIState.NOT_ANALYZED: self.tr("awb.state.not_analyzed"),
@@ -1018,6 +1207,7 @@ class AutoCalibrationPanel(ttk.Frame):
                 ("Include offset", "include_offset", "bool", bool(self.workspace.ccm_offset_var.get()), ()),
                 ("Ridge", "ridge", "float", float(self.workspace.ccm_ridge_var.get()), ()),
                 ("Excluded patches", "excluded_patches", "text", self.workspace.ccm_exclude_var.get(), ()),
+                ("Sample statistic", "sample_statistic", "text", self.ccm_statistic_var.get(), ()),
             ),
         }[module]
         for _label, key, kind, default, _choices in specifications:
@@ -1048,8 +1238,220 @@ class AutoCalibrationPanel(ttk.Frame):
             )
             return
         self.workspace._corners_from_roi()
+        self.ccm_region_source = "roi"
+        self.ccm_detection_confidence = None
+        self.use_roi_var.set(True)
+        self.app.calibration_polygons = generate_colorchecker_grid(
+            self.workspace._parse_corners()
+        )
         self.message.show("ColorChecker 角点已从当前 ROI 更新。", "success")
+        self._refresh_ccm_source_status()
+        self.app.render_current()
         self._options_changed()
+
+    def _ccm_setup_changed(self) -> None:
+        if self.ccm_region_source in {"roi", "corners"}:
+            try:
+                rotation = int(self.workspace.ccm_rotation_var.get())
+                columns, rows = (
+                    (4, 6) if rotation in {90, 270} else (6, 4)
+                )
+                self.app.calibration_polygons = generate_colorchecker_grid(
+                    self.workspace._parse_corners(),
+                    columns=columns,
+                    rows=rows,
+                )
+            except ISPError:
+                self.app.calibration_polygons = []
+        self._refresh_ccm_source_status()
+        self.app.render_current()
+        self._options_changed()
+
+    def _ccm_generate_patch_rois(self) -> None:
+        if self.app.roi is None:
+            self.message.show("请先在主预览框选 ColorChecker 外框。", "warning")
+            return
+        self.app.generate_24_rois(rows=4, cols=6, inset_fraction=0.18)
+        self.ccm_region_source = "grid"
+        self.ccm_detection_confidence = None
+        self.use_roi_var.set(False)
+        self.app.calibration_polygons = []
+        self._refresh_ccm_source_status()
+        self._options_changed()
+
+    def _ccm_edit_corners(self) -> None:
+        try:
+            stage = self.workspace._full_stage(
+                self._stage_before("color_correction_matrix")
+            )
+            if stage.domain != "rgb":
+                raise ISPError("色卡四角编辑需要线性 RGB 输入")
+            if (
+                self.app.roi_grid_bounds is None
+                and self.app.roi is not None
+                and self.ccm_region_source
+                not in {"detected", "corners", "roi"}
+            ):
+                self.workspace._corners_from_roi()
+            corners = self.workspace._parse_corners()
+        except Exception as exc:
+            self.message.show(str(exc), "error")
+            return
+        self.app._set_colorchecker_corners(corners, source="corners")
+        self.app.colorchecker_edit_active = True
+        self.app.render_current()
+        self.message.show(
+            "已启用主预览色卡编辑：拖动黄色角点调整透视，"
+            "拖动框内区域移动整张色卡。",
+            "info",
+        )
+
+    def _ccm_reset_center(self) -> None:
+        try:
+            self.app._set_colorchecker_corners(
+                self.app._default_colorchecker_corners(),
+                source="default",
+            )
+        except ISPError as exc:
+            self.message.show(str(exc), "error")
+            return
+        self.app.colorchecker_edit_active = True
+        self.app.colorchecker_selected_patch = 0
+        self._options_changed()
+        self.app.render_current()
+        self.message.show("ColorChecker 已重置到图像中心。", "success")
+
+    def _refresh_ccm_source_status(self) -> None:
+        grid_ready = (
+            self.ccm_region_source in {"", "grid"}
+            and
+            len(getattr(self.app, "rois", [])) == 24
+            and getattr(self.app, "roi_grid_bounds", None) is not None
+            and {
+                int(getattr(self.app, "roi_grid_rows", 0)),
+                int(getattr(self.app, "roi_grid_cols", 0)),
+            } == {4, 6}
+        )
+        if grid_ready:
+            self.ccm_source_status_var.set(
+                "当前采样源：24 个可微调色块 ROI"
+            )
+        elif self.ccm_region_source == "detected":
+            confidence = float(self.ccm_detection_confidence or 0.0)
+            self.ccm_source_status_var.set(
+                f"当前采样源：自动检测四角 · "
+                f"Confidence {confidence * 100:.1f}% · 请检查覆盖层"
+            )
+        elif self.ccm_region_source == "corners":
+            self.ccm_source_status_var.set(
+                "当前采样源：已微调的透视四角"
+            )
+        elif self.app.roi is not None:
+            roi = self.app.roi
+            self.ccm_source_status_var.set(
+                f"当前采样源：色卡外框 ROI "
+                f"({roi.x}, {roi.y}, {roi.width}×{roi.height})"
+            )
+        else:
+            self.ccm_source_status_var.set(
+                "尚未选择色卡：请先框选外框"
+            )
+        detected = self.ccm_region_source == "detected"
+        self.ccm_rotation_combo.configure(
+            state="disabled" if detected else "readonly"
+        )
+        self.ccm_flip_check.configure(
+            state="disabled" if detected else "normal"
+        )
+
+    def _detect_ccm_chart(self, use_current_roi: bool = False) -> None:
+        try:
+            stage = self.workspace._full_stage(
+                self._stage_before("color_correction_matrix")
+            )
+            if stage.domain != "rgb":
+                raise ISPError(
+                    "ColorChecker 自动检测需要 Demosaic 后的 RGB 预览。"
+                )
+            image = np.asarray(stage.image, dtype=np.float32).copy()
+            search_roi = None
+            if use_current_roi:
+                search_roi = (
+                    self.app.roi_grid_bounds
+                    if getattr(self.app, "roi_grid_bounds", None) is not None
+                    else self.app.roi
+                )
+                if search_roi is None:
+                    raise ISPError("请先框选色卡的粗略 ROI。")
+        except Exception as exc:
+            self.message.show(str(exc), "error")
+            return
+        source_label = "Current ROI" if search_roi is not None else "Full Image"
+        self.busy.show(
+            "Detect ColorChecker",
+            f"Search: {source_label}",
+        )
+        self.ccm_detect_button.configure(state="disabled")
+
+        def task():
+            try:
+                return True, detect_colorchecker(
+                    image,
+                    search_roi=search_roi,
+                    minimum_confidence=0.45,
+                )
+            except Exception as exc:
+                return False, exc
+
+        def finished(payload) -> None:
+            self.busy.hide()
+            self.ccm_detect_button.configure(state="normal")
+            success, value = payload
+            if not success:
+                self.message.show(str(value), "warning")
+                return
+            result = value
+            self.workspace._set_colorchecker_corners(result.corners)
+            self.workspace.ccm_rotation_var.set(0)
+            self.workspace.ccm_flip_var.set(False)
+            self.ccm_region_source = "detected"
+            self.ccm_detection_confidence = float(result.confidence)
+            self.use_roi_var.set(False)
+            self.app.calibration_polygons = generate_colorchecker_grid(
+                result.corners, columns=6, rows=4
+            )
+            self._refresh_ccm_source_status()
+            self.message.show(
+                "ColorChecker 已定位；请先检查 24 块覆盖层，"
+                "必要时使用“微调四角”，然后再计算 CCM。",
+                "success",
+            )
+            self.app.render_current()
+            self._options_changed()
+
+        self.workspace._run_async(
+            "Detect ColorChecker", task, finished
+        )
+
+    def _exclude_selected_ccm_patch(self) -> None:
+        selection = self.ccm_patch_tree.selection()
+        if not selection:
+            self.message.show("请先在结果表中选择一个色块。", "warning")
+            return
+        values = self.ccm_patch_tree.item(selection[0], "values")
+        if not values:
+            return
+        patch_id = int(values[0])
+        self._toggle_ccm_patch(patch_id)
+
+    def _apply_ccm_result(self) -> None:
+        """Commit a validated CCM with one explicit user action."""
+        machine = self.states["CCM"]
+        if machine.can_preview:
+            self.preview()
+            machine = self.states["CCM"]
+        if machine.can_apply:
+            self.apply()
 
     def _load_dark_frames(self) -> None:
         (
@@ -1427,6 +1829,17 @@ class AutoCalibrationPanel(ttk.Frame):
         if self.module_var.get() == "AWB":
             self.correct_and_apply_current()
 
+    def calculate_ccm(self) -> bool:
+        """An explicit recalculation replaces an existing recommendation."""
+        machine = self.states["CCM"]
+        if machine.state == CalibrationUIState.RUNNING:
+            return False
+        if machine.state == CalibrationUIState.PREVIEWING:
+            self.revert()
+        if machine.state in {CalibrationUIState.SUGGESTED, CalibrationUIState.APPLIED}:
+            machine.transition(CalibrationUIState.STALE)
+        return self.analyze()
+
     def analyze(self) -> bool:
         if self.controller.has_preview:
             self.controller.revert()
@@ -1449,7 +1862,8 @@ class AutoCalibrationPanel(ttk.Frame):
             force_full = bool(options.pop("_force_full", False))
             image = (
                 np.asarray(override_image, np.float32).copy()
-                if override_image is not None else stage.image.copy()
+                if override_image is not None
+                else np.asarray(stage.image, dtype=np.float32)
             )
             options.setdefault("data_state", stage.data_state)
             metadata = copy.deepcopy(self.app.loaded.metadata)
@@ -1576,32 +1990,29 @@ class AutoCalibrationPanel(ttk.Frame):
                 **advanced,
             }
         if module == "CCM":
-            rotation = int(advanced.get(
-                "rotation", self.workspace.ccm_rotation_var.get()
-            ))
-            flipped = bool(advanced.get(
-                "flip", self.workspace.ccm_flip_var.get()
-            ))
-            include_offset = bool(advanced.get(
-                "include_offset", self.workspace.ccm_offset_var.get()
-            ))
-            ridge = float(advanced.get(
-                "ridge", self.workspace.ccm_ridge_var.get()
-            ))
-            excluded = str(advanced.get(
-                "excluded_patches", self.workspace.ccm_exclude_var.get()
-            ))
-            self.workspace.ccm_rotation_var.set(rotation)
-            self.workspace.ccm_flip_var.set(flipped)
-            self.workspace.ccm_offset_var.set(include_offset)
-            self.workspace.ccm_ridge_var.set(ridge)
-            self.workspace.ccm_exclude_var.set(excluded)
+            # CCM controls bind directly to the persistent workspace variables.
+            # The removed Advanced Options pane still owns compatibility
+            # variables, but those copies must never override visible edits.
+            rotation = int(self.workspace.ccm_rotation_var.get())
+            flipped = bool(self.workspace.ccm_flip_var.get())
+            include_offset = bool(self.workspace.ccm_offset_var.get())
+            ridge = float(self.workspace.ccm_ridge_var.get())
             return CCMAnalyzerAdapter(), self._stage_before(
                 "color_correction_matrix"
             ), {
                 "patches": self._colorchecker_patches(),
                 "include_offset": include_offset,
                 "ridge": ridge,
+                "geometry_source": self.ccm_region_source or "manual",
+                "detection_confidence": self.ccm_detection_confidence,
+                "reference_white": self.workspace.illuminant_var.get(),
+                "input_stage": "WB / Demosaic output",
+                "input_color_space": "Camera linear RGB",
+                "target_color_space": "linear sRGB",
+                "source_description": (
+                    "ColorChecker "
+                    + (self.ccm_region_source or "manual")
+                ),
             }
         raise ISPError(f"未知自动分析模块：{module}")
 
@@ -1609,9 +2020,41 @@ class AutoCalibrationPanel(ttk.Frame):
         stage = self.workspace._full_stage(
             self._stage_before("color_correction_matrix")
         )
+        if stage.domain != "rgb" or np.asarray(stage.image).ndim != 3:
+            raise ISPError(
+                "CCM 需要 Demosaic 后的线性 RGB，请先启用 Demosaic。"
+            )
+        data_state = stage.data_state
+        if data_state is not None and not data_state.normalized:
+            raise ISPError(
+                "CCM 输入仍是 RGB DN。请先启用并正确设置 BLC，"
+                "使输入成为 0～1 线性 RGB。"
+            )
+        if data_state is not None and not data_state.black_level_applied:
+            raise ISPError(
+                "CCM 拟合前必须先完成 BLC；当前阶段未标记黑电平已扣除。"
+            )
+        wb_module = self.app.pipeline.module_by_id("white_balance")
+        if not wb_module.enabled:
+            raise ISPError(
+                "CCM 拟合需要 WB 后的线性 RGB，请先启用并校正 WB。"
+            )
         rotation = int(self.workspace.ccm_rotation_var.get())
         flipped = bool(self.workspace.ccm_flip_var.get())
-        if len(getattr(self.app, "rois", [])) == 24:
+        if self.ccm_region_source == "detected":
+            rotation = 0
+            flipped = False
+        uses_patch_grid = (
+            self.ccm_region_source in {"", "grid"}
+            and
+            len(getattr(self.app, "rois", [])) == 24
+            and getattr(self.app, "roi_grid_bounds", None) is not None
+            and {
+                int(getattr(self.app, "roi_grid_rows", 0)),
+                int(getattr(self.app, "roi_grid_cols", 0)),
+            } == {4, 6}
+        )
+        if uses_patch_grid:
             polygons = [
                 [
                     (roi.x, roi.y),
@@ -1621,28 +2064,48 @@ class AutoCalibrationPanel(ttk.Frame):
                 ]
                 for roi in self.app.rois
             ]
-            self.app.calibration_polygons = polygons
         else:
-            corners = self.workspace._parse_corners()
+            if self.use_roi_var.get():
+                if self.app.roi is None:
+                    raise ISPError(
+                        "请先在主预览框选 ColorChecker 外框。"
+                    )
+                roi = self.app.roi
+                corners = (
+                    (roi.x, roi.y),
+                    (roi.x2, roi.y),
+                    (roi.x2, roi.y2),
+                    (roi.x, roi.y2),
+                )
+                self.workspace._set_colorchecker_corners(corners)
+                self.ccm_region_source = "roi"
+            else:
+                corners = self.workspace._parse_corners()
             columns, rows = (
                 (4, 6) if rotation in {90, 270} else (6, 4)
             )
             polygons = generate_colorchecker_grid(
                 corners, columns=columns, rows=rows
             )
+        self.app.calibration_polygons = polygons
         names, references = colorchecker_reference(
             illuminant=self.workspace.illuminant_var.get()
         )
         order = reorder_reference_indices(rotation, flipped)
-        patches = sample_colorchecker(
-            stage.image, polygons, references, names, reference_indices=order
-        )
         excluded = {
             int(token)
             for token in self.workspace.ccm_exclude_var.get().replace("，", ",").split(",")
             if token.strip()
         }
-        return [patch for patch in patches if patch.patch_id not in excluded]
+        return sample_colorchecker(
+            stage.image,
+            polygons,
+            references,
+            names,
+            statistic=self.ccm_statistic_var.get(),
+            reference_indices=order,
+            excluded_patch_ids=excluded,
+        )
 
     def _analysis_finished(self, payload) -> None:
         success, value = payload
@@ -1759,6 +2222,17 @@ class AutoCalibrationPanel(ttk.Frame):
     def apply(self) -> None:
         machine = self.states[self.module_var.get()]
         if self.result is None or not machine.can_apply:
+            return
+        if (
+            self.result.module_id == "colorchecker_ccm"
+            and not bool(
+                self.result.measurements.get("safe_to_apply", False)
+            )
+        ):
+            self.message.show(
+                "CCM 未通过稳定性与 ΔE 检查，已禁止应用。",
+                "warning",
+            )
             return
         try:
             self.controller.session = self.app.calibration_session
@@ -1990,6 +2464,13 @@ class AutoCalibrationPanel(ttk.Frame):
         self.result = None
         self.analysis_base_image = None
         self.direct_apply_after_analysis = ""
+        self.ccm_region_source = ""
+        self.ccm_detection_confidence = None
+        if (
+            self.ccm_analysis_window is not None
+            and self.ccm_analysis_window.winfo_exists()
+        ):
+            self.ccm_analysis_window.withdraw()
         self.preview_banner.hide()
         self.message.hide()
         self._module_changed()
@@ -1997,4 +2478,9 @@ class AutoCalibrationPanel(ttk.Frame):
     def close(self) -> None:
         self.busy.hide()
         self.toast.close()
+        if (
+            self.ccm_analysis_window is not None
+            and self.ccm_analysis_window.winfo_exists()
+        ):
+            self.ccm_analysis_window.destroy()
         self.controller.close()

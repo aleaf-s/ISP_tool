@@ -1,7 +1,84 @@
-# ISP RAW Visual Simulator V0.4.33
+# ISP RAW Visual Simulator V0.4.41
 
-桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.33 同时提供相互隔离的
+桌面端 RAW ISP 快速视觉矫正与参数调试工具。V0.4.41 同时提供相互隔离的
 RAW ISP 流程 `BLC → LSC → WB → Demosaic → CCM` 与裸 YUV 预览流程。
+
+## V0.4.41 CCM 精简编辑与颜色分析
+
+- 修复色块联动中 `selection_set → TreeviewSelect → selection_set` 的重复事件循环；相同选择不再重发事件或重绘主图。
+- CCM 自动页保留色卡区域工具、计算按钮、可编辑的 3×3 矩阵、**校正**和 **Color Analysis**。方向/光源设置收进区域菜单，删除重复结果表、Before/After 缩略图和非核心参数的常驻显示。
+- **计算 CCM**进行自动拟合；编辑矩阵后点**校正**，使用当前上游色块样本按该矩阵重新评估并应用，不再优化或改写手动值。全局曝光使用最近一次自动拟合得到的独立增益。
+- **Color Analysis**仅在主动点击时打开并复用窗口，不计算整图、不重新拟合。显示校正后的 DEab、DCab、DL、DC、Dh，以及 Da、Db（DL/Da/Db 即输出 Lab 减标准 Lab）。
+- DEab 为 CIE76 Lab 距离；DCab 在本工具中明确定义为 a*b* 平面距离，**不是** Imatest 的 ΔC00。Dh 为最短有符号色相角差（度），低彩度时显示 `—`。
+- a*b* 图使用标准值方块、输出值圆点及误差连线；彩色背景为固定 L*=70 的 D65 Lab → sRGB 示意，不用于任何拟合或采样。表格数字列不压缩，窄窗口可横向滚动。
+- 交互验证入口：`python tools/preview_ccm_analysis.py`（合成色卡，只用于 UI 检查）。
+
+## V0.4.40 CCM 稳定性与色度拟合修复
+
+- CCM 计算前通过中性块稳健估算独立的 `Pre-CCM Exposure`，亮度增益不再混入 3×3 颜色矩阵。
+- 曝光匹配后直接以 CIE Lab `a* / b*` 残差为主要非线性优化目标，`L*` 仅保留很弱的防漂移约束。
+- CCM 分析窗口不再在 UI 线程变换整幅高分辨率图；先缩小再计算缩略对比，避免打开窗口时假死。
+- 分析表格使用随 DPI/字体变化的行高、完整数字列和可横向滚动布局，摘要自动换行，a*b* 图保留可用宽度。
+- 自动 CCM 建议会同时给出独立的 `input_gain` 与 3×3 矩阵，Apply 后两者按正确顺序执行。
+
+## V0.4.39 CCM 24 色卡交互标定与色差分析
+
+- 点击 Pipeline 中的 CCM 后，主预览自动显示居中的 6×4 ColorChecker 框；可直接拖动整框或 TL/TR/BR/BL 四角处理透视。
+- 色卡编辑与 Compare、ROI 由统一手势状态机仲裁：Compare 分割线优先，色卡命中优先于普通 ROI；拖动只重绘 Overlay，不重复执行 ISP。
+- 每张工作图分别保存色卡四角、方向、Flip、排除块、来源、检测 Confidence 和选中色块；切图或改变预览尺寸后仍可恢复。
+- CCM 二阶段求解改为色度/色相优先，L* 使用低权重；中性色块估计的曝光差只用于拟合归一化，不写入 CCM。
+- 常见的主对角 1.0～2.5、非对角接近零或为负改为软先验；仍保留行和、条件数、负值、溢出和实际色差安全检查。
+- 新增独立非模态 `Color Difference Analysis`：逐块显示校正前后 ΔE2000、ΔL*、ΔC*、ΔH*、L/C/h°，并在等比例 Lab a*b* 平面显示 Target、Before、After 和误差向量。
+- 图像 Overlay、结果表和 a*b* 图支持色块联动高亮；选中色块可排除或恢复后重新拟合，Calculate 与 Apply 仍严格分离。
+- Hue 差采用最短圆周角，低色度块会标记 Hue 不稳定；结果同时报告输入阶段、颜色空间、参考白点、矩阵行和和条件数。
+
+## V0.4.38 ColorChecker 辅助自动检测
+
+- CCM 页面新增 `Detect ColorChecker`；默认搜索全图，`Region Tools → Detect Within Current ROI` 可限制搜索范围。
+- 检测器对候选四边形进行透视展开，用参考色拟合、中性灰阶、块内均匀度、颜色多样性和网格特征联合评分。
+- 横放、竖放和旋转色卡会被统一到标准方向；自动检测状态下 Rotation/Flip 被锁定，避免对已校正的方向重复旋转。
+- 检测只提案四角和 24 个覆盖块，不写入 CCM；界面显示 Confidence，用户检查或微调后再执行 Calculate CCM。
+- 低置信度、无候选四边形或普通非色卡图像会明确拒绝，不覆盖原有色卡区域。
+
+## V0.4.37 ColorChecker CCM 工作流
+
+- CCM 自动页直接提供色卡外框 ROI、4×6 可微调色块、四角透视微调、方向/Flip、Illuminant、稳健采样和排除色块。
+- `Use Current ROI` 现在会真正作为 CCM 色卡外框；普通的 24 个 ROI 不再被误认为 ColorChecker。
+- D50/A 参考色使用 CAT02 适应到 sRGB D65，避免中性灰目标本身带色。
+- 采样使用中心区、Median/Trimmed Mean/Robust Mean、MAD Inlier 和质量权重；少量明显异常块可自动排除后重拟合。
+- CCM 必须在 BLC、WB、Demosaic 之后的 0～1 线性 RGB 上求解；RGB DN、Bayer 或未扣黑电平数据会被明确拒绝。
+- 计算结果不再自动写入；用户检查前后 CCM、24 块 ΔE、行和、条件数、负值/溢出率后，再显式点击 `Apply CCM`。
+
+## V0.4.36 导入任务生命周期统一
+
+- 新增无 UI 依赖的 `ImportRequestCoordinator`，统一管理导入 Generation、Future、轮询回调、重复导入替换及退出清理。
+- 新增 `ImportResultApplicationController`，结果进入工作区前验证请求路径清单、ImageWorkItem、成功/失败总数和耗时。
+- 所有实际文件读取统一放入 IO 工作线程；单张 PNG/TIFF/相机 RAW 不再在 Tk 主线程同步读取。
+- 重复发起导入时采用 Latest-wins：旧批次即使稍后完成，也不能替换或追加到当前工作区。
+- 每个请求路径必须恰好对应一个成功 Item 或一个结构化 Failure，支持一批文件部分成功后继续导入并集中显示失败摘要。
+- Performance Monitor 新增 Import Submitted、Completed、Cancelled、Failed、Stale Result、成功/失败文件数与 In-flight 状态。
+- RAW/YUV 元数据对话框仍保留在 UI 线程；用户确认后才创建后台任务，不改变现有元数据交互。
+- 保留旧 `import_generation`、Future 和 Poll 属性代理，已有集成无需同步修改。
+
+## V0.4.35 分析任务生命周期统一
+
+- 新增无 UI 依赖的 `AnalysisRequestCoordinator`，统一管理分析请求的 Debounce、Generation、Future、轮询回调与关闭清理。
+- 新增 `AnalysisResultApplicationController`，在任何缓存或界面写入前统一产生 Wait、Stale、Cancelled、Apply 决策并验证 Payload。
+- 主分析区的 Waveform、Vectorscope、Statistics 与内部 Histogram 共用 Latest-wins 规则；快速切阶段、ROI、图片或分析类型时，旧结果不能覆盖当前画面。
+- 修复旧实现先写 Analysis Cache、再检查 Generation 的顺序问题；过期或上下文不匹配的结果现在不会污染软件缓存。
+- 独立 Histogram 窗口迁移到同一协调器和 Payload 合同，缓存命中、计算失败、窗口关闭与主分析区行为一致。
+- Performance Monitor 新增 Analysis Submitted、Completed、Cancelled、Failed、Stale Result 与 In-flight 计数，并单独统计 Histogram Window Cache。
+- 保留旧 `analysis_generation`、Future 和 Poll ID 属性代理，已有调用方不需要同步修改。
+
+## V0.4.34 统一性能统计与监视器
+
+- 状态栏新增一行可点击摘要：Preview 总耗时、最慢 ISP 模块、Pipeline 软件缓存命中率和 NumPy 图像内存估算。
+- 原来的纯文本性能详情升级为独立非模态 `Performance Monitor`，使用耗时、缓存与内存、预览任务三个页签，不占用主工作区。
+- 各模块统一显示 Latest、Average、P95、Max 和样本数，并按滚动平均耗时排列，便于直接定位热点。
+- Pipeline、Display、Analysis、Workspace Preview 与 YUV Frame 缓存使用统一 Hit/Miss/Hit Rate 口径；命中率为软件计算缓存，不是 CPU 或 Windows 缓存。
+- 内存估算按 NumPy 底层共享数组去重，分别展示当前结果、工作图预览缓存、显示/分析缓存及 YUV 帧缓存；明确不等同于进程总内存。
+- 预览任务记录 Submitted、Completed、Cancelled/Superseded、Failed 和 Stale Result，可判断卡顿是否来自快速调参导致的旧任务积压。
+- 性能采集只观察已经产生的数据，不执行额外 ISP 算法，也不改变 RAW、YUV 或 RGB 计算结果。
 
 ## V0.4.33 预览结果应用决策抽离
 
@@ -560,14 +637,14 @@ BLC → LSC → WB → Demosaic → 线性 RGB 采样
 
 操作方式：
 
-1. 在主界面用 ROI 粗略框住色卡
-2. Calibration → ColorChecker → `Use current ROI`
-3. 点击 `Edit corners`
-4. 拖动 TL/TR/BR/BL 四个角点
-5. 选择旋转、翻转、Offset 和 Ridge
-6. Calculate CCM
-7. 检查条件数与 ΔE
-8. Preview、Apply 或 Revert
+1. 进入 CCM 的“自动”页，点击 `Detect ColorChecker` 搜索全图
+2. 若全图背景复杂，先用 ROI 粗略框住色卡，再选择 `Region Tools → Detect Within Current ROI`
+3. 检查生成的 24 块覆盖层和 Confidence；必要时生成 `4×6` 独立 ROI 逐块微调，或拖动 TL/TR/BR/BL 四角
+4. 确认 Rotation、Flip、Illuminant、采样统计和 Include Offset
+5. 点击 `Calculate CCM`
+6. 检查前后矩阵、逐块 ΔE、条件数、行和、负值与溢出率
+7. 如有反光或误识色块，在表中选中后点击“排除选中色块并重算”
+8. 通过安全检查后使用 `Preview` 或显式点击 `Apply CCM`
 
 参考数据来自 `colour-science`，并与工作区 Illuminant 选择联动：
 
@@ -639,7 +716,7 @@ BLC → LSC → WB → Demosaic → 线性 RGB 采样
 python -m unittest discover -s tests -v
 ```
 
-当前 145 项测试覆盖：
+当前 332 项测试覆盖（以下为主要范围）：
 
 - V0.1/V0.2 全部能力
 - Mesh 插值、四通道映射、ROI 等价和文件往返

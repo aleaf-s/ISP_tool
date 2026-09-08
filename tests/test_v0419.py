@@ -108,14 +108,14 @@ class HiddenTkSimpleDualWorkspaceTests(unittest.TestCase):
             ]
             self.assertNotIn("专家模式", labels)
             self.assertNotIn("Performance Details", labels)
-            self.assertNotIn("计算后端", labels)
+            self.assertNotIn(app.tr("menu.processing_backend"), labels)
             advanced_end = app.advanced_tools_menu.index("end")
             advanced_labels = [
                 app.advanced_tools_menu.entrycget(index, "label")
                 for index in range(int(advanced_end) + 1)
             ]
-            self.assertIn("计算后端", advanced_labels)
-            self.assertIn("性能详情…", advanced_labels)
+            self.assertIn(app.tr("menu.processing_backend"), advanced_labels)
+            self.assertIn(app.tr("menu.performance"), advanced_labels)
         finally:
             if root.winfo_exists():
                 app.close()

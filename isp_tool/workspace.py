@@ -44,6 +44,7 @@ class ImageWorkItem:
     manual_dirty_modules: List[str] = field(default_factory=list)
     preview_shape: Optional[tuple] = None
     input_revision: int = 0
+    colorchecker_state: Dict[str, Any] = field(default_factory=dict)
     runtime_preview: Optional[RuntimePreviewState] = field(
         default=None, repr=False, compare=False
     )

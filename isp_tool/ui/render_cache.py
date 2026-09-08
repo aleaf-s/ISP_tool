@@ -90,6 +90,10 @@ class RenderCache:
             while len(self._analysis) > self.analysis_capacity:
                 self._analysis.popitem(last=False)
 
+    def remove_analysis(self, key: CacheKey) -> None:
+        with self._lock:
+            self._analysis.pop(key, None)
+
     def clear(self) -> None:
         with self._lock:
             self._stage.clear()
@@ -110,3 +114,9 @@ class RenderCache:
                 "analysis_entries": len(self._analysis),
             }
 
+    def values(self) -> tuple:
+        """Return a stable value snapshot for memory estimation."""
+        with self._lock:
+            return tuple(self._stage.values()) + tuple(
+                self._analysis.values()
+            )

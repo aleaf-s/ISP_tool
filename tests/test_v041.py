@@ -1,5 +1,6 @@
 import copy
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -240,6 +241,13 @@ class HiddenTkSmokeTests(unittest.TestCase):
                     return_value=str(image_path),
                 ):
                     app.open_file()
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    root.update()
+                    if app.loaded.source_path == image_path:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(app.loaded.source_path, image_path)
             self.assertFalse(panel.controller.has_preview)
             self.assertNotEqual(module.parameters[key], suggested[key])
             self.assertEqual(
