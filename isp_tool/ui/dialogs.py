@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from pathlib import Path
 from typing import Optional
+from .theme import COLORS
 
 from ..models import RawMetadata
 from ..yuv import (
@@ -107,7 +108,7 @@ class RawMetadataDialog(tk.Toplevel):
         note = ttk.Label(
             body,
             text="提示：MIPI RAW10 宽度应为 4 的倍数，RAW12 为 2 的倍数，RAW14 为 4 的倍数。",
-            foreground="#9aa4b2",
+            foreground=COLORS["muted"],
             wraplength=420,
         )
         note.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(8, 12))

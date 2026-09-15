@@ -10,6 +10,8 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from ..calibration.ccm_analysis import lab_errors
+from ..calibration.srgb_gamut import srgb_ab_boundary, ab_background
+from .widgets.tooltip import Tooltip
 from .theme import COLORS, FONTS
 
 
@@ -73,11 +75,12 @@ class CCMAnalysisWindow(tk.Toplevel):
         self.panes.add(plot_frame, weight=1)
         self.panes.bind("<Configure>", self._position_initial_sash)
         columns = ("id", "deab", "dcab", "dl", "dc", "dh", "da", "db")
-        labels = ("#", "DEab", "DCab", "DL", "DC", "Dh (°)", "Da", "Db")
+        labels = ("#", "ΔE*ab", "‖Δab‖", "ΔL*", "ΔC*ab", "Δh°", "Δa*", "Δb*")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings",
                                  style="CCMAnalysis.Treeview", selectmode="browse")
         for column, label in zip(columns, labels):
-            width = max(65, self.body_font.measure("-123.45") + 20) if column != "id" else 45
+            width = max(65, self.body_font.measure("-123.45") + 20,
+                        self.body_font.measure(label) + 20) if column != "id" else 45
             self.tree.column(column, width=width, minwidth=width, stretch=False, anchor="center")
             self.tree.heading(column, text=label, command=lambda c=column: self._sort_by(c))
         self.tree.tag_configure("excluded", foreground=COLORS["muted"])
@@ -90,6 +93,19 @@ class CCMAnalysisWindow(tk.Toplevel):
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
+        self._heading_help = {
+            "#1": "* = excluded from fit",
+            "#2": "ΔE*ab · CIE 1976 Lab distance (not ΔE00)",
+            "#3": "‖Δab‖ · a*b* plane distance (not chroma difference)",
+            "#4": "ΔL* = L* output − L* standard",
+            "#5": "ΔC*ab = C* output − C* standard",
+            "#6": "Δh° · shortest signed hue angle, output − standard; — = low chroma",
+            "#7": "Δa* = a* output − a* standard",
+            "#8": "Δb* = b* output − b* standard",
+        }
+        self.heading_tooltip = Tooltip(self.tree, self._heading_tip)
+        self.tree.bind("<Motion>", self._heading_motion, add="+")
+        self._hover_heading = None
         self.detail_label = ttk.Label(table_frame, textvariable=self.patch_detail_var,
                                      justify="left", padding=(0, 8), wraplength=550)
         self.detail_label.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -97,12 +113,21 @@ class CCMAnalysisWindow(tk.Toplevel):
         self.ab_canvas.pack(fill="both", expand=True)
         self.ab_canvas.bind("<Configure>", lambda e: self._request_draw())
         self.ab_canvas.bind("<Button-1>", self._plot_clicked)
-        ttk.Label(self, text=(
-            "DEab = √(DL²+Da²+Db²)   DCab = √(Da²+Db²)   DC = C_out − C_ref\n"
-            "DL / Da / Db = Output Lab − Standard Lab   Dh = shortest hue angle (°); "
-            "— = low chroma / unavailable   * = excluded from fit\n"
-            "Plot background: Lab L*=70, D65 → clipped sRGB (visual guide)"
-        ), style="Muted.TLabel", padding=(12, 0, 12, 10), justify="left").pack(anchor="w")
+        self.reference_var = tk.StringVar(self)
+        self.reference_label = ttk.Label(self, textvariable=self.reference_var,
+                                        style="Muted.TLabel", padding=(12, 0, 12, 8))
+        self.reference_label.pack(anchor="w")
+        self.reference_tooltip = Tooltip(self.reference_label,
+            lambda: "\n".join(f"{k}: {v}" for k, v in self.measurements.get("reference_conditions", {}).items()))
+
+    def _heading_tip(self):
+        return self._heading_help.get(self._hover_heading, "")
+
+    def _heading_motion(self, event):
+        column = self.tree.identify_column(event.x) if self.tree.identify_region(event.x, event.y) == "heading" else None
+        if column != self._hover_heading:
+            self._hover_heading = column
+            self.heading_tooltip.schedule()
 
     def _wrap_summary(self, event):
         width = max(300, event.width - 24)
@@ -147,12 +172,17 @@ class CCMAnalysisWindow(tk.Toplevel):
             self.tree.insert("", "end", iid=f"patch-{patch_id}", values=values,
                              tags=() if valid else ("excluded",))
         parts = []
-        for key, label in (("deab", "DEab"), ("dcab", "DCab"), ("dl", "|DL|"),
-                           ("dc", "|DC|"), ("dh", "|Dh|°")):
+        for key, label in (("deab", "ΔE*ab"), ("dcab", "‖Δab‖"), ("dl", "|ΔL*|"),
+                           ("dc", "|ΔC*ab|"), ("dh", "|Δh°|")):
             values = np.array([float(m[key]) for m in metrics])
             values = np.abs(values[np.isfinite(values)])
             parts.append(f"{label} {np.mean(values):.2f}" if values.size else f"{label} —")
         self.summary_var.set("Mean · " + "   ·   ".join(parts))
+        conditions = self.measurements.get("reference_conditions", {})
+        self.reference_var.set(
+            f"{conditions.get('dataset', 'Reference: legacy / unverified')} · "
+            f"{conditions.get('illuminant', self.measurements.get('reference_white', '—'))} · "
+            f"{conditions.get('observer', '—')} · Lab D65")
         self.patch_detail_var.set("Select a patch to inspect Output / Standard Lab.")
         self._request_draw()
 
@@ -218,6 +248,9 @@ class CCMAnalysisWindow(tk.Toplevel):
         # Fixed default axes aid comparison between corrections. Expand for
         # valid outlying values, while keeping equal distance per Lab unit.
         amin, amax, bmin, bmax = -70., 85., -75., 110.
+        boundary = srgb_ab_boundary()
+        amin, amax = min(amin, boundary[:, 0].min()-5), max(amax, boundary[:, 0].max()+5)
+        bmin, bmax = min(bmin, boundary[:, 1].min()-5), max(bmax, boundary[:, 1].max()+5)
         if points:
             amin = min(amin, min(p[2] for p in points) - 8)
             amax = max(amax, max(p[2] for p in points) + 8)
@@ -230,10 +263,7 @@ class CCMAnalysisWindow(tk.Toplevel):
         key = (pw, ph, amin, amax, bmin, bmax)
         if self._background_key != key:
             # Bounded raster, independent of source RAW resolution.
-            aa, bb = np.meshgrid(np.linspace(amin, amax, 240), np.linspace(bmax, bmin, 280))
-            lab = np.stack((np.full_like(aa, 70), aa, bb), axis=-1).astype(np.float32)
-            rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
-            raster = Image.fromarray(np.uint8(np.clip(rgb, 0, 1)*255))
+            raster = Image.fromarray(ab_background(amin, amax, bmin, bmax))
             self._background_photo = ImageTk.PhotoImage(raster.resize((pw, ph), Image.Resampling.BILINEAR), master=self)
             self._background_key = key
         c.create_image(left, top, image=self._background_photo, anchor="nw")
@@ -249,6 +279,9 @@ class CCMAnalysisWindow(tk.Toplevel):
         c.create_text(left+pw/2, top+ph+38, text="a*", fill="#252525")
         c.create_text(left-34, top+ph/2, text="b*", fill="#252525")
         c.create_text(left+10, top+13, text="■ Standard    ● Output", anchor="w", fill="#202020")
+        c.create_text(left+10, top+31, text="- - sRGB section · L*=70 · D65", anchor="w", fill="#202020")
+        contour = [coordinate for a, b in boundary for coordinate in transform(a, b)]
+        c.create_line(*contour, fill="#303030", width=2, dash=(6, 4), tags="srgb_boundary")
         self._canvas_patch_points = []
         for patch in self.patch_rows:
             d = patch.get("diagnostics", {})

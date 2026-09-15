@@ -10,7 +10,7 @@ from PIL import Image, ImageTk
 
 from ..calibration.lsc_mesh import normalize_mesh_center
 from ..models import LSCMesh
-from .theme import FONTS
+from .theme import FONTS, COLORS
 
 
 class LSCMeshEditor(tk.Toplevel):
@@ -53,7 +53,7 @@ class LSCMeshEditor(tk.Toplevel):
             text="每行一个 Mesh 行，数值使用空格、逗号或 Tab 分隔",
         ).pack(anchor="w")
         self.text = tk.Text(
-            text_frame, bg="#11151b", fg="#e5e9ef", insertbackground="white",
+            text_frame, bg=COLORS["panel_alt"], fg=COLORS["foreground"], insertbackground=COLORS["foreground"],
             font=FONTS["mono"], wrap="none",
         )
         self.text.pack(fill="both", expand=True, pady=(5, 0))
@@ -61,7 +61,7 @@ class LSCMeshEditor(tk.Toplevel):
             text_frame, text="Update Channel", command=self._update_channel
         ).pack(fill="x", pady=(5, 0))
         self.canvas = tk.Canvas(
-            preview_frame, bg="#080b0f", highlightthickness=0
+            preview_frame, bg=COLORS["canvas"], highlightthickness=0
         )
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self._draw_heatmap())

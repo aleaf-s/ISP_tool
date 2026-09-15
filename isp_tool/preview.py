@@ -270,14 +270,44 @@ def export_image(
     domain: str,
     metadata: RawMetadata,
     data_state: Optional[StageDataState] = None,
+    exposure_ev: float = 0.0,
 ) -> None:
+    """Save the clean colour preview, including preview EV, without overlays.
+
+    PNG shares the UI's uint8 LUT exactly. TIFF uses sRGB-encoded 16-bit.
+    YUV RGB is already encoded and must not receive another sRGB transfer.
+    """
+    from PIL import Image, ImageCms
     rgb = display_rgb(
         image, domain, metadata, data_state=data_state
     )
     suffix = Path(path).suffix.lower()
-    if suffix in {".tif", ".tiff"} and tifffile is not None:
-        tifffile.imwrite(path, np.round(rgb * 65535.0).astype(np.uint16), photometric="rgb")
+    already_encoded = domain == "yuv_rgb" or (
+        data_state is not None and data_state.encoding == "Display Encoded RGB")
+    icc = None if already_encoded else ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    if suffix in {".tif", ".tiff"}:
+        if tifffile is None:
+            raise RuntimeError("TIFF export requires tifffile")
+        encoded = (np.clip(rgb * 2.0**float(np.clip(exposure_ev, -6, 6)), 0, 1)
+                   if already_encoded else encode_display_rgb(rgb, exposure_ev))
+        tags = [(34675, "B", len(icc), icc, False)] if icc else []
+        tifffile.imwrite(path, np.round(encoded * 65535.0).astype(np.uint16),
+                        photometric="rgb", extratags=tags, metadata={
+                            "kind": "display", "preview_ev": exposure_ev,
+                            "encoding": "source YUV RGB" if already_encoded else "sRGB"})
     else:
-        bgr = cv2.cvtColor(np.round(rgb * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        if not cv2.imwrite(path, bgr):
-            raise RuntimeError(f"无法导出图像：{path}")
+        raster = encode_display_uint8(rgb, exposure_ev, already_encoded)
+        Image.fromarray(raster).save(path, **({"icc_profile": icc} if icc else {}))
+
+
+def export_stage_data(path, image, domain, metadata, data_state=None):
+    """Non-display TIFF: float32 preserves negative and extended-range data."""
+    if tifffile is None:
+        raise RuntimeError("TIFF export requires tifffile")
+    from dataclasses import asdict
+    values = np.asarray(image, dtype=np.float32)
+    tifffile.imwrite(path, values, photometric="rgb" if values.ndim == 3 else "minisblack",
+                    metadata={"kind": "computation / non-display", "domain": domain,
+                              "data_state": asdict(data_state) if data_state else None,
+                              "bit_depth": metadata.bit_depth,
+                              "range": "float32, no clipping or display encoding"})

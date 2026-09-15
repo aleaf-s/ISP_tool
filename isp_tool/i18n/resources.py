@@ -6,7 +6,9 @@ remain in English in both locales.
 
 TRANSLATIONS = {
     "zh_CN": {
-        "app.title": "ISP RAW Visual Simulator V0.4.41 · CCM Color Analysis",
+        "ccm.show_chart": "显示色卡框",
+        "toolbar.export_data": "计算数据 · Float32 TIFF…",
+        "app.title": "ISP RAW Visual Simulator V0.4.45 · Manual Colour Grading",
         "menu.file": "文件",
         "menu.view": "视图",
         "menu.language": "语言 / Language",
@@ -168,7 +170,7 @@ TRANSLATIONS = {
         "performance.runtime_state": "当前状态",
         "performance.memory_note": "内存为软件持有的 NumPy 图像数组估算值，不是进程总内存。",
         "about.title": "关于",
-        "about.body": "ISP RAW Visual Simulator 0.4.41\n\n用于 RAW ISP 模块仿真和裸 YUV 逐帧预览。\n当前计算后端：{backend}\n内部使用 float32；当前不保证与硬件 ISP 逐位一致。",
+        "about.body": "ISP RAW Visual Simulator 0.4.45\n\n用于 RAW ISP 仿真、YUV 预览与彩色图像手动调色。\n当前计算后端：{backend}\n内部使用 float32；当前不保证与硬件 ISP 逐位一致。",
         "final.title": "最终效果与模块影响",
         "final.refresh": "刷新当前图像和参数",
         "final.select": "选择临时旁路模块",
@@ -184,7 +186,9 @@ TRANSLATIONS = {
         "i18n.fallback_probe": "默认语言回退",
     },
     "en_US": {
-        "app.title": "ISP RAW Visual Simulator V0.4.41 · CCM Color Analysis",
+        "ccm.show_chart": "Show ColorChecker",
+        "toolbar.export_data": "Computation data · Float32 TIFF…",
+        "app.title": "ISP RAW Visual Simulator V0.4.45 · Manual Colour Grading",
         "menu.file": "File",
         "menu.view": "View",
         "menu.language": "Language / 语言",
@@ -346,7 +350,7 @@ TRANSLATIONS = {
         "performance.runtime_state": "Runtime State",
         "performance.memory_note": "Memory is an estimate of NumPy image arrays held by the app, not total process memory.",
         "about.title": "About",
-        "about.body": "ISP RAW Visual Simulator 0.4.41\n\nRAW ISP module simulation and frame-by-frame raw YUV preview.\nProcessing backend: {backend}\nInternal processing uses float32 and is not guaranteed to be bit-exact with a hardware ISP.",
+        "about.body": "ISP RAW Visual Simulator 0.4.45\n\nRAW ISP simulation, YUV preview and manual colour grading.\nProcessing backend: {backend}\nInternal processing uses float32 and is not guaranteed to be bit-exact with a hardware ISP.",
         "final.title": "Final Effect and Module Impact",
         "final.refresh": "Refresh Current Image and Parameters",
         "final.select": "Select Temporary Bypass Module",

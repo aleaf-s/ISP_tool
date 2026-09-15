@@ -144,8 +144,8 @@ class HiddenTkV044Tests(unittest.TestCase):
             app._entry_commit("m00")
             root.update_idletasks()
             self.assertTrue(app.manual_apply_button.winfo_manager())
-            self.assertTrue(app.manual_revert_button.winfo_manager())
-            app.apply_manual_parameters()
+            self.assertEqual(app.pipeline.modules[ccm_index].parameters["m00"], original)
+            app._apply_ccm_draft()
             self.assertTrue(app.manual_apply_button.winfo_manager())
             self.assertEqual(
                 str(app.manual_apply_button["state"]), "disabled"

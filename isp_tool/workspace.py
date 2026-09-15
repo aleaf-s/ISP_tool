@@ -48,6 +48,7 @@ class ImageWorkItem:
     runtime_preview: Optional[RuntimePreviewState] = field(
         default=None, repr=False, compare=False
     )
+    tool_ui_state: Dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def label(self) -> str:

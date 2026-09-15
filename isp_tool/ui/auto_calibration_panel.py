@@ -346,6 +346,7 @@ class AutoCalibrationPanel(ttk.Frame):
                 text=self.tr("awb.current_roi")
             )
         self.ccm_setup_frame.configure(text=self.tr("ccm.setup"))
+        self.ccm_visibility_check.configure(text=self.tr("ccm.show_chart"))
         self.ccm_region_label.configure(text=self.tr("ccm.region"))
         self.ccm_detect_button.configure(text=self.tr("ccm.detect"))
         self.ccm_region_menu.set_text(self.tr("ccm.region_menu"))
@@ -421,6 +422,11 @@ class AutoCalibrationPanel(ttk.Frame):
             "重置到图像中心", self._ccm_reset_center,
         )
         self.ccm_region_menu.pack(side="left", padx=4)
+        self.ccm_visibility_check = ttk.Checkbutton(
+            self.ccm_setup_frame, text=self.tr("ccm.show_chart"),
+            variable=self.app.colorchecker_visible_var,
+            command=self.app._toggle_colorchecker_visibility)
+        self.ccm_visibility_check.grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.ccm_source_status_var = tk.StringVar(value="")
         ttk.Label(
             self.ccm_setup_frame,
@@ -519,24 +525,18 @@ class AutoCalibrationPanel(ttk.Frame):
             widget.grid_remove() if visible else widget.grid()
 
     def _build_ccm_result_panel(self, parent) -> None:
+        from .widgets.ccm_matrix_editor import CCMMatrixEditor
         self.ccm_result_frame = ttk.LabelFrame(parent, text="CCM", padding=8)
         self.ccm_verdict_var = tk.StringVar(value="")
         self.ccm_summary_var = tk.StringVar(value="")
         self.ccm_initial_matrix_var = tk.StringVar(value="")
         self.ccm_final_matrix_var = tk.StringVar(value="")
-        self.ccm_matrix_vars = []
-        self.ccm_matrix_entries = []
-        matrix_frame = ttk.Frame(self.ccm_result_frame)
-        matrix_frame.pack(fill="x", pady=(3, 8))
-        for row in range(3):
-            for col in range(3):
-                variable = tk.StringVar(value="1.0000" if row == col else "0.0000")
-                entry = ttk.Entry(matrix_frame, textvariable=variable, width=9, justify="right")
-                entry.grid(row=row, column=col, sticky="ew", padx=3, pady=4)
-                entry.bind("<Return>", lambda e: self._correct_edited_ccm())
-                self.ccm_matrix_vars.append(variable)
-                self.ccm_matrix_entries.append(entry)
-            matrix_frame.columnconfigure(row, weight=1)
+        self.ccm_editor = CCMMatrixEditor(self.ccm_result_frame, np.eye(3), self.app.ccm_format_var)
+        self.ccm_editor.pack(fill="x", pady=(3, 8))
+        self.ccm_matrix_vars = self.ccm_editor.variables
+        self.ccm_matrix_entries = self.ccm_editor.entries
+        self._ccm_editor_result = None
+        self._ccm_editor_drafts = {}
         ttk.Label(self.ccm_result_frame, textvariable=self.ccm_verdict_var,
                   wraplength=340, style="Muted.TLabel").pack(fill="x")
         actions = ttk.Frame(self.ccm_result_frame)
@@ -618,8 +618,13 @@ class AutoCalibrationPanel(ttk.Frame):
     def _show_ccm_result(self, result, base_image=None) -> None:
         measurements = result.measurements
         matrix = np.asarray(measurements.get("matrix", np.eye(3))).reshape(3, 3)
-        for variable, value in zip(self.ccm_matrix_vars, matrix.ravel()):
-            variable.set(f"{value:.6f}")
+        if result is not self._ccm_editor_result:
+            if self._ccm_editor_result is not None:
+                self._ccm_editor_drafts[id(self._ccm_editor_result)] = self.ccm_editor.snapshot()
+            self.ccm_editor.set_matrix(matrix)
+            if id(result) in self._ccm_editor_drafts:
+                self.ccm_editor.restore(self._ccm_editor_drafts[id(result)])
+            self._ccm_editor_result = result
         self.ccm_initial_matrix_var.set(self._format_ccm_matrix(
             measurements.get("initial_matrix", matrix)))
         self.ccm_final_matrix_var.set(self._format_ccm_matrix(matrix))
@@ -633,12 +638,13 @@ class AutoCalibrationPanel(ttk.Frame):
 
     def _correct_edited_ccm(self) -> None:
         """Apply and evaluate exactly the nine visible cells, without fitting."""
+        from ..calibration.colorchecker import reference_conditions
         if self.result is None or self.module_var.get() != "CCM":
             return
         if self.states["CCM"].state == CalibrationUIState.RUNNING:
             return
         try:
-            matrix = np.array([float(v.get()) for v in self.ccm_matrix_vars]).reshape(3, 3)
+            matrix = self.ccm_editor.matrix()
             if self.controller.has_preview:
                 self.controller.revert()
             current = self.app.pipeline.module_by_id("color_correction_matrix")
@@ -647,6 +653,7 @@ class AutoCalibrationPanel(ttk.Frame):
             patches = self._colorchecker_patches()
             measurements = dict(self.result.measurements)
             measurements["patches"] = [p.to_dict() for p in patches]
+            measurements["reference_conditions"] = reference_conditions(self.workspace.illuminant_var.get())
             gain = float(measurements.get("pre_ccm_exposure_gain", 1.0))
             offset = np.asarray(measurements.get("offset", [0, 0, 0]), dtype=float)
             measurements = evaluate_matrix(measurements, matrix, gain, offset)
@@ -1990,6 +1997,7 @@ class AutoCalibrationPanel(ttk.Frame):
                 **advanced,
             }
         if module == "CCM":
+            from ..calibration.colorchecker import reference_conditions
             # CCM controls bind directly to the persistent workspace variables.
             # The removed Advanced Options pane still owns compatibility
             # variables, but those copies must never override visible edits.
@@ -2006,6 +2014,7 @@ class AutoCalibrationPanel(ttk.Frame):
                 "geometry_source": self.ccm_region_source or "manual",
                 "detection_confidence": self.ccm_detection_confidence,
                 "reference_white": self.workspace.illuminant_var.get(),
+                "reference_conditions": reference_conditions(self.workspace.illuminant_var.get()),
                 "input_stage": "WB / Demosaic output",
                 "input_color_space": "Camera linear RGB",
                 "target_color_space": "linear sRGB",

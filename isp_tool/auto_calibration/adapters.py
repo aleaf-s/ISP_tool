@@ -460,6 +460,7 @@ class CCMAnalyzerAdapter(ModuleAnalyzer):
                 "reference_white": str(
                     options.get("reference_white", "D65")
                 ),
+                "reference_conditions": dict(options.get("reference_conditions", {})),
                 "delta_e_method": "CIE 2000",
                 "matrix_convention": "RGB_out = M × RGB_in + offset",
                 "geometry_source": str(

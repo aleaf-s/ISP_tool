@@ -25,16 +25,10 @@ class HiddenTkSimpleDualWorkspaceTests(unittest.TestCase):
         app = ISPApplication(root)
         try:
             root.update_idletasks()
-            self.assertTrue(app.isp_workspace_button.winfo_manager())
-            self.assertTrue(app.yuv_workspace_button.winfo_manager())
-            self.assertEqual(
-                str(app.isp_workspace_button.cget("style")),
-                "Primary.TButton",
-            )
-            self.assertEqual(
-                str(app.yuv_workspace_button.cget("style")),
-                "Secondary.TButton",
-            )
+            self.assertTrue(app.tool_selector.winfo_manager())
+            self.assertEqual(app.tool_var.get(), "isp")
+            self.assertEqual(app.tool_selector.menu.index('end'), 2)
+            self.assertIn('RAW ISP', app.tool_selector.cget('text'))
 
             long_name = "sensor_capture_with_a_complete_long_file_name.raw"
             app.work_items[0].loaded.source_path = Path(long_name)

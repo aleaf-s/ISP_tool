@@ -45,7 +45,7 @@ def evaluate_matrix(measurements, matrix, input_gain=1.0, offset=None):
             patch.setdefault("diagnostics", {}).update(valid=False, reasons=["Non-finite RGB sample"])
             continue
         output = apply_ccm(source * input_gain, matrix, offset)
-        delta, lab, target_lab = delta_e_values(np.clip(output, 0, 1.25), np.clip(target, 0, 1.25))
+        delta, lab, target_lab = delta_e_values(output, target)
         components = delta_lch_components(lab, target_lab)
         d = patch.setdefault("diagnostics", {})
         d.update(corrected_rgb=output.tolist(), corrected_lab=lab.tolist(),

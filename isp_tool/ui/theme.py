@@ -6,34 +6,34 @@ from tkinter import ttk
 
 
 COLORS = {
-    "background": "#11151B",
-    "panel": "#181E27",
-    "panel_alt": "#202834",
-    "canvas": "#080B0F",
-    "canvas_alt": "#0B0F14",
-    "foreground": "#E5E9EF",
-    "muted": "#98A4B3",
-    "border": "#303A48",
-    "accent": "#35A7FF",
-    "accent_dark": "#147DBE",
+    "background": "#F1F3F6",
+    "panel": "#FAFBFC",
+    "panel_alt": "#FFFFFF",
+    "canvas": "#D5D9DF",
+    "canvas_alt": "#F4F6F8",
+    "foreground": "#253244",
+    "muted": "#566579",
+    "border": "#BCC6D2",
+    "accent": "#1769AA",
+    "accent_dark": "#155C96",
     "selection": "#176DA2",
-    "success": "#40C88A",
-    "warning": "#F2B84B",
-    "warning_panel": "#21171A",
-    "warning_text": "#FF9AA9",
-    "error": "#FF5C72",
-    "preview": "#62B8FF",
+    "success": "#197344",
+    "warning": "#8A5700",
+    "warning_panel": "#FFF2DC",
+    "warning_text": "#8A3D16",
+    "error": "#B42338",
+    "preview": "#1769AA",
     "candidate": "#FFD84D",
     "calibration_overlay": "#54F0C0",
     "underexposure": "#27D7E7",
     "overexposure": "#F04DFF",
-    "grid": "#27313D",
-    "guide": "#596574",
-    "scope_grid": "#39424F",
-    "channel_r": "#FF5368",
-    "channel_g": "#42D68A",
-    "channel_b": "#4C93FF",
-    "channel_y": "#D9DDE4",
+    "grid": "#D5DCE5",
+    "guide": "#8795A6",
+    "scope_grid": "#CBD3DE",
+    "channel_r": "#C33348",
+    "channel_g": "#16824C",
+    "channel_b": "#2465C4",
+    "channel_y": "#566579",
 }
 
 FONT_NAMES = {
@@ -108,13 +108,24 @@ def configure_named_fonts(
     root: tk.Misc, ui_scale: float = 1.0
 ) -> dict:
     scale = min(1.5, max(0.9, float(ui_scale)))
+    available = set(tkfont.families(root))
+    # Choose a real CJK UI family instead of relying on per-glyph fallback
+    # from Segoe UI for Chinese labels. Tk renders point-sized native text;
+    # do not rasterize or resize text bitmaps when changing UI scale.
+    body_family = next((name for name in (
+        "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+        "Noto Sans CJK SC", "Segoe UI", "DejaVu Sans",
+    ) if name in available), "TkDefaultFont")
+    mono_family = next((name for name in (
+        "Consolas", "Cascadia Mono", "DejaVu Sans Mono",
+    ) if name in available), body_family)
     specs = {
-        "body": ("Segoe UI", 10, "normal"),
-        "body_large": ("Segoe UI", 11, "normal"),
-        "title": ("Segoe UI", 12, "bold"),
-        "section": ("Segoe UI", 10, "bold"),
-        "small": ("Segoe UI", 9, "normal"),
-        "mono": ("Consolas", 10, "normal"),
+        "body": (body_family, 10, "normal"),
+        "body_large": (body_family, 11, "normal"),
+        "title": (body_family, 12, "bold"),
+        "section": (body_family, 10, "bold"),
+        "small": (body_family, 10, "normal"),
+        "mono": (mono_family, 10, "normal"),
     }
     previous = getattr(root, "_isp_named_fonts", {})
     output = {}
@@ -143,7 +154,7 @@ def configure_named_fonts(
             tkfont.Font(
                 root=root, name=standard, exists=True
             ).configure(
-                family="Segoe UI", size=round(10 * scale)
+                family=body_family, size=round(10 * scale)
             )
         except tk.TclError:
             pass
@@ -151,12 +162,12 @@ def configure_named_fonts(
         tkfont.Font(
             root=root, name="TkHeadingFont", exists=True
         ).configure(
-            family="Segoe UI", size=round(10 * scale), weight="bold"
+            family=body_family, size=round(10 * scale), weight="bold"
         )
         tkfont.Font(
             root=root, name="TkFixedFont", exists=True
         ).configure(
-            family="Consolas", size=round(10 * scale)
+            family=mono_family, size=round(10 * scale)
         )
     except tk.TclError:
         pass
@@ -174,6 +185,15 @@ def configure_theme(
     except tk.TclError:
         pass
     c = COLORS
+    root.configure(background=c["background"])
+    for option, value in {
+        "*Menu.background": c["panel"], "*Menu.foreground": c["foreground"],
+        "*Menu.activeBackground": c["selection"], "*Menu.activeForeground": "white",
+        "*Menu.disabledForeground": c["muted"], "*Menu.font": FONTS["body"],
+        "*Text.background": c["panel_alt"], "*Text.foreground": c["foreground"],
+        "*Listbox.background": c["panel_alt"], "*Listbox.foreground": c["foreground"],
+    }.items():
+        root.option_add(option, value)
     style.configure(
         ".", background=c["panel"], foreground=c["foreground"],
         fieldbackground=c["panel_alt"], font=FONTS["body"],
@@ -204,7 +224,8 @@ def configure_theme(
         padding=(round(9 * scale), round(6 * scale)),
         bordercolor=c["border"],
     )
-    style.map("TButton", background=[("active", "#2C3745"), ("disabled", c["panel"])])
+    style.map("TButton", background=[("disabled", "#E9EDF2"), ("pressed", "#D5E5F4"), ("active", "#E5EEF7")],
+              foreground=[("disabled", c["muted"])], bordercolor=[("focus", c["accent"])])
     style.configure(
         "Compact.TButton",
         padding=(round(5 * scale), round(3 * scale)),
@@ -212,7 +233,8 @@ def configure_theme(
     style.configure(
         "Primary.TButton", background=c["accent_dark"], foreground="white",
     )
-    style.map("Primary.TButton", background=[("active", c["accent"])])
+    style.map("Primary.TButton", background=[("disabled", "#E3E8EF"), ("active", c["accent"])],
+              foreground=[("disabled", c["muted"]), ("!disabled", "white")])
     style.configure(
         "Secondary.TButton", background=c["panel_alt"], foreground=c["foreground"],
     )
@@ -226,7 +248,7 @@ def configure_theme(
         "TEntry", fieldbackground=c["panel_alt"], foreground=c["foreground"],
         insertcolor=c["foreground"],
     )
-    combo_arrow = "#3A4859"
+    combo_arrow = "#E6ECF3"
     style.configure(
         "TCombobox",
         fieldbackground=c["panel_alt"],
@@ -242,25 +264,26 @@ def configure_theme(
     style.map(
         "TCombobox",
         fieldbackground=[
+            ("disabled", "#E9EDF2"),
             ("readonly", c["panel_alt"]),
             ("focus", c["panel_alt"]),
             ("disabled", c["panel"]),
         ],
         background=[
             ("pressed", c["accent_dark"]),
-            ("active", "#4A5D72"),
+            ("active", "#D4E4F3"),
             ("disabled", c["border"]),
             ("readonly", combo_arrow),
         ],
         arrowcolor=[
             ("disabled", c["muted"]),
             ("pressed", "white"),
-            ("active", "white"),
+            ("active", c["accent_dark"]),
             ("readonly", c["foreground"]),
         ],
         bordercolor=[
             ("focus", c["accent"]),
-            ("active", "#526379"),
+            ("active", c["accent"]),
             ("readonly", c["border"]),
         ],
         foreground=[
@@ -280,7 +303,7 @@ def configure_theme(
     style.configure(
         "Parameter.Horizontal.TScale",
         background=c["panel"],
-        troughcolor="#354252",
+        troughcolor=c["border"],
         bordercolor=c["border"],
         lightcolor=c["accent"],
         darkcolor=c["accent_dark"],
@@ -290,10 +313,11 @@ def configure_theme(
     style.map(
         "Parameter.Horizontal.TScale",
         background=[("active", c["accent"]), ("focus", c["accent_dark"])],
-        troughcolor=[("focus", "#405166")],
+        troughcolor=[("focus", c["guide"])],
     )
     style.configure(
         "Parameter.TEntry",
+        font=FONTS["mono"],
         fieldbackground=c["panel_alt"],
         foreground=c["foreground"],
         bordercolor=c["border"],
@@ -303,6 +327,26 @@ def configure_theme(
         "Parameter.TEntry",
         bordercolor=[("focus", c["accent"])],
     )
+    style.configure("Invalid.Parameter.TEntry", bordercolor=c["error"])
+    style.map("Invalid.Parameter.TEntry", bordercolor=[("focus", c["error"])])
+    for name in ("TEntry", "TSpinbox"):
+        style.configure(name, fieldbackground=c["panel_alt"], foreground=c["foreground"],
+                        insertcolor=c["foreground"], bordercolor=c["border"], arrowcolor=c["foreground"])
+        style.map(name, fieldbackground=[("disabled", "#E9EDF2")],
+                  foreground=[("disabled", c["muted"])], bordercolor=[("focus", c["accent"])])
+    for name in ("TCheckbutton", "TRadiobutton"):
+        style.configure(name, background=c["panel"], foreground=c["foreground"],
+                        indicatorbackground="white", indicatorforeground=c["accent"])
+        style.map(name, foreground=[("disabled", c["muted"])], background=[("active", "#E5EEF7")])
+    for name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+        style.configure(name, background="#B6C3D2", troughcolor="#ECF0F5",
+                        arrowcolor=c["foreground"], bordercolor=c["border"])
+        style.map(name, background=[("active", "#819BB6"), ("pressed", c["accent"])])
+    row_height = max(round(29 * scale), root._isp_named_fonts["body"].metrics("linespace") + round(8 * scale))
+    style.configure("Treeview", background=c["panel_alt"], fieldbackground=c["panel_alt"],
+                    foreground=c["foreground"], rowheight=row_height)
+    style.configure("Treeview.Heading", background="#E6ECF3", foreground=c["foreground"])
+    style.map("Treeview", background=[("selected", c["selection"])], foreground=[("selected", "white")])
     style.configure("TNotebook", background=c["background"], borderwidth=0)
     style.configure(
         "TNotebook.Tab", background=c["panel_alt"], foreground=c["muted"],
@@ -315,7 +359,7 @@ def configure_theme(
     )
     style.configure(
         "Status.Treeview", background=c["panel_alt"], fieldbackground=c["panel_alt"],
-        foreground=c["foreground"], rowheight=round(29 * scale),
+        foreground=c["foreground"], rowheight=row_height,
         bordercolor=c["border"], font=FONTS["body"],
     )
     style.configure(

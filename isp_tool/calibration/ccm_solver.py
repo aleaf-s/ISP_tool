@@ -38,11 +38,11 @@ def _delta_e(
     measured: np.ndarray,
     reference: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Lab conversion is undefined for strongly negative RGB.  Clipping here is
-    # only for the perceptual metric; linear fitting still sees unclipped data.
+    # Extended linear RGB can represent a valid XYZ outside the sRGB cube.
+    # Do not change reference coordinates with display-domain clipping.
     return delta_e_values(
-        np.clip(measured, 0.0, 1.25),
-        np.clip(reference, 0.0, 1.25),
+        measured,
+        reference,
         "CIE 2000",
     )
 
@@ -181,7 +181,7 @@ def estimate_global_exposure_gain(
     luma_vector = np.array((0.2126729, 0.7151522, 0.0721750))
     measured_luma = measured @ luma_vector
     reference_luma = reference @ luma_vector
-    reference_lab = linear_srgb_to_lab(np.clip(reference, 0.0, 1.25))
+    reference_lab = linear_srgb_to_lab(reference)
     reference_chroma = np.hypot(reference_lab[:, 1], reference_lab[:, 2])
     finite = (
         np.isfinite(measured_luma)
@@ -257,7 +257,7 @@ def solve_ccm(
             raise ISPError("CCM 权重必须是 N 个有限正数")
     sample_weights /= max(float(np.mean(sample_weights)), 1e-8)
 
-    reference_lab_for_fit = linear_srgb_to_lab(np.clip(reference, 0.0, 1.25))
+    reference_lab_for_fit = linear_srgb_to_lab(reference)
     exposure_gain = 1.0
     exposure_diagnostics = {
         "method": "disabled",
@@ -354,7 +354,7 @@ def solve_ccm(
             )
         if perceptual_weight > 0:
             predicted_lab = linear_srgb_to_lab(
-                np.clip(predicted, 0.0, 1.25)
+                predicted
             )
             ab_strength = max(
                 0.5 * (chroma_strength + hue_strength), 1e-8
@@ -415,13 +415,13 @@ def solve_ccm(
     lch_initial = delta_lch_components(initial_lab, reference_lab)
     lch_after = delta_lch_components(corrected_lab, reference_lab)
     delta76_before, _, _ = delta_e_values(
-        np.clip(measured, 0.0, 1.25),
-        np.clip(reference, 0.0, 1.25),
+        measured,
+        reference,
         "CIE 1976",
     )
     delta76_after, _, _ = delta_e_values(
-        np.clip(predicted_after, 0.0, 1.25),
-        np.clip(reference, 0.0, 1.25),
+        predicted_after,
+        reference,
         "CIE 1976",
     )
     matrix_condition = float(np.linalg.cond(matrix))

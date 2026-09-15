@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from ..calibration.colorchecker import generate_colorchecker_grid
-from .theme import FONTS
+from .theme import FONTS, COLORS
 
 
 class ColorCheckerCornerEditor(tk.Toplevel):
@@ -43,7 +43,7 @@ class ColorCheckerCornerEditor(tk.Toplevel):
         ).pack(side="left")
         ttk.Button(toolbar, text="Apply", command=self._apply).pack(side="right")
         ttk.Button(toolbar, text="Cancel", command=self.destroy).pack(side="right", padx=5)
-        self.canvas = tk.Canvas(self, bg="#080b0f", highlightthickness=0)
+        self.canvas = tk.Canvas(self, bg=COLORS["canvas"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self._draw())
         self.canvas.bind("<ButtonPress-1>", self._press)

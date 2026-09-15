@@ -128,72 +128,45 @@ class ParameterControlTests(unittest.TestCase):
         configure_theme(root)
         return root
 
-    def test_step_entry_reset_and_throttled_latest_value(self):
+    def test_entry_commit_reset_and_duplicate_commit(self):
         root = self._root()
         calls = []
         spec = ParameterSpec("gain", "Gain", "float", 0.5, 0, 1, 0.1)
-        control = ParameterControl(
-            root, spec, 0.3, lambda immediate: calls.append(immediate)
-        )
+        control = ParameterControl(root, spec, 0.3, calls.append)
         try:
-            control.pack()
-            control._scale_changed("0.34")
-            control._scale_changed("0.46")
-            control._scale_changed("0.74")
-            deadline = time.time() + 1.0
-            while time.time() < deadline and not calls:
-                root.update()
-                time.sleep(0.005)
-            self.assertEqual(calls, [False])
-            self.assertAlmostEqual(control.value(), 0.7)
-
             control.entry_var.set("0.96")
+            self.assertEqual(calls, [])
             control._entry_commit()
-            self.assertAlmostEqual(control.value(), 1.0)
-            self.assertTrue(calls[-1])
-
+            control._entry_commit()
+            self.assertEqual(calls, [True])
+            self.assertAlmostEqual(control.value(), 0.96)
             control.reset()
-            self.assertAlmostEqual(control.value(), 0.5)
             self.assertEqual(control.entry_var.get(), "0.5")
         finally:
-            control.destroy()
             root.destroy()
 
-    def test_wheel_requires_focus_or_control_modifier(self):
+    def test_wheel_does_not_change_numeric_entry(self):
         root = self._root()
-        spec = ParameterSpec("gain", "Gain", "float", 0.5, 0, 1, 0.1)
-        control = ParameterControl(root, spec, 0.5, lambda _immediate: None)
+        control = ParameterControl(root, ParameterSpec("gain", "Gain", "float", .5, 0, 1, .1), .5, lambda _: None)
         try:
-            control.pack()
-            ignored = control._wheel_step(
-                SimpleNamespace(state=0, delta=120), 0
-            )
-            self.assertIsNone(ignored)
-            handled = control._wheel_step(
-                SimpleNamespace(state=0x0004, delta=120), 0
-            )
-            self.assertEqual(handled, "break")
-            self.assertAlmostEqual(control.value(), 1.0)
+            control.entry.event_generate("<MouseWheel>", delta=120, state=4)
+            self.assertEqual(control.value(), .5)
+            self.assertFalse(control.entry.bind("<MouseWheel>"))
         finally:
-            control.destroy()
             root.destroy()
 
-    def test_clicking_scale_track_jumps_to_pointer(self):
+    def test_slider_removed_and_keyboard_uses_step(self):
         root = self._root()
-        spec = ParameterSpec("gain", "Gain", "float", 0.5, 0, 1, 0.1)
-        control = ParameterControl(root, spec, 0.0, lambda _immediate: None)
+        control = ParameterControl(root, ParameterSpec("gain", "Gain", "float", .5, 0, 1, .1), .5, lambda _: None)
         try:
-            control.scale.coords = lambda value: (
-                (10, 10) if float(value) == 0.0 else (110, 10)
-            )
-            control.scale.identify = lambda _x, _y: "trough"
-            result = control._track_press(
-                SimpleNamespace(x=90, y=10)
-            )
-            self.assertEqual(result, "break")
-            self.assertAlmostEqual(control.value(), 0.8)
+            self.assertFalse(hasattr(control, "scale"))
+            control._key_step(SimpleNamespace(state=0), 1)
+            self.assertEqual(control.value(), .6)
+            control.entry_var.set("2")
+            control._entry_commit()
+            self.assertEqual(control.value(), .6)
+            self.assertTrue(control.error_var.get())
         finally:
-            control.destroy()
             root.destroy()
 
     def test_dark_combobox_and_parameter_scale_styles_are_explicit(self):

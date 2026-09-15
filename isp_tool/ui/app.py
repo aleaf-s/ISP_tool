@@ -123,7 +123,7 @@ from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, ParameterControl, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.40 · CCM Stability Fix"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.45 · Manual Colour Grading"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,
@@ -234,6 +234,7 @@ class ISPApplication:
         self.colorchecker_corners = []
         self.colorchecker_selected_patch = 0
         self.colorchecker_edit_active = False
+        self.colorchecker_visible_var = tk.BooleanVar(self.root, value=True)
         self.colorchecker_drag_mode = ""
         self.colorchecker_drag_corner = -1
         self.colorchecker_drag_start = None
@@ -324,6 +325,10 @@ class ISPApplication:
         self.line_profile_start: Optional[Tuple[int, int]] = None
         self.line_profile_end: Optional[Tuple[int, int]] = None
         self.temporary_input = False
+        self.ccm_format_var = tk.StringVar(self.root, value="Float")
+        self.ccm_editor = None
+        self._ccm_drafts = {}
+        self._ccm_editor_key = None
         self.param_vars: Dict[str, tk.Variable] = {}
         self.parameter_controls: Dict[str, ParameterControl] = {}
         self.manual_parameter_snapshots: Dict[str, Dict[str, object]] = {}
@@ -545,7 +550,6 @@ class ISPApplication:
         self.root.title(t("app.title"))
         mappings = (
             (getattr(self, "import_image_button", None), "toolbar.import"),
-            (getattr(self, "yuv_workspace_button", None), "toolbar.yuv_preview"),
             (getattr(self, "remove_image_button", None), "toolbar.remove"),
             (getattr(self, "auto_calibration_button", None), "toolbar.auto"),
             (getattr(self, "fit_button", None), "toolbar.fit"),
@@ -582,6 +586,7 @@ class ISPApplication:
                 "toolbar.export_current", "toolbar.export_roi",
                 "menu.export_yuv_metadata", "menu.export_yuv_planes",
                 "menu.export_yuv_rgb",
+                "toolbar.export_data",
             )):
                 export_menu.set_item_label(index, t(key))
         preview_menu = getattr(self, "preview_menu", None)
@@ -844,20 +849,12 @@ class ISPApplication:
         self.import_image_button.pack(side="left")
         self.workspace_switch = ttk.Frame(toolbar)
         self.workspace_switch.pack(side="left", padx=(7, 5))
-        self.isp_workspace_button = ttk.Button(
-            self.workspace_switch,
-            text="RAW ISP",
-            command=lambda: self._switch_workspace("isp"),
-            style="Primary.TButton",
-        )
-        self.isp_workspace_button.pack(side="left")
-        self.yuv_workspace_button = ttk.Button(
-            self.workspace_switch,
-            text="YUV 预览",
-            command=lambda: self._switch_workspace("yuv"),
-            style="Secondary.TButton",
-        )
-        self.yuv_workspace_button.pack(side="left", padx=(2, 0))
+        from .widgets.tool_selector import ToolSelector
+        self.tool_var = tk.StringVar(self.root, value="isp")
+        self.tool_selector = ToolSelector(self.workspace_switch, self.tool_var, self._switch_workspace)
+        self.tool_selector.pack(side="left")
+        self.grading_workspace = None
+        self._last_tool_items = {}
         self.image_var = tk.StringVar()
         self.image_combo = ttk.Combobox(
             toolbar,
@@ -903,6 +900,8 @@ class ISPApplication:
             enabled=lambda: self.loaded.domain == "yuv",
         )
         export_menu.pack(side="left")
+        export_menu.add_command(self.tr("toolbar.export_data"), self.export_computation_data,
+                                enabled=lambda: bool(self.results) and self.loaded.domain != "yuv")
         self.auto_calibration_button = ttk.Button(
             toolbar, text="自动矫正", command=self.open_calibration_workspace
         )
@@ -1784,6 +1783,7 @@ class ISPApplication:
     def _colorchecker_hit_at(self, point):
         if (
             not self.colorchecker_edit_active
+            or not self.colorchecker_visible_var.get()
             or len(self.colorchecker_corners) != 4
             or self.roi_process_var.get()
         ):
@@ -1799,6 +1799,10 @@ class ISPApplication:
         if cv2.pointPolygonTest(contour, (x, y), False) >= 0:
             return "move", -1
         return None
+
+    def _toggle_colorchecker_visibility(self):
+        # Visibility is independent of geometry, ROI and calibration state.
+        self._schedule_canvas_render()
 
     def select_colorchecker_patch(self, patch_id: int) -> None:
         selected = max(0, min(int(patch_id), 24))
@@ -1820,6 +1824,7 @@ class ISPApplication:
             "flipped": bool(workspace.ccm_flip_var.get()) if workspace else False,
             "excluded": workspace.ccm_exclude_var.get() if workspace else "",
             "selected_patch": int(self.colorchecker_selected_patch),
+            "visible": self.colorchecker_visible_var.get(),
         }
 
     def _restore_colorchecker_state(self, state: Dict[str, object]) -> None:
@@ -1830,6 +1835,7 @@ class ISPApplication:
             if isinstance(point, (list, tuple)) and len(point) == 2
         ]
         self.colorchecker_selected_patch = int(values.get("selected_patch", 0))
+        self.colorchecker_visible_var.set(bool(values.get("visible", True)))
         workspace = self.calibration_workspace
         panel = self._colorchecker_panel()
         if workspace is not None:
@@ -2594,6 +2600,10 @@ class ISPApplication:
                 )
 
     def _build_parameter_editor(self, module) -> None:
+        from .widgets.ccm_matrix_editor import CCMMatrixEditor
+        if self.ccm_editor is not None and self.ccm_editor.winfo_exists():
+            self._ccm_drafts[self._ccm_editor_key] = self.ccm_editor.snapshot()
+        self.ccm_editor = None
         for child in self.param_frame.winfo_children():
             child.destroy()
         self.param_vars.clear()
@@ -2602,18 +2612,10 @@ class ISPApplication:
         self.ccm_info_label = None
         basic_params = ttk.Frame(self.param_frame)
         basic_params.pack(fill="x")
-        if module.module_id == "white_balance":
-            ttk.Label(
-                basic_params,
-                text=(
-                    "RAW 马赛克中绿色像素数量是 R/B 的两倍，整体偏绿是正常的。"
-                    "请按 R、Gr、Gb、B 四个 CFA 平面的统计值计算增益，"
-                    "最终白平衡以 Demosaic 输出判断。"
-                ),
-                style="Muted.TLabel",
-                wraplength=300,
-                justify="left",
-            ).pack(fill="x", pady=(2, 7))
+        if module.module_id == "color_correction_matrix":
+            ttk.Checkbutton(basic_params, text=self.tr("ccm.show_chart"),
+                            variable=self.colorchecker_visible_var,
+                            command=self._toggle_colorchecker_visibility).pack(anchor="w")
         advanced_params = ttk.Frame(self.param_frame)
         self.advanced_params_frame = advanced_params
         basic_keys = BASIC_PARAMETER_KEYS.get(
@@ -2629,21 +2631,16 @@ class ISPApplication:
                 ttk.Label(basic_params, text="3 × 3 Matrix", style="Title.TLabel").pack(
                     anchor="w", pady=(8, 4)
                 )
-                matrix_frame = ttk.Frame(basic_params)
-                matrix_frame.pack(fill="x", pady=(0, 8))
-                for key in matrix_keys:
-                    row, col = int(key[1]), int(key[2])
-                    var = tk.StringVar(value=self._format_value(module.parameters[key]))
+                matrix = np.array([[module.parameters[f"m{r}{c}"] for c in range(3)] for r in range(3)])
+                self._ccm_editor_key = (id(self.work_items[self.current_image_index]), tuple(matrix.ravel()))
+                self.ccm_editor = CCMMatrixEditor(basic_params, matrix, self.ccm_format_var)
+                self.ccm_editor.pack(fill="x", pady=(0, 8))
+                if self._ccm_editor_key in self._ccm_drafts:
+                    self.ccm_editor.restore(self._ccm_drafts[self._ccm_editor_key])
+                for key, var in zip(matrix_keys, self.ccm_editor.variables):
                     self.param_vars[key] = var
-                    entry = ttk.Entry(matrix_frame, textvariable=var, width=8)
-                    entry.grid(row=row, column=col, padx=2, pady=2, sticky="ew")
-                    var.trace_add(
-                        "write",
-                        lambda *_args, k=key:
-                        self._parameter_changed(k),
-                    )
-                    entry.bind("<Return>", lambda _event, k=key: self._entry_commit(k))
-                    entry.bind("<FocusOut>", lambda _event, k=key: self._entry_commit(k))
+                ttk.Button(basic_params, text=self.tr("ccm.correct"), command=self._apply_ccm_draft,
+                           style="Primary.TButton").pack(fill="x", pady=(0, 6))
                 matrix_controls = ttk.Frame(basic_params)
                 matrix_controls.pack(fill="x", pady=(0, 5))
                 ttk.Button(
@@ -2758,6 +2755,8 @@ class ISPApplication:
         return str(value)
 
     def _entry_commit(self, key: str) -> None:
+        if self.ccm_editor is not None and key.startswith("m") and len(key) == 3:
+            return
         self._parameter_changed(key)
 
     def _parameter_changed(
@@ -2767,6 +2766,8 @@ class ISPApplication:
         variable = self.param_vars.get(key)
         if variable is None:
             return
+        if module.module_id == "color_correction_matrix" and key.startswith("m") and len(key) == 3:
+            return  # Matrix cells are a draft until Correct is pressed.
         try:
             value = variable.get()
             spec = module.specs[key]
@@ -2779,6 +2780,8 @@ class ISPApplication:
                 value = float(value)
                 if not math.isfinite(value):
                     raise ValueError("parameter must be finite")
+            if module.parameters[key] == value:
+                return
             module.parameters[key] = value
         except (ValueError, tk.TclError):
             return
@@ -2813,9 +2816,7 @@ class ISPApplication:
         self._mark_manual_parameter_state(module)
         self._refresh_auto_summary()
         self._refresh_module_state()
-        # ParameterControl already emits at most one drag update every 25 ms.
-        # Submit those sampled values immediately; applying the generic 90 ms
-        # debounce here would postpone every update until the drag stopped.
+        # Numeric controls emit only changed, validated commits.
         self.schedule_process(immediate=(immediate or control is not None))
 
     def _draw_tone_curve(self) -> None:
@@ -2866,6 +2867,27 @@ class ISPApplication:
     def _ccm_module(self):
         return self.pipeline.module_by_id("color_correction_matrix")
 
+    def _apply_ccm_draft(self):
+        if self.ccm_editor is None:
+            return
+        try:
+            matrix = self.ccm_editor.matrix()
+        except ValueError as exc:
+            self.toast.show(str(exc), "error")
+            return
+        module = self._ccm_module()
+        changed = any(module.parameters[f"m{r}{c}"] != float(matrix[r, c]) for r in range(3) for c in range(3))
+        for r in range(3):
+            for c in range(3):
+                module.parameters[f"m{r}{c}"] = float(matrix[r, c])
+        self._ccm_drafts.pop(self._ccm_editor_key, None)
+        self.ccm_editor.set_matrix(matrix)
+        self._mark_manual_parameter_state(module)
+        self.apply_manual_parameters()
+        self._update_ccm_info()
+        if changed:
+            self.schedule_process(immediate=True)
+
     def _set_ccm_values(self, values: np.ndarray) -> None:
         matrix = np.asarray(values, dtype=np.float32).reshape(3, 3)
         module = self._ccm_module()
@@ -2873,30 +2895,35 @@ class ISPApplication:
             for col in range(3):
                 key = f"m{row}{col}"
                 module.parameters[key] = float(matrix[row, col])
-                variable = self.param_vars.get(key)
-                if variable is not None:
-                    variable.set(self._format_value(matrix[row, col]))
+        if self.ccm_editor is not None:
+            self.ccm_editor.set_matrix(matrix)
         self._mark_manual_parameter_state(module)
         self._update_ccm_info()
         self._refresh_module_state()
         self.schedule_process(immediate=True)
 
     def _ccm_identity(self) -> None:
-        self._set_ccm_values(np.eye(3, dtype=np.float32))
+        if self.ccm_editor is not None:
+            self.ccm_editor.set_matrix(np.eye(3))
 
     def _ccm_normalize_rows(self) -> None:
-        matrix = self._ccm_module().matrix()
+        try:
+            matrix = self.ccm_editor.matrix() if self.ccm_editor is not None else self._ccm_module().matrix()
+        except ValueError:
+            return
         sums = matrix.sum(axis=1, keepdims=True)
         if np.any(np.abs(sums) < 1e-8):
             messagebox.showwarning(
                 "CCM", "至少一行的和接近 0，无法进行行归一化。", parent=self.root
             )
             return
-        self._set_ccm_values(matrix / sums)
+        if self.ccm_editor is not None:
+            self.ccm_editor.set_matrix(matrix / sums)
 
     def _ccm_copy(self) -> None:
-        matrix = self._ccm_module().matrix()
-        text = "\n".join("\t".join(f"{value:.8g}" for value in row) for row in matrix)
+        if self.ccm_editor is None:
+            return
+        text = "\n".join("\t".join(v.get() for v in self.ccm_editor.variables[r*3:r*3+3]) for r in range(3))
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.status_var.set("CCM 已复制到剪贴板")
@@ -2913,7 +2940,12 @@ class ISPApplication:
 
     def _ccm_paste(self) -> None:
         try:
-            self._set_ccm_values(self._parse_ccm_text(self.root.clipboard_get()))
+            tokens = [v for v in re.split(r"[\s,;，]+", self.root.clipboard_get().strip()) if v]
+            if len(tokens) != 9 or self.ccm_editor is None:
+                raise ValueError("CCM 必须包含 9 个数值")
+            for variable, token in zip(self.ccm_editor.variables, tokens):
+                variable.set(token)
+            self.ccm_editor.matrix()  # Validate without applying the pasted draft.
         except Exception as exc:
             messagebox.showerror("粘贴 CCM 失败", str(exc), parent=self.root)
 
@@ -3949,7 +3981,8 @@ class ISPApplication:
                             outline=COLORS["panel_alt"],
                             tags="roi",
                         )
-        if self.calibration_polygons and not self.roi_process_var.get():
+        if (self.calibration_polygons and not self.roi_process_var.get()
+                and self.colorchecker_visible_var.get()):
             for index, polygon in enumerate(self.calibration_polygons):
                 points = []
                 for x, y in polygon:
@@ -5917,33 +5950,71 @@ class ISPApplication:
         self._update_workspace_switch()
 
     def _update_workspace_switch(self) -> None:
-        if not hasattr(self, "isp_workspace_button"):
+        if not hasattr(self, "tool_var"):
             return
-        is_yuv = self.loaded.domain == "yuv"
-        self.isp_workspace_button.configure(
-            style="Secondary.TButton" if is_yuv else "Primary.TButton"
-        )
-        self.yuv_workspace_button.configure(
-            style="Primary.TButton" if is_yuv else "Secondary.TButton"
-        )
+        if self.grading_workspace is not None and self.grading_workspace.winfo_manager():
+            self.tool_var.set("grading")
+        else:
+            self.tool_var.set("yuv" if self.loaded.domain == "yuv" else "isp")
 
     def _switch_workspace(self, workspace: str) -> None:
-        """Activate the most recent image in a visible RAW ISP/YUV workspace."""
-
-        wants_yuv = workspace == "yuv"
-        current_matches = (self.loaded.domain == "yuv") == wants_yuv
-        if current_matches:
+        """Shared tool routing; cancelled import keeps the actual tool selected."""
+        if workspace == "grading":
+            self.open_grading_workspace()
+            return
+        self.close_grading_workspace()
+        current = "yuv" if self.loaded.domain == "yuv" else "isp"
+        self._last_tool_items[current] = id(self.work_items[self.current_image_index]) if 0 <= self.current_image_index < len(self.work_items) else None
+        if current == workspace:
             self._update_workspace_switch()
             return
-        for index in range(len(self.work_items) - 1, -1, -1):
-            item_is_yuv = self.work_items[index].loaded.domain == "yuv"
-            if item_is_yuv == wants_yuv:
-                self._activate_work_item(index)
-                return
-        if wants_yuv:
+        wanted = self._last_tool_items.get(workspace)
+        candidates = [i for i, item in enumerate(self.work_items)
+                      if (item.loaded.domain == "yuv") == (workspace == "yuv")]
+        if candidates:
+            index = next((i for i in candidates if id(self.work_items[i]) == wanted), candidates[-1])
+            self._activate_work_item(index)
+        elif workspace == "yuv":
             self.open_yuv_files()
         else:
             self.open_isp_files()
+        self._update_workspace_switch()
+
+    def open_grading_workspace(self):
+        from .grading_workspace import GradingWorkspace
+        if self.grading_workspace is None:
+            self.grading_workspace = GradingWorkspace(self.root, self.close_grading_workspace, self.tool_var, self._switch_workspace)
+        panel = self.grading_workspace
+        if panel.winfo_manager():
+            return
+        # Isolate root keyboard/menu actions from the hidden ISP workspace.
+        self._grading_saved_bindings = {sequence: self.root.bind(sequence) for sequence in self.root.bind()}
+        for sequence in self._grading_saved_bindings:
+            self.root.unbind(sequence)
+        self._grading_saved_menu = self.root.cget("menu")
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="导入彩色图像", command=panel.open_images)
+        menu.add_command(label="导出结果", command=panel.export)
+        self._grading_menu = menu
+        self.root.configure(menu=menu)
+        panel.place(x=0, y=0, relwidth=1, relheight=1)
+        panel.lift()
+        panel.schedule_draw()
+        self._update_workspace_switch()
+        self.root.bind("<Control-o>", lambda e: panel.open_images())
+        self.root.bind("<Control-e>", lambda e: panel.export())
+
+    def close_grading_workspace(self):
+        if self.grading_workspace is None or not self.grading_workspace.winfo_manager():
+            return
+        self.grading_workspace.place_forget()
+        for sequence in self.root.bind():
+            self.root.unbind(sequence)
+        for sequence, script in self._grading_saved_bindings.items():
+            self.root.bind(sequence, script)
+        self.root.configure(menu=self._grading_saved_menu)
+        self._grading_menu.destroy()
+        self._update_workspace_switch()
 
     def _runtime_cache_entries(self):
         return self.runtime_preview_cache_policy.entries(
@@ -6126,6 +6197,17 @@ class ISPApplication:
         ):
             self._refresh_image_selector()
             return
+        if 0 <= self.current_image_index < len(self.work_items):
+            ui = dict(fit=self.fit_mode, zoom=self.zoom, origin=tuple(self.canvas_origin),
+                      module=self.selected_module_index)
+            if self.loaded.domain != "yuv":
+                ui["drafts"] = {key: (control.value(), control.entry_var.get(), control.error_var.get())
+                                for key, control in self.parameter_controls.items() if control.winfo_exists()}
+                if self.ccm_editor is not None and self.ccm_editor.winfo_exists():
+                    self._ccm_drafts[self._ccm_editor_key] = self.ccm_editor.snapshot()
+            elif hasattr(self, "yuv_frame_spin") and self.yuv_frame_spin.winfo_exists():
+                ui["frame_draft"] = self.yuv_frame_spin.get()
+            self.work_items[self.current_image_index].tool_ui_state = ui
         if (
             self.calibration_workspace is not None
             and self.calibration_workspace.winfo_exists()
@@ -6187,7 +6269,11 @@ class ISPApplication:
                 )
             item.preview_shape = tuple(self.preview_image.shape[:2])
             self.results = []
-        self.fit_mode = True
+        view = item.tool_ui_state
+        self.fit_mode = view.get("fit", True)
+        self.zoom = view.get("zoom", 1.0)
+        self.canvas_origin = view.get("origin", (0., 0.))
+        self.selected_module_index = view.get("module", 0)
         if state.manual_parameter_snapshots:
             self.manual_parameter_snapshots = (
                 state.manual_parameter_snapshots
@@ -6210,6 +6296,8 @@ class ISPApplication:
         )
         if self.loaded.domain == "yuv":
             self._build_yuv_parameter_panel()
+            if "frame_draft" in view:
+                self.yuv_frame_spin.set(view["frame_draft"])
         else:
             self.parameters_label.configure(text="PARAMETERS")
             self._set_adjustment_mode(self.adjustment_mode)
@@ -6218,6 +6306,12 @@ class ISPApplication:
                 self.pipeline.modules[self.selected_module_index]
             )
             self._update_colorchecker_module_overlay()
+            for key, (value, text, error) in view.get("drafts", {}).items():
+                control = self.parameter_controls.get(key)
+                if control is not None and control.value() == value:
+                    control.entry_var.set(text)
+                    if error:
+                        control._error(error)
         self._update_roi_label()
         self._set_loaded_status()
         if restored_from_cache:
@@ -6516,13 +6610,10 @@ class ISPApplication:
         return True
 
     def open_files(self) -> None:
-        paths = filedialog.askopenfilenames(
-            parent=self.root,
-            title="导入一张或多张 RAW / YUV / 图像",
-            initialdir=self.last_directory or None,
-            filetypes=self._image_filetypes(),
-        )
-        self._load_paths(paths)
+        if self.loaded.domain == "yuv":
+            self.open_yuv_files()
+        else:
+            self.open_isp_files()
 
     def open_isp_files(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -6709,6 +6800,7 @@ class ISPApplication:
                 "performance_details_visible": False,
                 "ui_scale": self.ui_scale,
                 "ui_scale_mode": self.ui_scale_var.get(),
+                "ccm_number_format": self.ccm_format_var.get(),
                 "language": self.language_controller.language,
                 "preview_quality": self.preview_quality_var.get(),
                 "processing_backend": (
@@ -6964,6 +7056,8 @@ class ISPApplication:
                     str(key): bool(value)
                     for key, value in advanced_state.items()
                 }
+            ccm_format = ui_state.get("ccm_number_format", "Float")
+            self.ccm_format_var.set(ccm_format if ccm_format in ("Float", "Fixed 13-bit / ×1024") else "Float")
             raw_scale = ui_state.get("ui_scale_mode", ui_state.get("ui_scale", "100%"))
             if isinstance(raw_scale, (int, float)):
                 scale_value = float(raw_scale)
@@ -7130,96 +7224,75 @@ class ISPApplication:
         if self.loaded.domain != "yuv" or self.loaded.yuv_frame is None:
             self.toast.show("当前图像不是 YUV", "warning")
             return
-        path = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="导出 YUV 当前帧全分辨率 RGB",
-            defaultextension=".png",
-            filetypes=[("PNG 8-bit", "*.png"), ("TIFF 16-bit", "*.tif *.tiff")],
-        )
-        if not path:
-            return
-        try:
-            conversion = yuv_to_rgb(
-                self.loaded.yuv_frame,
-                target_size=None,
-                clip=True,
-            )
-            export_image(
-                path,
-                conversion.rgb,
-                "yuv_rgb",
-                self.loaded.metadata,
-            )
-        except Exception as exc:
-            messagebox.showerror("导出 YUV RGB 失败", str(exc), parent=self.root)
-            return
-        self.toast.show("YUV 当前帧 RGB 已导出", "success")
+        self._export_selected_stage(module_id="yuv_to_rgb")
 
     def export_current(self) -> None:
-        if not self.results:
-            return
-        result = self.results[self._current_result_index()]
-        path = filedialog.asksaveasfilename(
-            parent=self.root, title=f"导出 {result.name}",
-            defaultextension=".png",
-            filetypes=[("PNG 8-bit", "*.png"), ("TIFF 16-bit", "*.tif *.tiff")],
-        )
-        if not path:
-            return
-        try:
-            artifact_name = self.artifact_var.get()
-            if artifact_name != "Main Output" and artifact_name in result.artifacts:
-                image = artifact_to_rgb(artifact_name, result.artifacts[artifact_name])
-                domain = "rgb"
-                data_state = None
-            else:
-                image, domain = result.image, result.domain
-                data_state = result.data_state
-            export_image(
-                path, image, domain, self.loaded.metadata, data_state
-            )
-        except Exception as exc:
-            messagebox.showerror("导出失败", str(exc), parent=self.root)
-            return
-        self.toast.show(f"{result.name} 已导出", "success")
-        self.status_var.set(f"已导出 {result.name}：{path}")
+        self._export_selected_stage()
+
+    def export_computation_data(self) -> None:
+        self._export_selected_stage(computation=True)
 
     def export_roi(self) -> None:
         if self.roi is None:
             self.toast.show("请先框选 ROI", "warning")
             return
+        self._export_selected_stage(roi=self.roi)
+
+    def _export_selected_stage(self, roi=None, computation=False, module_id=None):
+        from ..exporting import export_pipeline_stage, export_yuv_stage
         if not self.results:
             return
+        if getattr(self, "_export_future", None) is not None:
+            self.toast.show("正在导出，请稍候 / Export in progress", "warning")
+            return
         result = self.results[self._current_result_index()]
-        artifact_name = self.artifact_var.get()
-        if artifact_name != "Main Output" and artifact_name in result.artifacts:
-            source = artifact_to_rgb(artifact_name, result.artifacts[artifact_name])
-            domain = "rgb"
-            data_state = None
-        else:
-            source = result.image
-            domain = result.domain
-            data_state = result.data_state
-        if not self.roi_process_var.get() and source.shape[:2] == self.preview_image.shape[:2]:
-            ys, xs = self.roi.slices()
-            source = source[ys, xs]
+        if module_id is not None:
+            result = next(r for r in self.results if r.module_id == module_id)
+        kind = "计算数据（非显示、无裁剪）" if computation else f"彩色预览（含预览 {self.preview_exposure_ev:+.1f} EV，无叠加层）"
         path = filedialog.asksaveasfilename(
-            parent=self.root,
-            title=f"导出 ROI · {result.name}",
-            defaultextension=".png",
-            filetypes=[("PNG 8-bit", "*.png"), ("TIFF 16-bit", "*.tif *.tiff")],
+            parent=self.root, title=f"{'ROI' if roi else 'Full image'} · {result.name} · {kind}",
+            defaultextension=".tif" if computation else ".png",
+            filetypes=([("Float32 TIFF · non-display", "*.tif *.tiff")] if computation else
+                       [("PNG 8-bit · display", "*.png"), ("TIFF 16-bit · display", "*.tif *.tiff")]),
         )
         if not path:
             return
-        try:
-            export_image(
-                path, source, domain, self.loaded.metadata, data_state
-            )
-        except Exception as exc:
-            messagebox.showerror("导出 ROI 失败", str(exc), parent=self.root)
+        metadata = copy.deepcopy(self.loaded.metadata)
+        if roi is not None:
+            ph, pw = self.preview_image.shape[:2]
+            fh, fw = ((self.loaded.yuv_metadata.height, self.loaded.yuv_metadata.width)
+                      if self.loaded.domain == "yuv" else self.loaded.image.shape[:2])
+            x0, y0 = round(roi.x * fw / pw), round(roi.y * fh / ph)
+            x1, y1 = round(roi.x2 * fw / pw), round(roi.y2 * fh / ph)
+            roi = ImageROI(x0, y0, x1-x0, y1-y0)
+            roi.validate((fh, fw))
+        if self.loaded.domain == "yuv":
+            self._export_future = self.io_executor.submit(
+                export_yuv_stage, path, self.loaded.source_path,
+                copy.deepcopy(self.loaded.yuv_metadata), result.module_id, self.preview_exposure_ev, roi)
+        else:
+            self._export_future = self.io_executor.submit(
+                export_pipeline_stage, path, self.loaded.image, self.loaded.domain, metadata,
+                copy.deepcopy(self.pipeline.snapshot()), result.module_id,
+                self.preview_exposure_ev, roi, computation, self.pipeline.backend_preference)
+        self.status_var.set(f"正在导出 / Exporting · {result.name} · {kind}")
+        self.root.after(60, lambda: self._poll_export(path))
+
+    def _poll_export(self, path):
+        if self._closing:
             return
-        self.toast.show("ROI 已导出", "success")
-        self.status_var.set(f"ROI 已导出：{path}")
+        future = self._export_future
+        if not future.done():
+            self.root.after(60, lambda: self._poll_export(path))
+            return
+        self._export_future = None
+        try:
+            future.result()
+        except Exception as exc:
+            messagebox.showerror("导出失败 / Export failed", str(exc), parent=self.root)
+            return
+        self.toast.show("导出完成 / Export complete", "success")
+        self.status_var.set(f"已导出：{path}")
 
     def show_about(self) -> None:
         messagebox.showinfo(
@@ -7232,6 +7305,9 @@ class ISPApplication:
 
     def close(self) -> None:
         self._closing = True
+        if getattr(self, "grading_workspace", None) is not None:
+            self.grading_workspace.destroy()
+            self.grading_workspace = None
         self.canvas_gestures.cancel_all()
         self.preview_requests.close()
         self.analysis_requests.close()

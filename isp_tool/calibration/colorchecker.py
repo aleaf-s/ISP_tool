@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from ..models import ColorCheckerPatch, ISPError
-from .delta_e import delta_e_values
+from .delta_e import delta_e_values, SRGB_TO_XYZ, D65_XY
 
 try:
     import colour
@@ -47,18 +47,26 @@ def colorchecker_reference(
         ][illuminant],
         dtype=np.float64,
     )
-    rgb = np.asarray(
-        colour.XYZ_to_sRGB(
-            xyz,
-            illuminant=source_white,
-            chromatic_adaptation_transform="CAT02",
-            apply_cctf_encoding=False,
-        ),
-        dtype=np.float32,
-    )
+    adapted = colour.adaptation.chromatic_adaptation_VonKries(
+        xyz, colour.xy_to_XYZ(source_white), colour.xy_to_XYZ(D65_XY), transform="CAT02")
+    # Use the exact inverse of the analysis matrix. Keep out-of-gamut values:
+    # a physical reference patch can have negative linear-sRGB components.
+    rgb = np.asarray(adapted @ np.linalg.inv(SRGB_TO_XYZ).T, dtype=np.float32)
     if len(names) != 24 or rgb.shape != (24, 3):
         raise ISPError("ColorChecker 参考数据不是标准 24 色块")
     return names, rgb
+
+
+def reference_conditions(illuminant="D65", dataset="ColorChecker N Ohta"):
+    return {
+        "dataset": dataset, "data_type": "spectral reflectance",
+        "source": "Noboru Ohta (1997), colour-science SDS_COLOURCHECKERS",
+        "source_url": "https://www.colour-science.org/api/0.3.4/html/colour.characterisation.dataset.colour_checkers.spds.html",
+        "library_version": getattr(colour, "__version__", "unavailable"),
+        "illuminant": illuminant, "observer": "CIE 1931 2°",
+        "adaptation": "CAT02", "lab_white": "D65", "rgb_space": "linear sRGB",
+        "order": "row-major: dark skin … cyan; white … black (19–24)",
+    }
 
 
 def _bilinear_point(corners: np.ndarray, u: float, v: float) -> np.ndarray:
