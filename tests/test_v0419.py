@@ -27,7 +27,7 @@ class HiddenTkSimpleDualWorkspaceTests(unittest.TestCase):
             root.update_idletasks()
             self.assertTrue(app.tool_selector.winfo_manager())
             self.assertEqual(app.tool_var.get(), "isp")
-            self.assertEqual(app.tool_selector.menu.index('end'), 2)
+            self.assertEqual(app.tool_selector.menu.index('end'), 3)
             self.assertIn('RAW ISP', app.tool_selector.cget('text'))
 
             long_name = "sensor_capture_with_a_complete_long_file_name.raw"

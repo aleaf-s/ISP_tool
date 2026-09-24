@@ -130,7 +130,7 @@ class WorkspaceTests(unittest.TestCase):
         p.offset=[0,0];p.zoom=1;p.fit=False;p.pick.set(True)
         p.output[:]=0
         with mock.patch.object(p.canvas,'winfo_width',return_value=160):
-            p.press(SimpleNamespace(x=90,y=10))
+            p.press(SimpleNamespace(x=10,y=10))
         np.testing.assert_allclose(p.history.points[0].source,(.8,.2,.1),atol=1e-6)
         p.mode.set('滑动对比');p.pick.set(True)
         with mock.patch.object(p.canvas,'winfo_width',return_value=160):
@@ -143,7 +143,7 @@ class WorkspaceTests(unittest.TestCase):
         revision=p.revision
         with mock.patch.object(p.canvas,'winfo_width',return_value=640),mock.patch.object(p.canvas,'winfo_height',return_value=480):
             p.draw()
-        self.assertTrue(all(image.width()<=320 and image.height()<=480 for image in p._photos))
+        self.assertTrue(all(image.width()<=640 and image.height()<=480 for image in p._photos))
         self.assertEqual(p.revision,revision)
 
     def test_export_validates_visible_draft_even_without_focusout(self):

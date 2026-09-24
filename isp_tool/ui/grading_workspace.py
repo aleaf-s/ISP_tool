@@ -5,22 +5,36 @@ import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from uuid import uuid4
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 from ..grading.model import GradeHistory, ColorPoint, build_lut, apply_lut, raster8, sample_original
-from ..grading.image_io import read_color_image, export_color_image
+from ..grading.image_io import read_color_image, export_color_image, export_processed_image
+from ..grading.clut import (CLUTState, build_clut, apply_clut, save_parameters, load_parameters,
+                           locate_rgb_node,neighbor_weights,sample_hs_field)
+from ..grading.ca import CACurve, apply_ca, load_ca_text, export_ca_text
+from ..grading.session import GradingState, processing_key, preview_lut
 from .theme import COLORS
+from .number_format import format_number
 from .widgets.tooltip import Tooltip
 from .widgets.tool_selector import ToolSelector
+from .widgets.comparison_view import ComparisonViewMixin
+from .widgets.clut_editor import CLUTEditor
+from .widgets.ca_editor import CAEditor
 
 
-class GradingWorkspace(ttk.Frame):
+class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
     def __init__(self,parent,on_back,tool_variable=None,on_tool=None):
         super().__init__(parent)
         self.on_back=on_back
-        self.history=GradeHistory()
+        self._empty_history=GradeHistory()
+        self.states={}
+        self._influence_cache=None
+        self._active_document=None
+        self._editor_epoch=0
+        self._point_rows={}
         self.documents=[]
         self.index=-1
         self.selected=-1
@@ -53,7 +67,10 @@ class GradingWorkspace(ttk.Frame):
         self.file_combo.bind('<<ComboboxSelected>>',lambda e:self.select_document(self.file_combo.current()))
         Tooltip(self.file_combo,lambda:self.document.path if self.document else '')
         ttk.Button(bar,text='移除',command=self.remove_document,width=5).pack(side='left')
-        self.export_button=ttk.Button(bar,text='导出结果',command=self.export)
+        self.export_menu=tk.Menu(self,tearoff=False)
+        self.export_menu.add_command(label='导出图像…',command=self.export)
+        self.export_menu.add_command(label='导出参数 TXT…',command=self.export_parameter_txt,state='disabled')
+        self.export_button=ttk.Menubutton(bar,text='导出 ▾',menu=self.export_menu)
         self.export_button.pack(side='right')
         body=ttk.Frame(self,padding=(8,0,8,0))
         body.pack(fill='both',expand=True)
@@ -66,10 +83,10 @@ class GradingWorkspace(ttk.Frame):
         self.parameter_canvas.pack(side='left',fill='both',expand=True)
         right=ttk.Frame(self.parameter_canvas)
         parameter_window=self.parameter_canvas.create_window(0,0,window=right,anchor='nw')
-        def size_parameters(event):
+        def size_parameters(event,content=right):
             # Use the actual font/control request, not hard-coded physical
             # pixels; Windows 150/200% DPI otherwise clips the third column.
-            self.parameter_canvas.configure(width=max(315,right.winfo_reqwidth()),
+            self.parameter_canvas.configure(width=max(315,content.winfo_reqwidth()),
                                             scrollregion=self.parameter_canvas.bbox('all'))
         right.bind('<Configure>',size_parameters)
         self.parameter_canvas.bind('<Configure>',lambda e:self.parameter_canvas.itemconfigure(parameter_window,width=e.width))
@@ -78,8 +95,9 @@ class GradingWorkspace(ttk.Frame):
         tools=ttk.Frame(left)
         tools.pack(fill='x',pady=(0,6))
         self.pick=tk.BooleanVar(self,value=False)
-        ttk.Checkbutton(tools,text='取色（原图 5×5）',variable=self.pick).pack(side='left')
-        self.mode=tk.StringVar(self,value='左右并排')
+        self.pick_button=ttk.Checkbutton(tools,text='取色（原图 5×5）',variable=self.pick)
+        self.pick_button.pack(side='left')
+        self.mode=tk.StringVar(self,value='滑动对比')
         mode=ttk.Combobox(tools,textvariable=self.mode,values=('左右并排','滑动对比'),state='readonly',width=10)
         mode.pack(side='left',padx=6)
         mode.bind('<<ComboboxSelected>>',lambda e:self.fit_image())
@@ -92,7 +110,7 @@ class GradingWorkspace(ttk.Frame):
         original.bind('<ButtonRelease-1>',lambda e:self.show_original(False))
         original.bind('<Leave>',lambda e:self.show_original(False))
         self.enabled=tk.BooleanVar(self,value=True)
-        ttk.Checkbutton(view_tools,text='启用调色',variable=self.enabled,command=self.schedule_draw).pack(side='left')
+        ttk.Checkbutton(view_tools,text='启用调色',variable=self.enabled,command=self.toggle_enabled).pack(side='left')
         self.canvas=tk.Canvas(left,bg='#707070',highlightthickness=0)
         self.canvas.pack(fill='both',expand=True)
         self.canvas.bind('<Configure>',lambda e:self.schedule_draw())
@@ -101,24 +119,36 @@ class GradingWorkspace(ttk.Frame):
         self.canvas.bind('<ButtonRelease-1>',lambda e:setattr(self,'drag',None))
         self.canvas.bind('<MouseWheel>',self.wheel)
         self.canvas.bind('<Motion>',self.hover)
-        ttk.Label(right,text='共用颜色控制点',style='Title.TLabel').pack(anchor='w')
-        self.point_list=tk.Listbox(right,height=7,width=29,exportselection=False,
-                                   bg=COLORS['panel_alt'],fg=COLORS['foreground'],
-                                   selectbackground=COLORS['accent'],selectforeground='white')
+        self.editor_host=right
+        self.method=tk.StringVar(self,value='取色调色')
+        method=ttk.Combobox(right,textvariable=self.method,values=('取色调色','CLUT 调色','CA 调色'),state='readonly',width=16)
+        method.pack(anchor='w',pady=(0,6))
+        method.bind('<<ComboboxSelected>>',self.switch_method)
+        self.point_panel=ttk.Frame(right);self.point_panel.pack(fill='x')
+        right=self.point_panel
+        ttk.Label(right,text='颜色控制点',style='Title.TLabel').pack(anchor='w')
+        self.point_list=ttk.Treeview(right,columns=('origin',),show='tree headings',height=7,selectmode='browse')
+        self.point_list.heading('#0',text='名称')
+        self.point_list.column('#0',width=140,minwidth=90)
+        self.point_list.heading('origin',text='来源')
+        self.point_list.column('origin',width=170,minwidth=90)
         self.point_list.pack(fill='x',pady=6)
-        self.point_list.bind('<<ListboxSelect>>',self.select_point)
-        Tooltip(self.point_list,lambda: ('取色来源：'+self.history.points[self.selected].origin) if 0<=self.selected<len(self.history.points) else '所有图像共用；始终从原图取色')
+        self.point_list.bind('<<TreeviewSelect>>',self.select_point)
+        self.point_list.bind('<Double-1>',self.rename_point)
+        self.point_list.bind('<Button-3>',self.point_menu)
+        Tooltip(self.point_list,self.point_details)
+        self.point_context=tk.Menu(self,tearoff=False)
         action=ttk.Frame(right)
         action.pack(fill='x')
-        ttk.Button(action,text='删除',command=self.delete_point,width=6).pack(side='left')
+        ttk.Button(action,text='更多 ▾',command=self.show_point_menu,width=7).pack(side='left')
         ttk.Button(action,text='重置当前',command=self.reset_point).pack(side='left',padx=5)
-        ttk.Button(action,text='重置全部',command=self.reset_all).pack(side='left')
+        ttk.Button(action,text='重置本图',command=self.reset_all).pack(side='left')
         self.original_label=ttk.Label(right,text='Original · 未取色',justify='left')
         self.original_label.pack(anchor='w',pady=(12,3))
         self.swatches=tk.Canvas(right,width=235,height=25,highlightthickness=0)
         self.swatches.pack(anchor='w',pady=3)
         self.values={}
-        for group,names in (('RGB',('R','G','B')),('HSV',('H°','S%','V%'))):
+        for group,names in (('RGB',('R','G','B')),('HSV',('H°','S 0–1','V 0–1'))):
             ttk.Label(right,text='Target '+group).pack(anchor='w',pady=(8,2))
             row=ttk.Frame(right)
             row.pack(anchor='w')
@@ -131,7 +161,7 @@ class GradingWorkspace(ttk.Frame):
                 entry=ttk.Entry(cell,textvariable=variable,width=7,justify='right',style='Parameter.TEntry')
                 entry.pack()
                 entry.bind('<Return>',lambda e,g=group:self.commit_target(g))
-                entry.bind('<FocusOut>',lambda e,g=group:self.commit_target(g))
+                entry.bind('<FocusOut>',lambda e,g=group:self.defer_commit(lambda:self.commit_target(g)))
                 variables.append(variable)
             self.values[group]=variables
         self._rendered={}
@@ -145,8 +175,10 @@ class GradingWorkspace(ttk.Frame):
             entry.pack(side='left')
             Tooltip(entry,tip)
             entry.bind('<Return>',self.commit_influence)
-            entry.bind('<FocusOut>',self.commit_influence)
+            entry.bind('<FocusOut>',lambda e:self.defer_commit(self.commit_influence))
         self.error=tk.StringVar(self)
+        self.draft_status=tk.StringVar(self)
+        ttk.Label(right,textvariable=self.draft_status,style='Muted.TLabel').pack(anchor='w')
         ttk.Label(right,textvariable=self.error,style='Error.TLabel',wraplength=275).pack(fill='x',pady=8)
         history=ttk.Frame(right)
         history.pack(fill='x',pady=4)
@@ -162,6 +194,368 @@ class GradingWorkspace(ttk.Frame):
         bind_scroll(right)
         self.parameter_canvas.bind('<MouseWheel>',self.scroll_parameters)
         self.refresh_points()
+        self._draft_traces=[]
+        for var in [v for vs in self.values.values() for v in vs]+[self.radius,self.strength]:
+            self._draft_traces.append((var,var.trace_add('write',self.update_draft_status)))
+        self.clut_status=tk.StringVar(self,value='已应用')
+        self.clut_panel=ttk.Frame(self.editor_host)
+        ttk.Label(self.clut_panel,text='CLUT',style='Title.TLabel').pack(anchor='w')
+        ttk.Button(self.clut_panel,text='打开 CLUT 调试窗口…',command=self.open_clut_window).pack(fill='x',pady=6)
+        ttk.Label(self.clut_panel,textvariable=self.clut_status,style='Muted.TLabel').pack(anchor='w',pady=4)
+        ttk.Button(self.clut_panel,text='应用',command=self.apply_clut_parameters,style='Primary.TButton').pack(fill='x',pady=5)
+        ttk.Button(self.clut_panel,text='恢复到上次应用',command=self.restore_clut_applied).pack(fill='x',pady=3)
+        ttk.Label(self.clut_panel,textvariable=self.error,style='Error.TLabel',wraplength=300).pack(fill='x')
+        self.clut_window=tk.Toplevel(self)
+        self.clut_window.withdraw()
+        self.clut_window.title('CLUT 调试')
+        self.clut_window.resizable(True,True)
+        self.clut_window.protocol('WM_DELETE_WINDOW',self.hide_clut_window)
+        # Keep Apply and file actions visible even when the editor is resized.
+        footer=ttk.Frame(self.clut_window,padding=8);footer.pack(side='bottom',fill='x')
+        actions=ttk.Frame(footer);actions.pack(fill='x',pady=(0,5))
+        ttk.Button(actions,text='应用',command=self.apply_clut_parameters,style='Primary.TButton').pack(side='right')
+        ttk.Button(actions,text='恢复到上次应用',command=self.restore_clut_applied).pack(side='right',padx=5)
+        ttk.Label(actions,textvariable=self.clut_status,style='Muted.TLabel').pack(side='left')
+        files=ttk.Frame(footer);files.pack(fill='x')
+        ttk.Button(files,text='导入 CLUT TXT…',command=self.load_clut_file).grid(row=0,column=0,sticky='w',padx=(0,5))
+        export_button=ttk.Button(files,text='导出 CLUT TXT…',command=self.export_clut_file)
+        export_button.grid(row=0,column=1,sticky='w')
+        Tooltip(export_button,'HiSilicon 5508-word TXT；沿用已验证的数据布局，硬件尺度与实机效果仍需设备确认。')
+        ttk.Button(files,text='检查配套 HSV TXT…',command=self.inspect_clut_hsv).grid(row=1,column=0,columnspan=2,sticky='w',pady=(4,0))
+        self.clut_source=tk.StringVar(self)
+        ttk.Label(footer,textvariable=self.clut_source,style='Muted.TLabel',wraplength=650).pack(anchor='w',pady=(4,0))
+        self.clut_editor=CLUTEditor(self.clut_window,self.clut_changed,self.error,self.update_clut_status,
+                                    self.schedule_draw,self.begin_clut_pick)
+        self.clut_editor.pack(fill='both',expand=True,padx=8,pady=8)
+        sw,sh=self.winfo_screenwidth(),self.winfo_screenheight()
+        width=min(round(sw*.85),max(900,self.clut_editor.cw*10+55))
+        height=min(round(sh*.85),max(800,self.clut_editor.ch*30))
+        self.clut_window.geometry(f'{width}x{height}')
+        self.clut_window.minsize(min(width,max(540,self.clut_editor.canvas_width+40)),min(height,600))
+        self.ca_status=tk.StringVar(self,value='已应用')
+        self.ca_panel=ttk.Frame(self.editor_host)
+        ttk.Label(self.ca_panel,text='CA',style='Title.TLabel').pack(anchor='w')
+        ttk.Button(self.ca_panel,text='打开 CA 曲线窗口…',command=self.open_ca_window).pack(fill='x',pady=6)
+        ttk.Label(self.ca_panel,textvariable=self.ca_status,style='Muted.TLabel').pack(anchor='w',pady=4)
+        ttk.Button(self.ca_panel,text='应用',command=self.apply_ca_parameters,style='Primary.TButton').pack(fill='x',pady=5)
+        ttk.Button(self.ca_panel,text='恢复到上次应用',command=self.restore_ca_applied).pack(fill='x',pady=3)
+        ttk.Label(self.ca_panel,textvariable=self.error,style='Error.TLabel',wraplength=300).pack(fill='x')
+        self.ca_window=tk.Toplevel(self)
+        self.ca_window.withdraw()
+        self.ca_window.title('CA · Chroma Adjust')
+        self.ca_window.resizable(True,True)
+        self.ca_window.protocol('WM_DELETE_WINDOW',self.hide_ca_window)
+        self.ca_editor=CAEditor(self.ca_window,self.ca_changed,self.apply_ca_parameters,
+                                self.restore_ca_applied,self.load_ca_file,self.export_ca_file,self.error,
+                                self.update_ca_status)
+        self.ca_editor.pack(fill='both',expand=True)
+        self.ca_window.geometry(f'{min(round(sw*.82),1150)}x{min(round(sh*.8),700)}')
+        self.ca_window.update_idletasks()
+        self.ca_window.minsize(max(640,self.ca_editor.side.winfo_reqwidth()+320),420)
+        self.bind('<Unmap>',lambda e:self.hide_clut_window() if e.widget is self else None,add='+')
+        self.bind('<Unmap>',lambda e:self.hide_ca_window() if e.widget is self else None,add='+')
+
+    def open_clut_window(self):
+        if self.document is None or self.method.get()!='CLUT 调色':return
+        self.clut_window.title(f'CLUT 调试 · {Path(self.document.path).name}')
+        self.clut_window.deiconify();self.clut_window.lift()
+
+    def begin_clut_pick(self):
+        if self.document is None:return
+        self.hide_clut_window();self.pick.set(True)
+        self.winfo_toplevel().lift()
+        self.status.set('点击原图颜色定位 CLUT（取原始像素 5×5，不采样叠加色）')
+
+    def pick_clut_at(self,x,y):
+        document=self.document
+        if document is None or not (0<=x<document.rgb.shape[1] and 0<=y<document.rgb.shape[0]):return False
+        if document.alpha is not None and document.alpha[y,x]<.1:
+            self.error.set('请在非透明区域取色');return False
+        color=sample_original(document.rgb,x,y)
+        state=self.state_for(document).clut;state.sample_rgb=tuple(float(v) for v in color)
+        self.clut_editor.locate_sample(*locate_rgb_node(color))
+        self.pick.set(False);self.open_clut_window()
+        return True
+
+    def restore_clut_applied(self):
+        if self.document is None or self.method.get()!='CLUT 调色':return
+        editor=self.clut_editor;state=self.state_for(self.document).clut
+        editor._drag_grid=editor._drag_preview=None;editor.close_inline()
+        state.drafts.clear();state.replace(state.applied_grid)
+        editor.show_node();editor.redraw();self.error.set('');self.update_clut_status()
+
+    def decorate_comparison_views(self,before,after):
+        if self.document is None or self.method.get()!='CLUT 调色' or self.hold_original:return before,after
+        state=self.state_for(self.document).clut
+        if not state.show_influence:return before,after
+        key=(self.document.document_id,self.source.shape[:2],state.selected,state.radius,state.smoothness)
+        if self._influence_cache is None or self._influence_cache[0]!=key:
+            hsv=cv2.cvtColor(np.asarray(self.source,np.float32),cv2.COLOR_RGB2HSV)
+            weight=sample_hs_field(hsv,neighbor_weights(*state.selected,state.radius,state.smoothness))
+            weight=np.where(hsv[...,1]>0,weight,0)
+            if self.document.alpha is not None:
+                weight*=cv2.resize(self.document.alpha,(self.source.shape[1],self.source.shape[0]))
+            self._influence_cache=(key,Image.fromarray(np.rint(np.clip(weight,0,1)*115).astype(np.uint8)))
+        ox,oy=self.offset;z=self.zoom
+        mask=self._influence_cache[1].transform(before.size,Image.Transform.AFFINE,
+              (1/z,0,-ox/z,0,1/z,-oy/z),resample=Image.Resampling.BILINEAR,fillcolor=0)
+        tint=Image.new('RGB',before.size,(255,125,0))
+        return Image.composite(tint,before,mask),Image.composite(tint,after,mask)
+
+    def hide_clut_window(self):
+        self.clut_editor.remember_draft()
+        # Closing the window stores a dragged node as a draft, never applies it.
+        if self.document and self.clut_editor.state is self.state_for(self.document).clut:
+            self.clut_editor.wheel_release()
+        self.clut_editor.close_inline()
+        self.clut_window.withdraw()
+
+    def update_clut_status(self):
+        if self.document is None:self.clut_status.set('请导入图像');return
+        state=self.state_for(self.document).clut
+        self.clut_source.set('设备表已导入 · 网格为额外调整，非原 HSV 参数；重置表仅清除额外调整'
+                             if state.grid.base_words else '')
+        self.clut_status.set('待应用' if state.drafts or state.grid!=state.applied_grid else '已应用')
+
+    def apply_clut_parameters(self):
+        if self.document is None or self.method.get()!='CLUT 调色':return False
+        if not self.clut_editor.commit_all():return False
+        state=self.state_for(self.document).clut
+        if state.applied_grid!=state.grid:
+            state.applied_grid=state.grid
+            self.request_preview()
+        self.error.set('');self.update_clut_status()
+        return True
+
+    def open_ca_window(self):
+        if self.document is None or self.method.get()!='CA 调色':return
+        self.ca_window.title(f'CA · Chroma Adjust · {Path(self.document.path).name}')
+        self.ca_window.deiconify();self.ca_window.lift()
+
+    def hide_ca_window(self):
+        self.ca_editor.release()
+        self.ca_window.withdraw()
+
+    def update_ca_status(self):
+        if self.document is None:self.ca_status.set('请导入图像');return
+        state=self.state_for(self.document).ca
+        self.ca_status.set('待应用' if state.curve!=state.applied or state.drafts is not None else '已应用')
+        if self.ca_editor.state is state:self.ca_editor.status.set(self.ca_status.get())
+
+    def ca_changed(self,curve):
+        if self.document is None:return
+        self.state_for(self.document).ca.replace(curve)
+        self.update_ca_status()
+
+    def apply_ca_parameters(self):
+        if self.document is None or self.method.get()!='CA 调色':return False
+        if not self.ca_editor.commit_draft():return False
+        state=self.state_for(self.document).ca
+        if state.curve!=state.applied:
+            state.applied=state.curve
+            self.request_preview()
+        self.error.set('');self.update_ca_status()
+        return True
+
+    def restore_ca_applied(self):
+        if self.document is None or self.method.get()!='CA 调色':return
+        self.ca_editor._dragging=False;self.ca_editor._preview=None
+        state=self.state_for(self.document).ca
+        state.drafts=None
+        state.replace(state.applied)
+        self.ca_editor.show_selection()
+        self.error.set('');self.update_ca_status()
+
+    def ca_ready(self):
+        if self.document is None or self.method.get()!='CA 调色':
+            self.error.set('请先切换到 CA 调色');return False
+        if not self.ca_editor.commit_draft():return False
+        state=self.state_for(self.document).ca
+        if state.curve!=state.applied:
+            self.error.set('CA 曲线有未应用修改，请先点击“应用”再导出');return False
+        return True
+
+    def load_ca_file(self):
+        if self.document is None or self.method.get()!='CA 调色':return
+        if self.state_for(self.document).ca.drafts is not None:
+            self.error.set('请先提交或恢复当前 CA 数字输入');return
+        path=filedialog.askopenfilename(parent=self.ca_window,title='加载 CA 256 点数据',
+                                         filetypes=[('CA TXT','*.txt')])
+        if not path:return
+        try:
+            if Path(path).suffix.lower()!='.txt':raise ValueError('请选择 CA .txt 数据文件')
+            curve=load_ca_text(path)
+            state=self.state_for(self.document).ca
+            state.replace(curve)
+            state.selected_x=128
+            state.drafts=None
+            self.ca_editor.set_state(state)
+            self.error.set('');self.update_ca_status()
+            self.status.set('CA 数据已加载为草稿，请点击“应用”预览')
+        except (OSError,UnicodeError,ValueError) as exc:self.error.set(str(exc))
+
+    def export_ca_file(self):
+        if not self.ca_ready() or self.io_future is not None:return
+        path=filedialog.asksaveasfilename(parent=self.ca_window,title='导出 CA 256 点数据',
+             defaultextension='.txt',filetypes=[('CA TXT','*.txt')])
+        if not path:return
+        if Path(path).suffix.lower()!='.txt':
+            self.error.set('CA 数据请保存为 .txt 文件');return
+        curve=self.state_for(self.document).ca.applied
+        try:
+            export_ca_text(path,curve)
+            self.error.set('');self.status.set('CA 256 点数据已导出')
+        except (OSError,ValueError) as exc:self.error.set(str(exc))
+
+    def sync_method(self):
+        selected=self.state_for(self.document).method if self.document is not None else '取色调色'
+        clut=selected=='CLUT 调色';ca=selected=='CA 调色'
+        self.export_menu.entryconfigure(1,label='导出 CA TXT…' if ca else '导出 CLUT TXT…' if clut else '导出参数 TXT…',
+                                         state='normal' if ca or clut else 'disabled')
+        self.method.set(selected)
+        self.point_panel.pack_forget();self.clut_panel.pack_forget();self.ca_panel.pack_forget()
+        if clut:
+            self.clut_editor.set_state(self.state_for(self.document).clut)
+            self.clut_panel.pack(fill='x');self.pick.set(False)
+            self.clut_window.title(f'CLUT 调试 · {Path(self.document.path).name}')
+            self.hide_ca_window()
+        elif ca:
+            self.hide_clut_window()
+            self.ca_editor.set_state(self.state_for(self.document).ca)
+            self.ca_panel.pack(fill='x');self.pick.set(False)
+            self.ca_window.title(f'CA · Chroma Adjust · {Path(self.document.path).name}')
+        else:
+            self.hide_clut_window();self.hide_ca_window();self.point_panel.pack(fill='x')
+        self.update_clut_status();self.update_ca_status()
+        self.pick.set(False) if ca else None
+        self.pick_button.configure(state='disabled' if ca else 'normal',
+             text='定位 CLUT（原图 5×5）' if clut else '取色（原图 5×5）')
+        self.parameter_canvas.yview_moveto(0)
+
+    def switch_method(self,event=None):
+        if self.document is None:self.method.set('取色调色');return
+        self.save_draft();self.clut_editor.remember_draft()
+        self.clut_editor.wheel_release()
+        self.ca_editor.release()
+        self.ca_editor.remember_draft()
+        state=self.state_for(self.document)
+        if state.method==self.method.get():return
+        state.method=self.method.get();self.error.set('')
+        self.sync_method();self.request_preview()
+        if event is not None and self.method.get()=='CLUT 调色':self.open_clut_window()
+        if event is not None and self.method.get()=='CA 调色':self.open_ca_window()
+
+    def active_key(self):
+        if self.document and self.state_for(self.document).method=='CA 调色':
+            return ('ca',self.state_for(self.document).ca.applied)
+        if self.document and self.state_for(self.document).method=='CLUT 调色':
+            grid=self.state_for(self.document).clut.applied_grid
+            return ('clut',grid)
+        return processing_key(self.history.points)
+
+    @staticmethod
+    def processor_for_key(key):
+        if key and key[0]=='ca':
+            return lambda pixels:apply_ca(pixels,key[1])
+        if key and key[0]=='clut':
+            return lambda pixels:apply_clut(pixels,build_clut(key[1]))
+        return lambda pixels:apply_lut(pixels,preview_lut(key))
+
+    def clut_changed(self,grid,final):
+        if self.document is None:return
+        if final:
+            self.state_for(self.document).clut.replace(grid)
+            if self.clut_editor.state is self.state_for(self.document).clut:
+                self.clut_editor.show_node();self.clut_editor.redraw()
+            self.update_clut_status()
+        else:self.clut_status.set('编辑中 · 待应用')
+        # Motion only repaints the local wheel. Image processing is Apply-only.
+
+    def clut_ready(self,require_applied=True):
+        if self.document is None or self.state_for(self.document).method!='CLUT 调色':
+            self.error.set('请先切换到 CLUT 调色');return False
+        self.clut_editor.remember_draft()
+        state=self.state_for(self.document).clut
+        if state.drafts or self.clut_editor._drag_grid is not None:
+            self.error.set('存在未提交 CLUT 输入，请点击“应用”完成校验');return False
+        if require_applied and state.grid!=state.applied_grid:
+            self.error.set('CLUT 有未应用修改，请先点击“应用”再导出');return False
+        return True
+
+    def save_clut_parameters(self):
+        if self.document is None or self.method.get()!='CLUT 调色':return
+        if not self.clut_editor.commit_all():return
+        if not self.clut_ready(require_applied=False):return
+        path=filedialog.asksaveasfilename(parent=self,title='保存 CLUT 编辑方案备份（非设备导出）',defaultextension='.json',filetypes=[('编辑方案备份','*.json')])
+        if not path:return
+        try:
+            save_parameters(path,self.state_for(self.document).clut.grid,self.document.path)
+            self.error.set('');self.status.set('CLUT 参数已保存')
+        except (OSError,ValueError) as exc:self.error.set(str(exc))
+
+    def load_clut_parameters(self):
+        if self.document is None:return
+        state=self.state_for(self.document).clut
+        self.clut_editor.remember_draft()
+        if state.drafts:self.error.set('请先提交或重置 CLUT 草稿');return
+        path=filedialog.askopenfilename(parent=self,title='加载本工具 CLUT 参数（不读取海思 HSV 文件）',filetypes=[('CLUT 参数','*.json')])
+        if not path:return
+        try:
+            grid,source=load_parameters(path)
+            if source and str(Path(source))!=str(Path(self.document.path)):
+                if not messagebox.askyesno('加载到当前图像',f'参数来源：{source}\n加载为 {Path(self.document.path).name} 的编辑草稿？点击“应用”后才更新图像。',parent=self):return
+            self.state_for(self.document).method='CLUT 调色';state.drafts.clear()
+            self.clut_changed(grid,True);self.sync_method();self.error.set('')
+        except (OSError,ValueError,TypeError) as exc:self.error.set(str(exc))
+
+    def export_parameter_txt(self):
+        if self.method.get()=='CA 调色':self.export_ca_file()
+        elif self.method.get()=='CLUT 调色':self.export_clut_file()
+
+    def load_clut_file(self):
+        if self.document is None or self.method.get()!='CLUT 调色':return
+        self.clut_editor.remember_draft()
+        state=self.state_for(self.document).clut
+        if state.drafts or state.grid!=state.applied_grid:
+            if not messagebox.askyesno('替换 CLUT 草稿','导入会替换当前未应用修改，是否继续？',parent=self.clut_window):return
+        path=filedialog.askopenfilename(parent=self.clut_window,title='导入 CLUT TXT · 5508 个整数',
+                                       filetypes=[('CLUT TXT','*.txt')])
+        if not path:return
+        try:
+            if Path(path).suffix.lower()!='.txt':raise ValueError('请选择海思 CLUT .txt 文件')
+            from ..grading.hisi_clut import load_hisi
+            grid=load_hisi(path)
+            # Only mutate the current draft after complete validation.
+            self.clut_editor.close_inline();state.drafts.clear()
+            self.clut_editor._drag_grid=self.clut_editor._drag_preview=None
+            self.clut_changed(grid,True)
+            self.error.set('');self.status.set('CLUT 5508 个整数已导入，请点击“应用”预览')
+        except (OSError,UnicodeError,ValueError,OverflowError) as exc:self.error.set(str(exc))
+
+    def inspect_clut_hsv(self):
+        path=filedialog.askopenfilename(parent=self.clut_window,title='检查海思配套 HSV TXT（非设备表）',
+                                       filetypes=[('HSV TXT','*.txt')])
+        if not path:return
+        try:
+            from ..grading.hisi_clut import inspect_hsv
+            result=inspect_hsv(path)
+            messagebox.showinfo('HSV 文件结构检查',
+                f"识别到 {result['records']} 条六字段记录。\n此文件不是 5508 个整数的设备表。\n"
+                '末三字段的单位/语义尚未确认，不能可靠导入调色。\n请提供芯片/SDK 格式说明；设备预览请导入配套 CLUT TXT。',parent=self.clut_window)
+        except (OSError,UnicodeError,ValueError) as exc:self.error.set(str(exc))
+
+    def export_clut_file(self):
+        if not self.clut_ready() or self.io_future is not None:return
+        if not self.enabled.get():self.error.set('调色已旁路，请启用后再导出 CLUT');return
+        path=filedialog.asksaveasfilename(parent=self.clut_window,title='导出 CLUT TXT · HiSilicon 5508-word',
+             defaultextension='.txt',filetypes=[('CLUT TXT','*.txt')])
+        if not path:return
+        if Path(path).suffix.lower()!='.txt':
+            self.error.set('CLUT 数据请保存为 .txt 文件');return
+        grid=self.state_for(self.document).clut.applied_grid
+        from ..grading.hisi_clut import export_hisi
+        self.io_future=self.executor.submit(export_hisi,path,grid)
+        self.status.set('正在导出 CLUT…');self.later(40,self.poll_export)
 
     def scroll_parameters(self,event):
         bounds=self.parameter_canvas.bbox('all')
@@ -171,7 +565,39 @@ class GradingWorkspace(ttk.Frame):
 
     @property
     def document(self):
-        return self.documents[self.index] if 0 <= self.index < len(self.documents) else None
+        return self._active_document
+
+    def state_for(self,document):
+        return self.states.setdefault(document.document_id,GradingState())
+
+    @property
+    def history(self):
+        return self.state_for(self.document).history if self.document else self._empty_history
+
+    def selected_point(self):
+        return self.history.points[self.selected] if 0<=self.selected<len(self.history.points) else None
+
+    def toggle_enabled(self):
+        if self.document:self.state_for(self.document).enabled=self.enabled.get()
+        self.schedule_draw()
+
+    def save_draft(self):
+        point=self.selected_point()
+        if self.document and point:
+            state=self.state_for(self.document)
+            state.selected_id=point.point_id
+            state.drafts[point.point_id]=dict(values={g:[v.get() for v in vs] for g,vs in self.values.items()},
+                rendered=copy.deepcopy(self._rendered),radius=self.radius.get(),strength=self.strength.get(),error=self.error.get())
+
+    def defer_commit(self,callback):
+        token=self._editor_epoch
+        def commit():
+            if token!=self._editor_epoch or not self.winfo_ismapped():return
+            focus=self.focus_get()
+            # Navigation must retain a draft, never implicitly apply it. Only
+            # ordinary moves within numeric entries commit on focus loss.
+            if isinstance(focus,ttk.Entry) and not isinstance(focus,ttk.Combobox):callback()
+        self.later(0,commit)
 
     def later(self,ms,callback):
         def run():
@@ -217,9 +643,21 @@ class GradingWorkspace(ttk.Frame):
     def select_document(self,index):
         if not 0 <= index < len(self.documents): return
         if self.document is self.documents[index]:
+            self.index=index
             return
+        self.save_draft()
+        self.clut_editor.remember_draft()
+        if self.document:self.clut_editor.wheel_release()
+        if self.document:self.ca_editor.release()
+        if self.document:self.ca_editor.remember_draft()
+        self._influence_cache=None
         self.store_view()
         self.index=index
+        self._active_document=self.documents[index]
+        self._editor_epoch+=1
+        grading=self.state_for(self.document)
+        self.enabled.set(grading.enabled)
+        self.selected=next((i for i,p in enumerate(grading.history.points) if p.point_id==grading.selected_id),-1)
         self.refresh_files()
         self.file_combo.current(index)
         rgb=self.document.rgb
@@ -234,16 +672,18 @@ class GradingWorkspace(ttk.Frame):
         self.zoom=state.get('zoom',1.0)
         self.offset=list(state.get('offset',(0.,0.)))
         self.divider=state.get('divider',.5)
-        self.mode.set(state.get('mode','左右并排'))
         self.drag=None
         self.hold_original=False
+        self.refresh_points()
+        self.sync_method()
         self.schedule_draw()
         self.request_preview()
 
     def store_view(self):
         if self.document is not None:
+            self.state_for(self.document).enabled=self.enabled.get()
             self.document.view_state=dict(fit=self.fit,zoom=self.zoom,offset=list(self.offset),
-                                          divider=self.divider,mode=self.mode.get())
+                                          divider=self.divider)
 
     def make_display(self,rgb):
         if self.document.alpha is not None:
@@ -253,8 +693,15 @@ class GradingWorkspace(ttk.Frame):
 
     def remove_document(self):
         if self.document is None: return
-        index=self.index
+        self.clut_editor.wheel_release()
+        self.ca_editor.release()
+        self._influence_cache=None
+        index=next(i for i,d in enumerate(self.documents) if d is self.document)
+        self.states.pop(self.document.document_id,None)
         self.documents.pop(index)
+        self._active_document=None
+        self.selected=-1
+        self._editor_epoch+=1
         self.index=-1
         self.refresh_files()
         self.revision+=1
@@ -263,57 +710,159 @@ class GradingWorkspace(ttk.Frame):
             self.index=-1
             self.source=self.output=self.source_pil=self.output_pil=None
             self.file_combo.set('')
+            self.refresh_points()
+            self.sync_method()
             self.schedule_draw()
 
     def refresh_points(self):
-        self.point_list.delete(0,'end')
+        self.point_list.delete(*self.point_list.get_children())
+        self._point_rows={}
         points=self.history.points
-        for i,p in enumerate(points):
-            rgb=tuple(round(c*255) for c in p.source)
-            self.point_list.insert('end',f'{i+1:02}  RGB {rgb}')
+        for image_index,document in enumerate(self.documents):
+            for p in self.state_for(document).history.points:
+                self.point_list.insert('', 'end', iid=p.point_id,text=p.name or '未命名',
+                    values=(f'{image_index+1} · {Path(document.path).name}',))
+                self._point_rows[p.point_id]=(document.document_id,p.point_id)
         self.selected=min(self.selected,len(points)-1)
         if self.selected>=0:
-            self.point_list.selection_set(self.selected)
+            self.point_list.selection_set(points[self.selected].point_id)
             self.show_point()
         else:
+            self._editor_epoch+=1
+            self.error.set('')
             self.original_label.configure(text='Original · 在图像上取色')
             self.swatches.delete('all')
+            for variables in self.values.values():
+                for var in variables:var.set('0')
+            self._rendered={g:['0']*3 for g in self.values}
+            self.radius.set('25');self.strength.set('100')
         self.undo_button.configure(state='normal' if self.history.undo_stack else 'disabled')
         self.redo_button.configure(state='normal' if self.history.redo_stack else 'disabled')
+        self.update_draft_status()
 
     def select_point(self,event=None):
-        selected=self.point_list.curselection()
-        if selected:
-            self.selected=selected[0]
-            self.show_point()
+        selected=self.point_list.selection()
+        if not selected or selected[0] not in self._point_rows:return
+        owner,point_id=self._point_rows[selected[0]]
+        current=self.selected_point()
+        if self.document and self.document.document_id==owner and current and current.point_id==point_id:return
+        self.save_draft()
+        index=next((i for i,d in enumerate(self.documents) if d.document_id==owner),None)
+        if index is None:return
+        self.select_document(index)
+        self.selected=next(i for i,p in enumerate(self.history.points) if p.point_id==point_id)
+        self.point_list.selection_set(point_id)
+        self.point_list.see(point_id)
+        self.show_point()
+
+    def point_details(self):
+        selected=self.point_list.selection()
+        hovered=self.point_list.identify_row(self.point_list.winfo_pointery()-self.point_list.winfo_rooty())
+        if hovered:selected=(hovered,)
+        if not selected or selected[0] not in self._point_rows:return '色块仅作用于所属图像；双击名称重命名'
+        owner,point_id=self._point_rows[selected[0]]
+        document=next((d for d in self.documents if d.document_id==owner),None)
+        if document is None:return ''
+        point=next(p for p in self.state_for(document).history.points if p.point_id==point_id)
+        return f'{point.name}\n所属：{document.path}\n取样：{point.origin}\nOriginal RGB {tuple(round(v*255) for v in point.source)}\nTarget RGB {tuple(round(v*255) for v in point.target)}'
+
+    def rename_point(self,event=None,name=None):
+        if event is not None:
+            row=self.point_list.identify_row(event.y)
+            if not row:return 'break'
+            self.point_list.selection_set(row);self.select_point()
+        point=self.selected_point()
+        if point is None:return 'break'
+        self.save_draft()
+        if name is None:name=simpledialog.askstring('重命名色块','名称',initialvalue=point.name,parent=self)
+        if name is None:return 'break'
+        if not name.strip():self.error.set('色块名称不能为空');return 'break'
+        points=copy.deepcopy(self.history.points);points[self.selected].name=name.strip()
+        self.edit(points,keep_draft=True)
+        return 'break'
+
+    def point_menu(self,event):
+        row=self.point_list.identify_row(event.y)
+        if row:self.point_list.selection_set(row);self.select_point()
+        self.show_point_menu(event)
+        return 'break'
+
+    def show_point_menu(self,event=None):
+        if self.selected_point() is None:return
+        menu=self.point_context;menu.delete(0,'end')
+        menu.add_command(label='重命名',command=self.rename_point)
+        menu.add_command(label='删除',command=self.delete_point)
+        copy_menu=tk.Menu(menu,tearoff=False)
+        # Destroy old submenus as well as their menu entries.
+        for child in menu.winfo_children():
+            if child is not copy_menu:child.destroy()
+        for i,d in enumerate(self.documents):
+            if d is not self.document:
+                copy_menu.add_command(label=f'{i+1} · {Path(d.path).name}',command=lambda target=d.document_id:self.copy_point_to(target))
+        menu.add_cascade(label='复制调整到图像',menu=copy_menu,state='normal' if len(self.documents)>1 else 'disabled')
+        try:menu.tk_popup(event.x_root if event else self.winfo_pointerx(),event.y_root if event else self.winfo_pointery())
+        finally:menu.grab_release()
+
+    def copy_point_to(self,document_id):
+        point=self.selected_point()
+        target=next((d for d in self.documents if d.document_id==document_id),None)
+        if point is None or target is None or target is self.document:return
+        if self.has_draft():self.error.set('请先提交或重置当前色块的输入，再复制调整');return
+        clone=copy.deepcopy(point);clone.point_id=uuid4().hex;clone.owner_id=target.document_id
+        state=self.state_for(target)
+        state.history.replace(state.history.points+[clone]);state.cache_key=None;state.output=None
+        self.refresh_points()
 
     def show_point(self):
+        self._editor_epoch+=1
         p=self.history.points[self.selected]
+        state=self.state_for(self.document);state.selected_id=p.point_id
         hsv=colorsys.rgb_to_hsv(*p.source)
-        self.original_label.configure(text=f'Original RGB  {tuple(round(v*255) for v in p.source)}\nHSV  {hsv[0]*360:.1f}° / {hsv[1]*100:.1f}% / {hsv[2]*100:.1f}%')
+        self.original_label.configure(text=f'Original RGB  {tuple(round(v*255) for v in p.source)}\nHSV  {hsv[0]*360:.1f}° / {hsv[1]:.3f} / {hsv[2]:.3f}')
         target_hsv=colorsys.rgb_to_hsv(*p.target)
-        for group,values in (('RGB',[v*255 for v in p.target]),('HSV',[target_hsv[0]*360,target_hsv[1]*100,target_hsv[2]*100])):
-            texts=[f'{v:.4f}'.rstrip('0').rstrip('.') or '0' for v in values]
+        for group,values in (('RGB',[v*255 for v in p.target]),('HSV',[target_hsv[0]*360,target_hsv[1],target_hsv[2]])):
+            precision=(1,1,1) if group=='RGB' else (1,3,3)
+            texts=[format_number(v,d) for v,d in zip(values,precision)]
             for var,text in zip(self.values[group],texts): var.set(text)
             self._rendered[group]=texts
-        self.radius.set(f'{p.radius:g}')
-        self.strength.set(f'{p.strength*100:g}')
+        self.radius.set(format_number(p.radius,1))
+        self.strength.set(format_number(p.strength*100,1))
         self.error.set('')
+        draft=state.drafts.get(p.point_id)
+        if draft:
+            for group,texts in draft['values'].items():
+                for var,text in zip(self.values[group],texts):var.set(text)
+            self._rendered=copy.deepcopy(draft['rendered'])
+            self.radius.set(draft['radius']);self.strength.set(draft['strength']);self.error.set(draft['error'])
         self.swatches.delete('all')
         for x,color in ((0,p.source),(122,p.target)):
             fill='#%02x%02x%02x'%tuple(round(v*255) for v in color)
             self.swatches.create_rectangle(x,0,x+110,24,fill=fill,outline=COLORS['border'])
+        self.update_draft_status()
+
+    def has_draft(self):
+        point=self.selected_point()
+        if point is None:return False
+        return (any([v.get().strip() for v in vs]!=self._rendered.get(g) for g,vs in self.values.items())
+                or self.radius.get()!=format_number(point.radius,1) or self.strength.get()!=format_number(point.strength*100,1))
+
+    def update_draft_status(self,*_):
+        self.draft_status.set('未提交输入 · Enter 确认' if self.has_draft() else '')
 
     def commit_target(self,group):
         if self.selected<0: return 'break'
         texts=[v.get().strip() for v in self.values[group]]
         if texts==self._rendered.get(group): return 'break'
         try:
-            values=[float(v) for v in texts]
-            maximum=(255,255,255) if group=='RGB' else (360,100,100)
+            point=self.selected_point()
+            hsv=colorsys.rgb_to_hsv(*point.target)
+            precise=[v*255 for v in point.target] if group=='RGB' else [hsv[0]*360,hsv[1],hsv[2]]
+            values=[old if text==shown else float(text)
+                    for text,shown,old in zip(texts,self._rendered[group],precise)]
+            maximum=(255,255,255) if group=='RGB' else (360,1,1)
             if any(not math.isfinite(v) or not 0<=v<=m for v,m in zip(values,maximum)):
                 raise ValueError(f'{group} 范围：{maximum}')
-            target=tuple(v/255 for v in values) if group=='RGB' else colorsys.hsv_to_rgb(values[0]/360,values[1]/100,values[2]/100)
+            target=tuple(v/255 for v in values) if group=='RGB' else colorsys.hsv_to_rgb(values[0]/360,values[1],values[2])
             points=copy.deepcopy(self.history.points)
             points[self.selected].target=target
             self.edit(points)
@@ -323,7 +872,9 @@ class GradingWorkspace(ttk.Frame):
     def commit_influence(self,event=None):
         if self.selected<0: return 'break'
         try:
-            radius,strength=float(self.radius.get()),float(self.strength.get())
+            point=self.selected_point()
+            radius=point.radius if self.radius.get()==format_number(point.radius,1) else float(self.radius.get())
+            strength=point.strength*100 if self.strength.get()==format_number(point.strength*100,1) else float(self.strength.get())
             if not 5<=radius<=100 or not 0<=strength<=100: raise ValueError('范围 5…100，强度 0…100')
             points=copy.deepcopy(self.history.points)
             points[self.selected].radius=radius
@@ -332,10 +883,26 @@ class GradingWorkspace(ttk.Frame):
         except ValueError as exc: self.error.set(str(exc))
         return 'break'
 
-    def edit(self,points):
+    def edit(self,points,keep_draft=False):
+        if self.document is None:return
+        points=copy.deepcopy(points)
+        for i,p in enumerate(points):
+            if p.owner_id and p.owner_id!=self.document.document_id:
+                raise ValueError('不能直接使用其他图像的色块，请显式复制调整')
+            p.owner_id=self.document.document_id
+            if not p.name:p.name=f'颜色 {i+1}'
+            if not p.origin:p.origin=self.document.path
+        before=processing_key(self.history.points)
+        previous=self.selected_point()
         if self.history.replace(points):
+            state=self.state_for(self.document)
+            if not keep_draft:
+                if previous:state.drafts.pop(previous.point_id,None)
+            valid={p.point_id for p in points}
+            state.drafts={k:v for k,v in state.drafts.items() if k in valid}
             self.refresh_points()
-            self.request_preview()
+            if before!=processing_key(points):self.request_preview()
+        self.update_draft_status()
 
     def delete_point(self):
         if self.selected>=0:
@@ -346,32 +913,50 @@ class GradingWorkspace(ttk.Frame):
     def reset_point(self):
         if self.selected>=0:
             points=copy.deepcopy(self.history.points)
-            points[self.selected]=ColorPoint(points[self.selected].source,points[self.selected].source,origin=points[self.selected].origin)
+            point=points[self.selected];point.target=point.source;point.radius=25.;point.strength=1.;point.enabled=True
             self.edit(points)
+            self.state_for(self.document).drafts.pop(point.point_id,None)
+            self.show_point()
 
     def reset_all(self):
-        if self.history.points and messagebox.askyesno('重置共用调色', '将清空所有图像共用的颜色控制点，可通过撤销恢复。是否继续？',parent=self):
+        if self.history.points and messagebox.askyesno('重置本图调色', '只清空当前图像的颜色控制点，可通过撤销恢复。是否继续？',parent=self):
             self.edit([])
 
     def travel(self,redo):
+        before=processing_key(self.history.points)
         if (self.history.redo() if redo else self.history.undo()):
+            self.state_for(self.document).drafts.clear()
             self.selected=0 if self.history.points else -1
             self.refresh_points()
-            self.request_preview()
+            if before!=processing_key(self.history.points):self.request_preview()
 
     def request_preview(self):
         self.revision+=1
-        self.status.set('正在更新当前图像 · 所有图像共用调色…' if self.document else '导入图像即可应用当前共用调色')
+        self.status.set('正在更新当前图像…' if self.document else '请导入图像')
+        self.schedule_draw()
         if self.future is None: self.start_preview()
+
+    def preview_processor(self):
+        if not self.enabled.get():
+            return lambda pixels: pixels
+        return self.processor_for_key(self.active_key())
 
     def start_preview(self):
         if self.document is None: return
         revision=self.revision
+        document_id=self.document.document_id
         points=copy.deepcopy(self.history.points)
+        key=self.active_key()
+        state=self.state_for(self.document)
+        if state.cache_key==key and state.output is not None:
+            self.output=state.output;self.output_pil=self.make_display(self.output)
+            self._shown_revision=revision
+            self.status.set(f'{Path(self.document.path).name} · {len(points)} 个控制点')
+            self.schedule_draw();return
         source=self.source
+        self._running_revision=revision
         def process():
-            lut=build_lut(points)
-            return revision,lut,apply_lut(source,lut)
+            return revision,document_id,key,GradingWorkspace.processor_for_key(key)(source)
         self.future=self.executor.submit(process)
         self.later(30,self.poll_preview)
 
@@ -381,8 +966,9 @@ class GradingWorkspace(ttk.Frame):
             return
         future,self.future=self.future,None
         try:
-            revision,lut,result=future.result()
-            if revision==self.revision and self.document:
+            revision,document_id,key,result=future.result()
+            if revision==self.revision and self.document and document_id==self.document.document_id and key==self.active_key():
+                state=self.state_for(self.document);state.cache_key=key;state.output=result
                 self.output=result
                 self.output_pil=self.make_display(result)
                 self._shown_revision=revision
@@ -390,65 +976,9 @@ class GradingWorkspace(ttk.Frame):
                 self.schedule_draw()
             elif self.document:
                 self.start_preview()
-        except Exception as exc: self.error.set(str(exc))
-
-    def fit_image(self):
-        self.fit=True
-        self.schedule_draw()
-
-    def show_original(self,value):
-        self.hold_original=value
-        self.schedule_draw()
-
-    def schedule_draw(self):
-        if self._render_timer is None: self._render_timer=self.later(16,self.draw)
-
-    def draw(self):
-        self._render_timer=None
-        self.canvas.delete('all')
-        self._photos=[]
-        if self.source_pil is None:
-            self.canvas.create_text(30,30,anchor='nw',text='导入彩色图像，然后启用“取色”添加控制点',fill='white')
-            return
-        w,h=max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height())
-        side=self.mode.get()=='左右并排'
-        pw=max(1,w//2) if side else w
-        iw,ih=self.source_pil.size
-        if self.fit:
-            self.zoom=min(pw/iw,h/ih)
-            self.offset=[(pw-iw*self.zoom)/2,(h-ih*self.zoom)/2]
-        ready=self._shown_revision==self.revision
-        corrected=self.source_pil if self.hold_original or not self.enabled.get() or not ready else self.output_pil
-        def viewport(image):
-            ox,oy=self.offset
-            x0=max(0,math.floor(-ox/self.zoom));y0=max(0,math.floor(-oy/self.zoom))
-            x1=min(iw,math.ceil((pw-ox)/self.zoom));y1=min(ih,math.ceil((h-oy)/self.zoom))
-            view=Image.new('RGB',(pw,h),(112,112,112))
-            if x1>x0 and y1>y0:
-                crop=image.crop((x0,y0,x1,y1))
-                crop=crop.resize((max(1,round((x1-x0)*self.zoom)),max(1,round((y1-y0)*self.zoom))),Image.Resampling.NEAREST if self.zoom>=2 else Image.Resampling.BILINEAR)
-                view.paste(crop,(round(ox+x0*self.zoom),round(oy+y0*self.zoom)))
-            return view
-        before,after=viewport(self.source_pil),viewport(corrected)
-        if side:
-            views=[(0,before),(pw,after)]
-        else:
-            split=round(pw*self.divider)
-            before.paste(after.crop((split,0,pw,h)),(split,0))
-            views=[(0,before)]
-        for x,view in views:
-            photo=ImageTk.PhotoImage(view,master=self)
-            self._photos.append(photo)
-            self.canvas.create_image(x,0,image=photo,anchor='nw')
-        self.canvas.create_text(10,10,anchor='nw',text='原图 / Before',fill='white')
-        self.canvas.create_text(w-10,10,anchor='ne',text='最终效果 / After' if ready or not self.enabled.get() else '正在更新…',fill='white')
-        self.canvas.create_line(pw if side else w*self.divider,0,pw if side else w*self.divider,h,fill='#ffffff',width=2)
-
-    def coordinates(self,event):
-        w=max(1,self.canvas.winfo_width())
-        pw=w//2 if self.mode.get()=='左右并排' else w
-        local=event.x%max(1,pw) if self.mode.get()=='左右并排' else event.x
-        return (local-self.offset[0])/self.zoom,(event.y-self.offset[1])/self.zoom,local
+        except Exception as exc:
+            if self.document and getattr(self,'_running_revision',None)!=self.revision:self.start_preview()
+            else:self.error.set(str(exc))
 
     def press(self,event):
         if self.document is None: return 'break'
@@ -458,48 +988,29 @@ class GradingWorkspace(ttk.Frame):
             x,y,_=self.coordinates(event)
             if 0<=x<self.source.shape[1] and 0<=y<self.source.shape[0]:
                 fx=int(x*self.document.rgb.shape[1]/self.source.shape[1]);fy=int(y*self.document.rgb.shape[0]/self.source.shape[0])
+                if self.method.get()=='CLUT 调色':
+                    self.pick_clut_at(fx,fy);return 'break'
                 if self.document.alpha is not None and self.document.alpha[fy,fx]<.1:
                     self.error.set('请在非透明区域取色')
                     return 'break'
                 color=sample_original(self.document.rgb,fx,fy)
+                self.save_draft()
                 self.selected=len(self.history.points)
                 self.edit(self.history.points+[ColorPoint(color,color,origin=self.document.path)])
                 self.pick.set(False)
         else:
-            self.fit=False
-            self.drag=('pan',event.x,event.y,*self.offset)
+            self.drag=None
         return 'break'
-
-    def motion(self,event):
-        if self.drag:
-            if self.drag[0]=='split': self.divider=max(.02,min(.98,event.x/max(1,self.canvas.winfo_width())))
-            else: self.offset=[self.drag[3]+event.x-self.drag[1],self.drag[4]+event.y-self.drag[2]]
-            self.schedule_draw()
-        return 'break'
-
-    def wheel(self,event):
-        if self.document is not None:
-            x,y,local=self.coordinates(event)
-            self.fit=False
-            self.zoom=max(.02,min(32,self.zoom*(1.15 if event.delta>0 else 1/1.15)))
-            self.offset=[local-x*self.zoom,event.y-y*self.zoom]
-            self.schedule_draw()
-        return 'break'
-
-    def hover(self,event):
-        if self.source is None: return
-        x,y,_=self.coordinates(event)
-        x,y=int(x),int(y)
-        if 0<=x<self.source.shape[1] and 0<=y<self.source.shape[0]:
-            before=tuple(raster8(self.source[y,x]).tolist())
-            after=tuple(raster8((self.output if self.enabled.get() and self._shown_revision==self.revision else self.source)[y,x]).tolist())
-            self.status.set(f'Preview ({x},{y}) · Before RGB {before} · After RGB {after} /255')
 
     def export(self):
         if self.document is None or self.io_future is not None: return
         # Clicking a ttk button does not always move keyboard focus. Validate
         # the visible draft before taking the export snapshot as well.
-        if self.selected>=0:
+        is_clut=self.method.get()=='CLUT 调色'
+        is_ca=self.method.get()=='CA 调色'
+        if is_clut and not self.clut_ready():return
+        if is_ca and not self.ca_ready():return
+        if self.selected>=0 and not is_clut and not is_ca:
             for group in ('RGB','HSV'):
                 self.commit_target(group)
                 if self.error.get():return
@@ -509,7 +1020,10 @@ class GradingWorkspace(ttk.Frame):
         if not path: return
         document=self.document
         points=copy.deepcopy(self.history.points) if self.enabled.get() else []
-        def save(): export_color_image(path,document,build_lut(points))
+        processor=self.preview_processor()
+        def save():
+            if is_clut or is_ca:export_processed_image(path,document,processor)
+            else:export_color_image(path,document,build_lut(points))
         self.io_future=self.executor.submit(save)
         self.status.set('正在导出完整图像…')
         self.later(40,self.poll_export)
@@ -520,12 +1034,16 @@ class GradingWorkspace(ttk.Frame):
             return
         future,self.io_future=self.io_future,None
         try:
-            future.result()
-            self.status.set('导出完成 · sRGB')
+            report=future.result()
+            if isinstance(report,dict) and 'max_code_error' in report:
+                self.status.set(f'导出完成 · 33³ 节点重读误差 Mean {report["mean_code_error"]:.3f} / Max {report["max_code_error"]:.3f}（RGB /255，非硬件验证）')
+            else:self.status.set('导出完成')
         except Exception as exc: self.error.set(str(exc))
 
     def destroy(self):
         self.closed=True
+        self.cancel_detail()
+        for var,trace in self._draft_traces:var.trace_remove('write',trace)
         for identifier in list(self._timers): self.after_cancel(identifier)
         self._timers.clear()
         self.executor.shutdown(wait=False,cancel_futures=True)

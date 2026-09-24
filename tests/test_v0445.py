@@ -1,4 +1,4 @@
-"""Unified tool navigation and workspace-wide colour mapping regression."""
+"""Unified navigation; V0.4.49 keeps a shared catalogue, not shared mappings."""
 import copy
 import tempfile
 from pathlib import Path
@@ -35,17 +35,25 @@ class SharedGradingTests(unittest.TestCase):
         p.zoom=3;p.offset=[-24,-18];p.fit=False;p.divider=.3
         self.add_document()
         p.select_document(1);self.wait_preview()
-        self.assertEqual(p.history.points[0],original)
+        self.assertEqual(p.history.points,[])
+        np.testing.assert_array_equal(p.output,p.source)
         np.testing.assert_allclose(p.output,apply_lut(p.source,build_lut(p.history.points)))
         self.pick()
-        self.assertEqual(len(p.history.points),2)
-        self.assertEqual(p.history.points[1].origin,'B.png')
-        np.testing.assert_allclose(p.history.points[1].source,(.2,.3,.7),atol=1e-6)
-        p.values['HSV'][1].set('80');p.commit_target('HSV')
+        self.assertEqual(len(p.history.points),1)
+        self.assertEqual(len(p.point_list.get_children()),2)
+        self.assertEqual(p.history.points[0].origin,'B.png')
+        np.testing.assert_allclose(p.history.points[0].source,(.2,.3,.7),atol=1e-6)
+        p.values['HSV'][1].set('.8');p.commit_target('HSV')
         p.select_document(0);self.wait_preview()
-        self.assertEqual(p.zoom,3);self.assertEqual(p.offset,[-24,-18])
+        self.assertEqual(p.zoom,3)
+        # Navigation retains scale, but no longer restores drag-to-pan offsets.
+        width=max(1,p.canvas.winfo_width())
+        if p.mode.get()=='左右并排':width=max(1,width//2)
+        self.assertEqual(p.offset,[(width-p.source.shape[1]*3)/2,
+                                  (max(1,p.canvas.winfo_height())-p.source.shape[0]*3)/2])
         self.assertEqual(p.divider,.3);self.assertFalse(p.fit)
-        self.assertEqual(len(p.history.points),2)
+        self.assertEqual(len(p.history.points),1)
+        self.assertEqual(p.history.points[0],original)
         np.testing.assert_allclose(p.output,apply_lut(p.source,build_lut(p.history.points)))
 
     def test_remove_source_and_reimport_keep_history_and_bypass(self):
@@ -53,12 +61,12 @@ class SharedGradingTests(unittest.TestCase):
         p.enabled.set(False)
         points=copy.deepcopy(p.history.points)
         p.remove_document()
-        self.assertEqual(p.history.points,points)
+        self.assertEqual(p.history.points,[])
         p.travel(False);self.assertEqual(p.history.points,[])
-        p.travel(True);self.assertEqual(p.history.points,points)
+        p.travel(True);self.assertEqual(p.history.points,[])
         self.add_document();p.select_document(0);self.wait_preview()
-        self.assertFalse(p.enabled.get())
-        self.assertEqual(p.history.points,points)
+        self.assertTrue(p.enabled.get())
+        self.assertEqual(p.history.points,[])
 
     def test_reset_all_requires_explicit_shared_scope_and_can_undo(self):
         p=self.panel;self.pick();self.add_document()
@@ -67,7 +75,7 @@ class SharedGradingTests(unittest.TestCase):
         self.assertEqual(len(p.history.points),1)
         with mock.patch('isp_tool.ui.grading_workspace.messagebox.askyesno',return_value=True) as confirm:
             p.reset_all()
-            self.assertIn('所有图像',confirm.call_args.args[1])
+            self.assertIn('当前图像',confirm.call_args.args[1])
         self.assertEqual(p.history.points,[])
         p.travel(False);self.assertEqual(len(p.history.points),1)
 
@@ -76,10 +84,11 @@ class SharedGradingTests(unittest.TestCase):
         snapshot=copy.deepcopy(p.history.points)
         p.values['RGB'][0].set('-')
         p.select_document(1)
-        self.assertEqual(p.values['RGB'][0].get(),'-')
-        self.assertEqual(p.history.points,snapshot)
+        self.assertEqual(p.values['RGB'][0].get(),'0')
+        self.assertEqual(p.history.points,[])
         p.select_document(0);self.wait_preview()
         self.assertEqual(p.values['RGB'][0].get(),'-')
+        self.assertEqual(p.history.points,snapshot)
 
     def test_latest_request_discards_previous_image_and_is_lazy(self):
         p=self.panel;self.add_document()
@@ -90,7 +99,7 @@ class SharedGradingTests(unittest.TestCase):
             p.selected=0
             p.edit([ColorPoint((.2,.3,.7),(.3,.4,.5))])
             submit.assert_not_called()
-            future.set_result((old_revision,build_lut([]),np.zeros((64,80,3),np.float32)))
+            future.set_result((old_revision,p.documents[0].document_id,(),np.zeros((64,80,3),np.float32)))
             p.poll_preview()
             self.assertEqual(submit.call_count,1)
             self.wait_preview()
@@ -156,8 +165,8 @@ class ToolNavigationTests(unittest.TestCase):
             self.assertEqual(app.tool_var.get(),'grading')
             self.assertIn('手动调色',p.tool_selector.cget('text'))
             for selector in (app.tool_selector,p.tool_selector):
-                self.assertEqual(selector.menu.index('end'),2)
-                self.assertTrue(all(selector.menu.type(i)=='radiobutton' for i in range(3)))
+                self.assertEqual(selector.menu.index('end'),3)
+                self.assertTrue(all(selector.menu.type(i)=='radiobutton' for i in range(4)))
             p.fit=False;p.zoom=4;p.offset=[-31,52]
             p.values['RGB'][0].set('-')
             app._switch_workspace('isp')

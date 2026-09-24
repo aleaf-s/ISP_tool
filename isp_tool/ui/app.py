@@ -123,7 +123,7 @@ from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, ParameterControl, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.45 · Manual Colour Grading"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.56 · CA 交互与 TXT 导入导出"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,
@@ -854,6 +854,8 @@ class ISPApplication:
         self.tool_selector = ToolSelector(self.workspace_switch, self.tool_var, self._switch_workspace)
         self.tool_selector.pack(side="left")
         self.grading_workspace = None
+        self.awb_retune_workspace = None
+        self._active_auxiliary = None
         self._last_tool_items = {}
         self.image_var = tk.StringVar()
         self.image_combo = ttk.Combobox(
@@ -5952,15 +5954,15 @@ class ISPApplication:
     def _update_workspace_switch(self) -> None:
         if not hasattr(self, "tool_var"):
             return
-        if self.grading_workspace is not None and self.grading_workspace.winfo_manager():
-            self.tool_var.set("grading")
+        if self._active_auxiliary is not None:
+            self.tool_var.set(self._active_auxiliary)
         else:
             self.tool_var.set("yuv" if self.loaded.domain == "yuv" else "isp")
 
     def _switch_workspace(self, workspace: str) -> None:
         """Shared tool routing; cancelled import keeps the actual tool selected."""
-        if workspace == "grading":
-            self.open_grading_workspace()
+        if workspace in ("grading", "awb_retune"):
+            self._open_auxiliary_workspace(workspace)
             return
         self.close_grading_workspace()
         current = "yuv" if self.loaded.domain == "yuv" else "isp"
@@ -5981,12 +5983,20 @@ class ISPApplication:
         self._update_workspace_switch()
 
     def open_grading_workspace(self):
+        self._open_auxiliary_workspace("grading")
+
+    def _open_auxiliary_workspace(self, workspace):
         from .grading_workspace import GradingWorkspace
-        if self.grading_workspace is None:
-            self.grading_workspace = GradingWorkspace(self.root, self.close_grading_workspace, self.tool_var, self._switch_workspace)
-        panel = self.grading_workspace
-        if panel.winfo_manager():
+        from .awb_retune_workspace import AWBRetuneWorkspace
+        if self._active_auxiliary == workspace:
             return
+        self.close_grading_workspace()
+        if workspace == "grading" and self.grading_workspace is None:
+            self.grading_workspace = GradingWorkspace(self.root, self.close_grading_workspace, self.tool_var, self._switch_workspace)
+        if workspace == "awb_retune" and self.awb_retune_workspace is None:
+            self.awb_retune_workspace = AWBRetuneWorkspace(self.root, self.tool_var, self._switch_workspace)
+        panel = self.grading_workspace if workspace == "grading" else self.awb_retune_workspace
+        self._active_auxiliary = workspace
         # Isolate root keyboard/menu actions from the hidden ISP workspace.
         self._grading_saved_bindings = {sequence: self.root.bind(sequence) for sequence in self.root.bind()}
         for sequence in self._grading_saved_bindings:
@@ -6005,9 +6015,11 @@ class ISPApplication:
         self.root.bind("<Control-e>", lambda e: panel.export())
 
     def close_grading_workspace(self):
-        if self.grading_workspace is None or not self.grading_workspace.winfo_manager():
+        if self._active_auxiliary is None:
             return
-        self.grading_workspace.place_forget()
+        panel = self.grading_workspace if self._active_auxiliary == "grading" else self.awb_retune_workspace
+        panel.place_forget()
+        self._active_auxiliary = None
         for sequence in self.root.bind():
             self.root.unbind(sequence)
         for sequence, script in self._grading_saved_bindings.items():
@@ -7308,6 +7320,9 @@ class ISPApplication:
         if getattr(self, "grading_workspace", None) is not None:
             self.grading_workspace.destroy()
             self.grading_workspace = None
+        if getattr(self, "awb_retune_workspace", None) is not None:
+            self.awb_retune_workspace.destroy()
+            self.awb_retune_workspace = None
         self.canvas_gestures.cancel_all()
         self.preview_requests.close()
         self.analysis_requests.close()

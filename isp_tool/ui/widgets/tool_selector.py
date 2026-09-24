@@ -3,7 +3,7 @@ from .action_menu import ActionMenu
 
 
 class ToolSelector(ActionMenu):
-    LABELS = {'isp': 'RAW ISP', 'yuv': 'YUV 预览', 'grading': '手动调色'}
+    LABELS = {'isp': 'RAW ISP', 'yuv': 'YUV 预览', 'grading': '手动调色', 'awb_retune': 'AWB 仿真'}
 
     def __init__(self, parent, variable, command):
         super().__init__(parent, '工具', style='Primary.TButton')

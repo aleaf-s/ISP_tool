@@ -2,6 +2,7 @@ from decimal import Decimal, InvalidOperation
 import tkinter as tk
 from tkinter import ttk
 from .tooltip import Tooltip
+from ..number_format import format_number
 
 
 class ParameterControl(ttk.Frame):
@@ -11,6 +12,7 @@ class ParameterControl(ttk.Frame):
         self.spec, self.command = spec, command
         self.variable = tk.DoubleVar(self, value=float(value))
         self.entry_var = tk.StringVar(self, value=self._format(value))
+        self._rendered = self.entry_var.get()
         self.error_var = tk.StringVar(self)
         controls = ttk.Frame(self)
         controls.pack(fill="x")
@@ -21,7 +23,7 @@ class ParameterControl(ttk.Frame):
                                        style="Compact.TButton")
         self.reset_button.pack(side="left", padx=(6, 0))
         self.tooltip = Tooltip(self.entry,
-            f"Range {spec.minimum} … {spec.maximum} · Default {spec.default} · Step {spec.step}")
+            lambda:f"Range {spec.minimum} … {spec.maximum} · Default {spec.default} · Step {spec.step}\n实际值 / Value: {self.value():.12g}")
         self.reset_tooltip = Tooltip(self.reset_button, f"Reset: {spec.default}")
         self.error_label = ttk.Label(self, textvariable=self.error_var, style="Error.TLabel", wraplength=320)
         self.entry.bind("<Return>", self._entry_commit)
@@ -31,9 +33,11 @@ class ParameterControl(ttk.Frame):
         # Entry has no wheel class binding; the panel's wheel router owns it.
 
     def _format(self, value):
-        return str(int(value)) if self.spec.kind == "int" else repr(float(value))
+        return str(int(value)) if self.spec.kind == "int" else format_number(value,step=self.spec.step)
 
     def _parse(self):
+        if self.entry_var.get().strip()==self._rendered:
+            return self.value()
         try:
             value = Decimal(self.entry_var.get().strip())
         except InvalidOperation:
@@ -56,6 +60,7 @@ class ParameterControl(ttk.Frame):
         changed = value != self.value()
         self.variable.set(value)
         self.entry_var.set(self._format(value))
+        self._rendered = self.entry_var.get()
         self.error_var.set("")
         self.error_label.pack_forget()
         self.entry.configure(style="Parameter.TEntry")

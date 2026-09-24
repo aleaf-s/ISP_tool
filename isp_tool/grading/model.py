@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import uuid4
 import copy
 import numpy as np
 import cv2
@@ -13,6 +14,9 @@ class ColorPoint:
     strength: float = 1.0
     enabled: bool = True
     origin: str = ''  # Informational source only, never a live image reference.
+    name: str = ''
+    owner_id: str = ''
+    point_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 class GradeHistory:

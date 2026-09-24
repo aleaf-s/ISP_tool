@@ -3,13 +3,15 @@ import tkinter as tk
 from tkinter import ttk
 import numpy as np
 from ...ccm_encoding import encode_ccm, decode_ccm
+from .tooltip import Tooltip
+from ..number_format import format_number
 
 FLOAT = "Float"
 FIXED = "Fixed 13-bit / ×1024"
 
 
 class CCMMatrixEditor(ttk.Frame):
-    def __init__(self, parent, matrix, preference=None):
+    def __init__(self, parent, matrix, preference=None, compact=False):
         super().__init__(parent)
         self.preference = preference if preference is not None else tk.StringVar(self, value=FLOAT)
         self.mode = FLOAT
@@ -27,8 +29,21 @@ class CCMMatrixEditor(ttk.Frame):
                 entry.grid(row=r, column=c, sticky="ew", padx=3, pady=4)
                 self.variables.append(variable)
                 self.entries.append(entry)
+                Tooltip(entry,lambda i=r*3+c:f'Float: {self.precise.ravel()[i]:.12g}')
         self.message_var = tk.StringVar(self)
-        ttk.Label(self, textvariable=self.message_var, style="Muted.TLabel", wraplength=360).pack(fill="x")
+        self.message_label = ttk.Label(self, textvariable=self.message_var, style="Muted.TLabel", wraplength=300 if compact else 360)
+        self._message_trace = None
+        if compact:
+            Tooltip(self.combo, lambda: self.message_var.get() or 'Float / 13-bit 补码 ×1024；两组矩阵共用格式偏好。')
+            def show_error(*_):
+                message = self.message_var.get()
+                if message and not message.startswith('Fixed 为量化近似'):
+                    self.message_label.pack(fill='x')
+                else:
+                    self.message_label.pack_forget()
+            self._message_trace = self.message_var.trace_add('write', show_error)
+        else:
+            self.message_label.pack(fill='x')
         self._trace = self.preference.trace_add("write", self._preference_changed)
         self.set_matrix(matrix)
 
@@ -41,7 +56,7 @@ class CCMMatrixEditor(ttk.Frame):
 
     def _render(self):
         values = self.precise.ravel()
-        texts = [str(encode_ccm(v)) for v in values] if self.mode == FIXED else [format(v, ".12g") for v in values]
+        texts = [str(encode_ccm(v)) for v in values] if self.mode == FIXED else [format_number(v,4) for v in values]
         for var, text in zip(self.variables, texts):
             var.set(text)
         cell_width = max(8, min(12, max(map(len, texts)) + 1))
@@ -101,6 +116,10 @@ class CCMMatrixEditor(ttk.Frame):
     def snapshot(self):
         return (self.precise.copy(), self.mode, list(self._rendered), [v.get() for v in self.variables])
 
+    def set_readonly(self, readonly=True):
+        for entry in self.entries:
+            entry.configure(state='readonly' if readonly else 'normal')
+
     def restore(self, snapshot):
         self.precise, self.mode, self._rendered, texts = snapshot
         self.mode_var.set(self.mode)
@@ -111,4 +130,6 @@ class CCMMatrixEditor(ttk.Frame):
 
     def destroy(self):
         self.preference.trace_remove("write", self._trace)
+        if self._message_trace is not None:
+            self.message_var.trace_remove('write', self._message_trace)
         super().destroy()

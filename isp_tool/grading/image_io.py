@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import io
+from uuid import uuid4
 import numpy as np
 import cv2
 from PIL import Image, ImageCms, ImageOps
@@ -17,6 +18,7 @@ class ColorDocument:
     bit_depth: int
     note: str
     view_state: dict = field(default_factory=dict)
+    document_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 def read_color_image(path):
@@ -68,9 +70,17 @@ def read_color_image(path):
 
 
 def export_color_image(path,document,lut):
+    export_processed_image(path, document, lambda pixels: apply_lut(pixels, lut))
+
+
+def export_processed_image(path, document, process):
+    """Write display sRGB supplied by `process`; no further transfer curve."""
     output=np.empty_like(document.rgb)
     for y in range(0,len(output),128):
-        output[y:y+128]=apply_lut(document.rgb[y:y+128],lut)
+        output[y:y+128]=process(document.rgb[y:y+128])
+    if not np.all(np.isfinite(output)):
+        raise ValueError('Output contains NaN/Infinity')
+    np.clip(output,0,1,out=output)
     if document.alpha is not None:
         output=np.dstack((output,document.alpha))
     icc=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
