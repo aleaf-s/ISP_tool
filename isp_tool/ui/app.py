@@ -123,7 +123,7 @@ from .theme import COLORS, FONTS, UI_SCALE_CHOICES, configure_theme
 from .widgets import ActionMenu, ParameterControl, ToastManager
 
 
-APP_TITLE = "ISP RAW Visual Simulator V0.4.56 · CA 交互与 TXT 导入导出"
+APP_TITLE = "ISP RAW Visual Simulator V0.4.60 · HSV 参数编辑"
 PREVIEW_QUALITY_CHOICES = {
     "快速 · 900 px": 900,
     "平衡 · 1200 px": 1200,

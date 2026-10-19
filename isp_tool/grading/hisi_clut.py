@@ -13,6 +13,8 @@ from .clut import HSGrid, ZEROS, build_clut, apply_clut, atomic_text
 
 @lru_cache(maxsize=1)
 def addresses():
+    # SDK coordinates i,j,k = R,B,G; our array axes remain R,G,B.
+    # Groups 0..3 have 729 slots each, groups 4..7 have 648 each.
     counters=[0]*8;indices=[];positions=[]
     for g in range(17):
         for b in range(17):
@@ -21,16 +23,20 @@ def addresses():
                 address=(0 if group<4 else 2916)+4*counters[group]+group%4
                 counters[group]+=1
                 indices.append((r,g,b));positions.append(address)
-    return np.array(indices),np.array(positions)
+    indices,positions=np.array(indices),np.array(positions)
+    indices.setflags(write=False);positions.setflags(write=False)
+    return indices,positions
 
 
 def pack_deltas(deltas):
     a=np.asarray(deltas)
-    if a.shape!=(17,17,17,3) or not np.all(np.isfinite(a)) or np.any(a!=np.rint(a)) or np.any(np.abs(a)>511):
+    # Do not use abs(a): abs(INT_MIN) overflows in signed NumPy arrays.
+    if a.shape!=(17,17,17,3) or not np.all(np.isfinite(a)) or np.any(a!=np.rint(a)) or np.any((a < -511) | (a > 511)):
         raise ValueError('HiSilicon Delta RGB 必须是 17³×3 整数，范围 −511…511；未执行截断')
     indices,positions=addresses()
     values=a[indices[:,0],indices[:,1],indices[:,2]].astype(np.int64)&1023
     words=np.zeros(5508,np.uint32)
+    # Official word order: {2'b00, deltaB[9:0], deltaG[9:0], deltaR[9:0]}.
     words[positions]=values[:,0]|(values[:,1]<<10)|(values[:,2]<<20)
     return words
 
@@ -73,6 +79,9 @@ def quantize_grid(grid):
 
 
 def export_hisi(path,grid):
+    from .hsv_grid import HSVGrid
+    if isinstance(grid,HSVGrid) and not grid.preview_supported:
+        raise ValueError('非零 HSV 第三字段尚未支持，不能生成设备 CLUT')
     if grid.base_words and grid.dh==ZEROS and grid.ds==ZEROS:
         words=np.asarray(grid.base_words,dtype=np.int64)
         delta=unpack_words(words)
@@ -91,7 +100,7 @@ def export_hisi(path,grid):
 
 
 def load_hisi(path):
-    """Preserve all device words. HS edits start at zero as extra adjustments."""
+    """Preserve device words in a zero-adjustment carrier, separate from HSV UI."""
     return HSGrid(base_words=tuple(int(v) for v in read_words(path)))
 
 

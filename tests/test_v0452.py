@@ -3,7 +3,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase, mock
+from unittest import TestCase, mock, skip
 import numpy as np
 from isp_tool.grading.clut import HSGrid,apply_clut,build_clut,save_parameters,load_parameters
 from isp_tool.grading.image_io import ColorDocument
@@ -16,6 +16,7 @@ from isp_tool.ui.widgets.ccm_matrix_editor import CCMMatrixEditor,FLOAT,FIXED
 from isp_tool.grading.model import ColorPoint
 
 
+@skip('V0.4.60 已移除旧 HS/JSON 界面；HSV 显式应用、恢复和窗口回归见 test_v0457/test_v0460')
 class CLUTApplyTests(TestCase):
     setUp=test_v0444.WorkspaceTests.setUp
     tearDown=test_v0444.WorkspaceTests.tearDown

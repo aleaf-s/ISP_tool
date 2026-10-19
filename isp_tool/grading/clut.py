@@ -69,6 +69,24 @@ class CLUTState:
     smoothness: float = 1.
     show_influence: bool = False
     sample_rgb: object = None
+    slice_index: int = 4
+    device_grid: object = None
+    device_path: str = ''
+    hsv_path: str = ''
+    preview_source: str = 'editor'
+    applied_source: str = 'editor'
+    applied_editor_grid: object = None
+    applied_device_grid: object = None
+    applied_device_path: str = ''
+    applied_hsv_path: str = ''
+    import_note: str = ''
+
+    def preview_grid(self):
+        return self.device_grid if self.preview_source == 'device' else self.grid
+
+    def pending(self):
+        return bool(self.drafts or self.preview_source != self.applied_source
+                    or self.preview_grid() != self.applied_grid)
 
     def replace(self, grid):
         if grid == self.grid:return False
@@ -150,6 +168,8 @@ def map_hsv(hsv, grid):
 
 @lru_cache(maxsize=4)
 def build_clut(grid):
+    from .hsv_grid import HSVGrid, build_hsv_clut
+    if isinstance(grid,HSVGrid):return build_hsv_clut(grid)
     if grid.base_words:
         from .hisi_clut import unpack_words
         axis17=np.linspace(0,1,17,dtype=np.float32)

@@ -3,7 +3,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase, mock
+from unittest import TestCase, mock, skip
 
 from isp_tool.grading.clut import HSGrid
 from isp_tool.grading.hisi_clut import read_words
@@ -11,6 +11,7 @@ from isp_tool.grading.ca import load_ca_text
 from tests import test_v0444
 
 
+@skip('V0.4.60 已移除设备 TXT/旧 HS 界面；HSV TXT 与无需回车交互见 test_v0460')
 class CLUTInteractionTests(TestCase):
     setUp=test_v0444.WorkspaceTests.setUp
     tearDown=test_v0444.WorkspaceTests.tearDown

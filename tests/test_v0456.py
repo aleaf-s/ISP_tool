@@ -1,7 +1,7 @@
 """CA usable controls, device TXT import and exact data-count regression."""
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase, mock
+from unittest import TestCase, mock, skip
 import tempfile
 import time
 import tkinter as tk
@@ -104,6 +104,7 @@ class InteractionTests(TestCase):
         self.assertNotIn(132,dict(e.state.curve.points))
         self.assertEqual(e.state.applied,CACurve())
 
+    @skip('V0.4.60 移除设备 CLUT 的界面导入/导出；HSV 原子导入与恢复见 test_v0460')
     def test_txt_import_apply_export_invalid_atomicity_and_reset(self):
         p=self.panel;p.method.set('CLUT 调色');p.switch_method();self.wait_preview()
         delta=np.zeros((17,17,17,3),np.int16);delta[...,2]=40
@@ -114,7 +115,7 @@ class InteractionTests(TestCase):
             with mock.patch('isp_tool.ui.grading_workspace.filedialog.askopenfilename',return_value=str(source)):
                 p.load_clut_file()
             state=p.state_for(p.document).clut
-            self.assertEqual(state.grid,base);self.assertEqual(state.applied_grid,HSGrid())
+            self.assertEqual(state.device_grid,base);self.assertEqual(state.grid,HSGrid());self.assertEqual(state.applied_grid,HSGrid())
             self.assertEqual(p.revision,revision)
             p.apply_clut_parameters();self.wait_preview()
             np.testing.assert_allclose(p.preview_processor()(p.document.rgb),apply_clut(p.document.rgb,build_clut(base)))
@@ -125,10 +126,10 @@ class InteractionTests(TestCase):
                 self.root.update();time.sleep(.01)
             np.testing.assert_array_equal(read_words(dest),read_words(source))
             source.write_text('1,2,3')
-            with mock.patch('isp_tool.ui.grading_workspace.filedialog.askopenfilename',return_value=str(source)):
+            with mock.patch('isp_tool.ui.grading_workspace.filedialog.askopenfilename',return_value=str(source)),mock.patch('isp_tool.ui.grading_workspace.messagebox.askyesno',return_value=True):
                 p.load_clut_file()
-            self.assertEqual(state.grid,base);self.assertTrue(p.error.get())
-            p.clut_editor.reset_all();self.assertEqual(state.grid,base)
+            self.assertEqual(state.device_grid,base);self.assertTrue(p.error.get())
+            p.clut_editor.reset_all();self.assertEqual(state.device_grid,base)
 
 
 class LayoutTests(TestCase):

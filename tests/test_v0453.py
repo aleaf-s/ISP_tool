@@ -2,7 +2,7 @@
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase,mock
+from unittest import TestCase,mock,skip
 import numpy as np
 from PIL import Image
 from isp_tool.grading.clut import (HSGrid,neighbor_weights,edit_neighborhood,locate_rgb_node,
@@ -49,6 +49,7 @@ class NeighborhoodTests(TestCase):
         self.assertEqual(locate_rgb_node((0,0,0)),(0,0))
 
 
+@skip('V0.4.60 已移除旧 HS/JSON 界面；HSV 取色、邻域和状态隔离回归见 test_v0457/test_v0460')
 class CLUTWorkflowTests(TestCase):
     setUp=test_v0444.WorkspaceTests.setUp
     tearDown=test_v0444.WorkspaceTests.tearDown

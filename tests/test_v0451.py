@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase,mock
+from unittest import TestCase,mock,skip
 import numpy as np
 import cv2
 from PIL import Image
@@ -99,6 +99,7 @@ class HisiPackingTests(TestCase):
             self.assertEqual(path.read_bytes(),prior)
 
 
+@skip('V0.4.60 已移除旧 24×9 HS/设备 CLUT 界面；现行 HSV 工作流见 test_v0457/test_v0460')
 class CLUTWorkspaceTests(TestCase):
     setUp=test_v0444.WorkspaceTests.setUp
     tearDown=test_v0444.WorkspaceTests.tearDown

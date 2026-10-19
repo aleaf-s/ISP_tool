@@ -2,6 +2,7 @@
 import colorsys
 import copy
 import math
+from dataclasses import replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
@@ -12,9 +13,10 @@ import numpy as np
 from PIL import Image
 from ..grading.model import GradeHistory, ColorPoint, build_lut, apply_lut, raster8, sample_original
 from ..grading.image_io import read_color_image, export_color_image, export_processed_image
-from ..grading.clut import (CLUTState, build_clut, apply_clut, save_parameters, load_parameters,
+from ..grading.clut import (build_clut, apply_clut,
                            locate_rgb_node,neighbor_weights,sample_hs_field)
 from ..grading.ca import CACurve, apply_ca, load_ca_text, export_ca_text
+from ..grading.hsv_grid import HSVGrid, VALUES, load_hsv, export_hsv, locate as locate_hsv, influence as hsv_influence
 from ..grading.session import GradingState, processing_key, preview_lut
 from .theme import COLORS
 from .number_format import format_number
@@ -121,7 +123,7 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         self.canvas.bind('<Motion>',self.hover)
         self.editor_host=right
         self.method=tk.StringVar(self,value='取色调色')
-        method=ttk.Combobox(right,textvariable=self.method,values=('取色调色','CLUT 调色','CA 调色'),state='readonly',width=16)
+        method=ttk.Combobox(right,textvariable=self.method,values=('取色调色','HSV 调色','CA 调色'),state='readonly',width=16)
         method.pack(anchor='w',pady=(0,6))
         method.bind('<<ComboboxSelected>>',self.switch_method)
         self.point_panel=ttk.Frame(right);self.point_panel.pack(fill='x')
@@ -199,34 +201,39 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
             self._draft_traces.append((var,var.trace_add('write',self.update_draft_status)))
         self.clut_status=tk.StringVar(self,value='已应用')
         self.clut_panel=ttk.Frame(self.editor_host)
-        ttk.Label(self.clut_panel,text='CLUT',style='Title.TLabel').pack(anchor='w')
-        ttk.Button(self.clut_panel,text='打开 CLUT 调试窗口…',command=self.open_clut_window).pack(fill='x',pady=6)
+        ttk.Label(self.clut_panel,text='HSV',style='Title.TLabel').pack(anchor='w')
+        ttk.Button(self.clut_panel,text='打开 HSV 调试窗口…',command=self.open_clut_window).pack(fill='x',pady=6)
         ttk.Label(self.clut_panel,textvariable=self.clut_status,style='Muted.TLabel').pack(anchor='w',pady=4)
         ttk.Button(self.clut_panel,text='应用',command=self.apply_clut_parameters,style='Primary.TButton').pack(fill='x',pady=5)
         ttk.Button(self.clut_panel,text='恢复到上次应用',command=self.restore_clut_applied).pack(fill='x',pady=3)
         ttk.Label(self.clut_panel,textvariable=self.error,style='Error.TLabel',wraplength=300).pack(fill='x')
         self.clut_window=tk.Toplevel(self)
         self.clut_window.withdraw()
-        self.clut_window.title('CLUT 调试')
+        self.clut_window.title('HSV 调试')
         self.clut_window.resizable(True,True)
         self.clut_window.protocol('WM_DELETE_WINDOW',self.hide_clut_window)
-        # Keep Apply and file actions visible even when the editor is resized.
-        footer=ttk.Frame(self.clut_window,padding=8);footer.pack(side='bottom',fill='x')
-        actions=ttk.Frame(footer);actions.pack(fill='x',pady=(0,5))
-        ttk.Button(actions,text='应用',command=self.apply_clut_parameters,style='Primary.TButton').pack(side='right')
-        ttk.Button(actions,text='恢复到上次应用',command=self.restore_clut_applied).pack(side='right',padx=5)
-        ttk.Label(actions,textvariable=self.clut_status,style='Muted.TLabel').pack(side='left')
-        files=ttk.Frame(footer);files.pack(fill='x')
-        ttk.Button(files,text='导入 CLUT TXT…',command=self.load_clut_file).grid(row=0,column=0,sticky='w',padx=(0,5))
-        export_button=ttk.Button(files,text='导出 CLUT TXT…',command=self.export_clut_file)
-        export_button.grid(row=0,column=1,sticky='w')
-        Tooltip(export_button,'HiSilicon 5508-word TXT；沿用已验证的数据布局，硬件尺度与实机效果仍需设备确认。')
-        ttk.Button(files,text='检查配套 HSV TXT…',command=self.inspect_clut_hsv).grid(row=1,column=0,columnspan=2,sticky='w',pady=(4,0))
-        self.clut_source=tk.StringVar(self)
-        ttk.Label(footer,textvariable=self.clut_source,style='Muted.TLabel',wraplength=650).pack(anchor='w',pady=(4,0))
         self.clut_editor=CLUTEditor(self.clut_window,self.clut_changed,self.error,self.update_clut_status,
                                     self.schedule_draw,self.begin_clut_pick)
         self.clut_editor.pack(fill='both',expand=True,padx=8,pady=8)
+        footer=ttk.Frame(self.clut_editor.sidebar,padding=(0,12));footer.pack(fill='x')
+        self.hsv_footer=footer
+        actions=ttk.Frame(footer);actions.pack(fill='x',pady=(0,5))
+        ttk.Button(actions,text='应用',command=self.apply_clut_parameters,style='Primary.TButton').pack(side='right')
+        ttk.Button(actions,text='恢复到上次应用',command=self.restore_clut_applied).pack(side='right',padx=5)
+        ttk.Label(footer,textvariable=self.clut_status,style='Muted.TLabel').pack(anchor='w')
+        files=ttk.Frame(footer);files.pack(fill='x')
+        ttk.Button(files,text='导入 HSV TXT…',command=self.load_hsv_file).pack(side='left',padx=(0,5))
+        ttk.Button(files,text='导出 HSV TXT…',command=self.save_hsv_file).pack(side='left')
+        self.clut_source=tk.StringVar(self)
+        source_label=ttk.Label(footer,textvariable=self.clut_source,style='Muted.TLabel',wraplength=650)
+        # Routine explanations live in tooltips, not the compact parameter sidebar.
+        Tooltip(files,'图像预览为软件近似，并非海思 ISP 的实机效果。')
+        self.clut_import_note=tk.StringVar(self)
+        note_label=ttk.Label(footer,textvariable=self.clut_import_note,wraplength=650)
+        error_label=ttk.Label(footer,textvariable=self.error,style='Error.TLabel',wraplength=650);error_label.pack(anchor='w')
+        footer.bind('<Configure>',lambda e:[label.configure(wraplength=max(200,e.width-16)) for label in (source_label,note_label,error_label)])
+        self.clut_editor.sidebar.update_idletasks()
+        self.clut_editor.side_view.configure(width=max(340,self.clut_editor.sidebar.winfo_reqwidth()))
         sw,sh=self.winfo_screenwidth(),self.winfo_screenheight()
         width=min(round(sw*.85),max(900,self.clut_editor.cw*10+55))
         height=min(round(sh*.85),max(800,self.clut_editor.ch*30))
@@ -256,15 +263,23 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         self.bind('<Unmap>',lambda e:self.hide_ca_window() if e.widget is self else None,add='+')
 
     def open_clut_window(self):
-        if self.document is None or self.method.get()!='CLUT 调色':return
-        self.clut_window.title(f'CLUT 调试 · {Path(self.document.path).name}')
+        if self.document is None or self.method.get()!='HSV 调色':return
+        self.clut_window.title(f'HSV 调试 · {Path(self.document.path).name}')
         self.clut_window.deiconify();self.clut_window.lift()
+        self.clut_window.update_idletasks()
+        # Reserve a useful table viewport at the actual Tk font/DPI scale.
+        # Fixed 600px minima otherwise allow the footer to crush the table.
+        editor=self.clut_editor
+        needed_h=editor.parameter_header.winfo_reqheight()+420
+        needed_w=max(760,editor.sidebar.winfo_reqwidth()+400)
+        self.clut_window.minsize(min(needed_w,self.winfo_screenwidth()-40),
+                                 min(needed_h,self.winfo_screenheight()-80))
 
     def begin_clut_pick(self):
         if self.document is None:return
         self.hide_clut_window();self.pick.set(True)
         self.winfo_toplevel().lift()
-        self.status.set('点击原图颜色定位 CLUT（取原始像素 5×5，不采样叠加色）')
+        self.status.set('点击原图颜色定位 HSV（取原始像素 5×5，不采样叠加色）')
 
     def pick_clut_at(self,x,y):
         document=self.document
@@ -273,25 +288,35 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
             self.error.set('请在非透明区域取色');return False
         color=sample_original(document.rgb,x,y)
         state=self.state_for(document).clut;state.sample_rgb=tuple(float(v) for v in color)
-        self.clut_editor.locate_sample(*locate_rgb_node(color))
+        if isinstance(state.grid,HSVGrid):
+            index,row,column=locate_hsv(color)
+            self.clut_editor.remember_draft();self.clut_editor.close_inline()
+            state.slice_index=4
+            self.clut_editor.show_node()
+            self.clut_editor.locate_sample(row,column)
+        else:self.clut_editor.locate_sample(*locate_rgb_node(color))
         self.pick.set(False);self.open_clut_window()
         return True
 
     def restore_clut_applied(self):
-        if self.document is None or self.method.get()!='CLUT 调色':return
+        if self.document is None or self.method.get()!='HSV 调色':return
         editor=self.clut_editor;state=self.state_for(self.document).clut
         editor._drag_grid=editor._drag_preview=None;editor.close_inline()
-        state.drafts.clear();state.replace(state.applied_grid)
+        state.drafts.clear();state.strength_draft=None;state.gain_draft=None;state.replace(state.applied_grid)
+        state.hsv_path=state.applied_hsv_path;state.import_note='已恢复上次应用的 HSV 参数'
         editor.show_node();editor.redraw();self.error.set('');self.update_clut_status()
 
     def decorate_comparison_views(self,before,after):
-        if self.document is None or self.method.get()!='CLUT 调色' or self.hold_original:return before,after
+        if self.document is None or self.method.get()!='HSV 调色' or self.hold_original:return before,after
         state=self.state_for(self.document).clut
         if not state.show_influence:return before,after
-        key=(self.document.document_id,self.source.shape[:2],state.selected,state.radius,state.smoothness)
+        key=(self.document.document_id,self.source.shape[:2],state.selected,state.radius,state.smoothness,
+             isinstance(state.grid,HSVGrid),state.slice_index)
         if self._influence_cache is None or self._influence_cache[0]!=key:
             hsv=cv2.cvtColor(np.asarray(self.source,np.float32),cv2.COLOR_RGB2HSV)
-            weight=sample_hs_field(hsv,neighbor_weights(*state.selected,state.radius,state.smoothness))
+            if isinstance(state.grid,HSVGrid):
+                weight=hsv_influence(hsv,state.slice_index,*state.selected,state.radius,state.smoothness)
+            else:weight=sample_hs_field(hsv,neighbor_weights(*state.selected,state.radius,state.smoothness))
             weight=np.where(hsv[...,1]>0,weight,0)
             if self.document.alpha is not None:
                 weight*=cv2.resize(self.document.alpha,(self.source.shape[1],self.source.shape[0]))
@@ -313,18 +338,31 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
     def update_clut_status(self):
         if self.document is None:self.clut_status.set('请导入图像');return
         state=self.state_for(self.document).clut
-        self.clut_source.set('设备表已导入 · 网格为额外调整，非原 HSV 参数；重置表仅清除额外调整'
-                             if state.grid.base_words else '')
-        self.clut_status.set('待应用' if state.drafts or state.grid!=state.applied_grid else '已应用')
+        warning='图像预览为软件近似，非海思 ISP 效果'
+        if not state.grid.preview_supported:warning='第三字段未确认：仅可编辑 H/S 和导出，不能应用图像'
+        elif state.grid.prefix.strip():warning+='；RGB 对记录仅保留'
+        self.clut_source.set(warning)
+        self.clut_import_note.set(state.import_note)
+        self.clut_status.set('待应用' if state.pending() else '已应用')
+
+    def hsv_apply_failed(self,message):
+        self.error.set(message);self.clut_status.set('未应用')
+        if self.clut_window.winfo_viewable():
+            messagebox.showerror('HSV 未应用',message,parent=self.clut_window)
+        return False
 
     def apply_clut_parameters(self):
-        if self.document is None or self.method.get()!='CLUT 调色':return False
-        if not self.clut_editor.commit_all():return False
-        state=self.state_for(self.document).clut
-        if state.applied_grid!=state.grid:
-            state.applied_grid=state.grid
+        if self.document is None or self.method.get()!='HSV 调色':return False
+        if not self.clut_editor.commit_all():return self.hsv_apply_failed(self.error.get())
+        state=self.state_for(self.document).clut;grid=state.grid
+        if not grid.preview_supported:
+            return self.hsv_apply_failed('HSV 第三字段非零，语义未确认；已保留原值。可以编辑 H/S 和导出 HSV，不能应用图像。')
+        if state.applied_grid!=grid:
+            state.applied_grid=grid
             self.request_preview()
+        state.applied_hsv_path=state.hsv_path
         self.error.set('');self.update_clut_status()
+        if not self.enabled.get():self.clut_status.set('参数已应用 · 调色已旁路')
         return True
 
     def open_ca_window(self):
@@ -409,15 +447,15 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
 
     def sync_method(self):
         selected=self.state_for(self.document).method if self.document is not None else '取色调色'
-        clut=selected=='CLUT 调色';ca=selected=='CA 调色'
-        self.export_menu.entryconfigure(1,label='导出 CA TXT…' if ca else '导出 CLUT TXT…' if clut else '导出参数 TXT…',
+        clut=selected=='HSV 调色';ca=selected=='CA 调色'
+        self.export_menu.entryconfigure(1,label='导出 CA TXT…' if ca else '导出 HSV TXT…' if clut else '导出参数 TXT…',
                                          state='normal' if ca or clut else 'disabled')
         self.method.set(selected)
         self.point_panel.pack_forget();self.clut_panel.pack_forget();self.ca_panel.pack_forget()
         if clut:
             self.clut_editor.set_state(self.state_for(self.document).clut)
             self.clut_panel.pack(fill='x');self.pick.set(False)
-            self.clut_window.title(f'CLUT 调试 · {Path(self.document.path).name}')
+            self.clut_window.title(f'HSV 调试 · {Path(self.document.path).name}')
             self.hide_ca_window()
         elif ca:
             self.hide_clut_window()
@@ -429,7 +467,7 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         self.update_clut_status();self.update_ca_status()
         self.pick.set(False) if ca else None
         self.pick_button.configure(state='disabled' if ca else 'normal',
-             text='定位 CLUT（原图 5×5）' if clut else '取色（原图 5×5）')
+             text='定位 HSV（原图 5×5）' if clut else '取色（原图 5×5）')
         self.parameter_canvas.yview_moveto(0)
 
     def switch_method(self,event=None):
@@ -442,13 +480,13 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         if state.method==self.method.get():return
         state.method=self.method.get();self.error.set('')
         self.sync_method();self.request_preview()
-        if event is not None and self.method.get()=='CLUT 调色':self.open_clut_window()
+        if event is not None and self.method.get()=='HSV 调色':self.open_clut_window()
         if event is not None and self.method.get()=='CA 调色':self.open_ca_window()
 
     def active_key(self):
         if self.document and self.state_for(self.document).method=='CA 调色':
             return ('ca',self.state_for(self.document).ca.applied)
-        if self.document and self.state_for(self.document).method=='CLUT 调色':
+        if self.document and self.state_for(self.document).method=='HSV 调色':
             grid=self.state_for(self.document).clut.applied_grid
             return ('clut',grid)
         return processing_key(self.history.points)
@@ -464,7 +502,8 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
     def clut_changed(self,grid,final):
         if self.document is None:return
         if final:
-            self.state_for(self.document).clut.replace(grid)
+            state=self.state_for(self.document).clut
+            state.replace(grid)
             if self.clut_editor.state is self.state_for(self.document).clut:
                 self.clut_editor.show_node();self.clut_editor.redraw()
             self.update_clut_status()
@@ -472,90 +511,68 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         # Motion only repaints the local wheel. Image processing is Apply-only.
 
     def clut_ready(self,require_applied=True):
-        if self.document is None or self.state_for(self.document).method!='CLUT 调色':
-            self.error.set('请先切换到 CLUT 调色');return False
+        if self.document is None or self.state_for(self.document).method!='HSV 调色':
+            self.error.set('请先切换到 HSV 调色');return False
         self.clut_editor.remember_draft()
         state=self.state_for(self.document).clut
-        if state.drafts or self.clut_editor._drag_grid is not None:
-            self.error.set('存在未提交 CLUT 输入，请点击“应用”完成校验');return False
-        if require_applied and state.grid!=state.applied_grid:
-            self.error.set('CLUT 有未应用修改，请先点击“应用”再导出');return False
+        if state.drafts or state.strength_draft is not None or state.gain_draft is not None or self.clut_editor._drag_grid is not None:
+            self.error.set('存在未提交 HSV 输入，请点击“应用”完成校验');return False
+        if require_applied and state.pending():
+            self.error.set('HSV 有未应用修改，请先点击“应用”再导出');return False
         return True
-
-    def save_clut_parameters(self):
-        if self.document is None or self.method.get()!='CLUT 调色':return
-        if not self.clut_editor.commit_all():return
-        if not self.clut_ready(require_applied=False):return
-        path=filedialog.asksaveasfilename(parent=self,title='保存 CLUT 编辑方案备份（非设备导出）',defaultextension='.json',filetypes=[('编辑方案备份','*.json')])
-        if not path:return
-        try:
-            save_parameters(path,self.state_for(self.document).clut.grid,self.document.path)
-            self.error.set('');self.status.set('CLUT 参数已保存')
-        except (OSError,ValueError) as exc:self.error.set(str(exc))
-
-    def load_clut_parameters(self):
-        if self.document is None:return
-        state=self.state_for(self.document).clut
-        self.clut_editor.remember_draft()
-        if state.drafts:self.error.set('请先提交或重置 CLUT 草稿');return
-        path=filedialog.askopenfilename(parent=self,title='加载本工具 CLUT 参数（不读取海思 HSV 文件）',filetypes=[('CLUT 参数','*.json')])
-        if not path:return
-        try:
-            grid,source=load_parameters(path)
-            if source and str(Path(source))!=str(Path(self.document.path)):
-                if not messagebox.askyesno('加载到当前图像',f'参数来源：{source}\n加载为 {Path(self.document.path).name} 的编辑草稿？点击“应用”后才更新图像。',parent=self):return
-            self.state_for(self.document).method='CLUT 调色';state.drafts.clear()
-            self.clut_changed(grid,True);self.sync_method();self.error.set('')
-        except (OSError,ValueError,TypeError) as exc:self.error.set(str(exc))
 
     def export_parameter_txt(self):
         if self.method.get()=='CA 调色':self.export_ca_file()
-        elif self.method.get()=='CLUT 调色':self.export_clut_file()
+        elif self.method.get()=='HSV 调色':self.save_hsv_file()
 
-    def load_clut_file(self):
-        if self.document is None or self.method.get()!='CLUT 调色':return
-        self.clut_editor.remember_draft()
-        state=self.state_for(self.document).clut
-        if state.drafts or state.grid!=state.applied_grid:
-            if not messagebox.askyesno('替换 CLUT 草稿','导入会替换当前未应用修改，是否继续？',parent=self.clut_window):return
-        path=filedialog.askopenfilename(parent=self.clut_window,title='导入 CLUT TXT · 5508 个整数',
-                                       filetypes=[('CLUT TXT','*.txt')])
+    def clut_import_failed(self,exc):
+        text=f'导入失败，原数据未替换：{exc}'
+        self.error.set(text)
+        if self.clut_window.winfo_viewable():messagebox.showerror('HSV 导入失败',text,parent=self.clut_window)
+
+    def load_hsv_file(self):
+        if self.document is None or self.method.get()!='HSV 调色':
+            self.error.set('请先导入图像并切换到 HSV 调色');return
+        editor=self.clut_editor;state=self.state_for(self.document).clut
+        editor.remember_draft()
+        if state.pending():
+            if not messagebox.askyesno('替换 HSV 草稿','导入会替换当前未应用修改，是否继续？',parent=self.clut_window):return
+        path=filedialog.askopenfilename(parent=self.clut_window,title='导入三维 HSV TXT · 2700 条记录',filetypes=[('HSV TXT','*.txt')])
         if not path:return
         try:
-            if Path(path).suffix.lower()!='.txt':raise ValueError('请选择海思 CLUT .txt 文件')
-            from ..grading.hisi_clut import load_hisi
-            grid=load_hisi(path)
-            # Only mutate the current draft after complete validation.
-            self.clut_editor.close_inline();state.drafts.clear()
-            self.clut_editor._drag_grid=self.clut_editor._drag_preview=None
-            self.clut_changed(grid,True)
-            self.error.set('');self.status.set('CLUT 5508 个整数已导入，请点击“应用”预览')
-        except (OSError,UnicodeError,ValueError,OverflowError) as exc:self.error.set(str(exc))
+            if Path(path).suffix.lower()!='.txt':raise ValueError('请选择 HSV .txt 文件')
+            grid=load_hsv(path)
+            # HSV does not store CLUT Attr: retain the separately entered gains.
+            grid=replace(grid,enabled=state.grid.enabled,gains=state.grid.gains)
+            editor.close_inline();editor._drag_grid=editor._drag_preview=None;state.drafts.clear();state.strength_draft=None;state.gain_draft=None
+            self.clut_changed(grid,True);self.error.set('')
+            state.hsv_path=str(path)
+            state.import_note=f'已导入 {Path(path).name} · 2700 个节点'
+            if not grid.preview_supported:
+                state.import_note+=' · 第三字段未确认'
+            # Editing is fixed to the center layer; imports never auto-expand.
+            planes=[grid.plane(i) for i in range(9)]
+            active=[np.flatnonzero((abs(np.asarray(p.dh))>1e-10)|(abs(np.asarray(p.ds))>1e-10)) for p in planes]
+            index=4
+            row,column=divmod(int(active[index][0]),12) if len(active[index]) else (0,4)
+            state.slice_index=index;editor.show_node();editor.locate_sample(row,column)
+            self.update_clut_status();self.status.set(state.import_note)
+        except (OSError,UnicodeError,ValueError) as exc:self.clut_import_failed(exc)
 
-    def inspect_clut_hsv(self):
-        path=filedialog.askopenfilename(parent=self.clut_window,title='检查海思配套 HSV TXT（非设备表）',
-                                       filetypes=[('HSV TXT','*.txt')])
+    def save_hsv_file(self):
+        if self.document is None or self.method.get()!='HSV 调色':return
+        if not isinstance(self.state_for(self.document).clut.grid,HSVGrid):
+            self.error.set('当前参数不是 HSV 格式');return
+        if not self.clut_editor.commit_all():return
+        path=filedialog.asksaveasfilename(parent=self.clut_window,title='导出 HSV TXT · 当前编辑参数',
+                                         defaultextension='.txt',filetypes=[('HSV TXT','*.txt')])
         if not path:return
         try:
-            from ..grading.hisi_clut import inspect_hsv
-            result=inspect_hsv(path)
-            messagebox.showinfo('HSV 文件结构检查',
-                f"识别到 {result['records']} 条六字段记录。\n此文件不是 5508 个整数的设备表。\n"
-                '末三字段的单位/语义尚未确认，不能可靠导入调色。\n请提供芯片/SDK 格式说明；设备预览请导入配套 CLUT TXT。',parent=self.clut_window)
-        except (OSError,UnicodeError,ValueError) as exc:self.error.set(str(exc))
-
-    def export_clut_file(self):
-        if not self.clut_ready() or self.io_future is not None:return
-        if not self.enabled.get():self.error.set('调色已旁路，请启用后再导出 CLUT');return
-        path=filedialog.asksaveasfilename(parent=self.clut_window,title='导出 CLUT TXT · HiSilicon 5508-word',
-             defaultextension='.txt',filetypes=[('CLUT TXT','*.txt')])
-        if not path:return
-        if Path(path).suffix.lower()!='.txt':
-            self.error.set('CLUT 数据请保存为 .txt 文件');return
-        grid=self.state_for(self.document).clut.applied_grid
-        from ..grading.hisi_clut import export_hisi
-        self.io_future=self.executor.submit(export_hisi,path,grid)
-        self.status.set('正在导出 CLUT…');self.later(40,self.poll_export)
+            if Path(path).suffix.lower()!='.txt':raise ValueError('HSV 参数请保存为 .txt')
+            export_hsv(path,self.state_for(self.document).clut.grid)
+            gains=self.state_for(self.document).clut.grid.gains
+            self.error.set('');self.status.set(f'HSV TXT 已导出；CLUT Attr 需在设备另填 gain_r/g/b={gains}，图像应用状态不变')
+        except (OSError,ValueError) as exc:self.error.set(str(exc))
 
     def scroll_parameters(self,event):
         bounds=self.parameter_canvas.bbox('all')
@@ -568,7 +585,10 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         return self._active_document
 
     def state_for(self,document):
-        return self.states.setdefault(document.document_id,GradingState())
+        # A 2700-node HSV default is sizeable; do not build it on every lookup.
+        if document.document_id not in self.states:
+            self.states[document.document_id]=GradingState()
+        return self.states[document.document_id]
 
     @property
     def history(self):
@@ -988,7 +1008,7 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
             x,y,_=self.coordinates(event)
             if 0<=x<self.source.shape[1] and 0<=y<self.source.shape[0]:
                 fx=int(x*self.document.rgb.shape[1]/self.source.shape[1]);fy=int(y*self.document.rgb.shape[0]/self.source.shape[0])
-                if self.method.get()=='CLUT 调色':
+                if self.method.get()=='HSV 调色':
                     self.pick_clut_at(fx,fy);return 'break'
                 if self.document.alpha is not None and self.document.alpha[fy,fx]<.1:
                     self.error.set('请在非透明区域取色')
@@ -1006,7 +1026,7 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         if self.document is None or self.io_future is not None: return
         # Clicking a ttk button does not always move keyboard focus. Validate
         # the visible draft before taking the export snapshot as well.
-        is_clut=self.method.get()=='CLUT 调色'
+        is_clut=self.method.get()=='HSV 调色'
         is_ca=self.method.get()=='CA 调色'
         if is_clut and not self.clut_ready():return
         if is_ca and not self.ca_ready():return
@@ -1035,9 +1055,7 @@ class GradingWorkspace(ComparisonViewMixin, ttk.Frame):
         future,self.io_future=self.io_future,None
         try:
             report=future.result()
-            if isinstance(report,dict) and 'max_code_error' in report:
-                self.status.set(f'导出完成 · 33³ 节点重读误差 Mean {report["mean_code_error"]:.3f} / Max {report["max_code_error"]:.3f}（RGB /255，非硬件验证）')
-            else:self.status.set('导出完成')
+            self.status.set('导出完成')
         except Exception as exc: self.error.set(str(exc))
 
     def destroy(self):

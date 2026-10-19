@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from .model import GradeHistory, ColorPoint, build_lut
 from functools import lru_cache
-from .clut import CLUTState
+from .hsv_grid import HSVState
 from .ca import CAState
 
 
@@ -27,5 +27,6 @@ class GradingState:
     cache_key: object = None
     output: object = None
     method: str = '取色调色'
-    clut: CLUTState = field(default_factory=CLUTState)
+    # Internal name retained for shared rendering code; UI exposes HSV only.
+    clut: HSVState = field(default_factory=HSVState)
     ca: CAState = field(default_factory=CAState)
